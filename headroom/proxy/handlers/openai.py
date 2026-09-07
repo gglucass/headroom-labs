@@ -718,6 +718,7 @@ def _shape_openai_responses_payload(
         from headroom.proxy.output_savings import (
             assign_arm,
             conversation_key_from_responses_body,
+            conversation_label,
             stratum_key,
             stratum_label,
         )
@@ -736,7 +737,8 @@ def _shape_openai_responses_payload(
             holdout = float(runtime_env.getenv("HEADROOM_OUTPUT_HOLDOUT", "0") or "0")
         except ValueError:
             holdout = 0.0
-        arm = assign_arm(conversation_key_from_responses_body(payload), holdout)
+        conversation = conversation_key_from_responses_body(payload)
+        arm = assign_arm(conversation, holdout)
 
         turn_kind = classify_responses_turn(payload.get("input")).value
         approx_input_tokens = len(json.dumps(payload)) // 4
@@ -746,7 +748,9 @@ def _shape_openai_responses_payload(
             model=model or str(payload.get("model", "")),
             has_tools=bool(payload.get("tools")),
         )
-        labels = [stratum_label(arm, stratum)]
+        # The conversation is the unit the arm was assigned to, so the ledger
+        # needs it to count distinct conversations rather than requests.
+        labels = [stratum_label(arm, stratum), conversation_label(conversation)]
 
         if arm != "treatment":
             return labels, False
@@ -4490,6 +4494,7 @@ class OpenAIHandlerMixin:
             from headroom.proxy.output_savings import (
                 assign_arm,
                 conversation_key_from_body,
+                conversation_label,
                 stratum_key,
                 stratum_label,
             )
@@ -4514,7 +4519,8 @@ class OpenAIHandlerMixin:
                     _holdout = float(runtime_env.getenv("HEADROOM_OUTPUT_HOLDOUT", "0") or "0")
                 except ValueError:
                     _holdout = 0.0
-                _arm = assign_arm(conversation_key_from_body(body), _holdout)
+                _conversation = conversation_key_from_body(body)
+                _arm = assign_arm(_conversation, _holdout)
                 _turn_kind = classify_turn(body.get("messages", [])).value
                 _stratum = stratum_key(
                     turn_kind=_turn_kind,
@@ -4523,8 +4529,10 @@ class OpenAIHandlerMixin:
                     has_tools=bool(body.get("tools")),
                 )
                 # Carry (arm, stratum) on the transforms channel so the outcome
-                # funnel feeds the output-savings ledger from the chat path too.
+                # funnel feeds the output-savings ledger from the chat path too,
+                # plus the conversation the arm was actually assigned to.
                 transforms_applied.append(stratum_label(_arm, _stratum))
+                transforms_applied.append(conversation_label(_conversation))
                 if _arm == "treatment":
                     _level, _src = resolve_verbosity_level(_shaper_settings)
                     _shape_result = shape_openai_chat_request(

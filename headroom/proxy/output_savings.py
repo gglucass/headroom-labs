@@ -54,12 +54,16 @@ from .output_savings_policy import (
     conversation_key_from_responses_body as conversation_key_from_responses_body,
 )
 from .output_savings_policy import (
+    conversation_label as conversation_label,
+)
+from .output_savings_policy import (
     input_bucket as input_bucket,
 )
 from .output_savings_policy import (
     model_family as model_family,
 )
 from .output_savings_policy import (
+    parse_conversation_label,
     parse_stratum_label,
 )
 from .output_savings_policy import (
@@ -71,6 +75,21 @@ from .output_savings_policy import (
 
 logger = logging.getLogger(__name__)
 
+# A stratum enters the measured (A/B) estimate only once BOTH arms hold this
+# many distinct conversations. Assignment is per conversation, so conversations
+# -- not requests -- are the independent draws: one agent session in the holdout
+# can leave 2,500 control requests in a single stratum, and every request-count
+# gate we have waves that through as a well-sampled arm. On a real ledger that
+# produced a -1.6% "measured" reduction whose two largest terms came from strata
+# with four control requests apiece.
+MEASURED_MIN_CLUSTERS = 5
+
+# Distinct conversations tracked per arm/stratum. The count is only ever
+# compared against the threshold above, so there is nothing to gain from an
+# exact tally of a busy stratum -- and this keeps a flushed-every-25-requests
+# ledger from growing a set per conversation forever.
+_CLUSTER_CAP = 32
+
 
 @dataclass
 class _Accum:
@@ -79,11 +98,25 @@ class _Accum:
     n: int = 0
     sum: float = 0.0
     sumsq: float = 0.0
+    #: Distinct conversation ids behind ``n``, capped at ``_CLUSTER_CAP``.
+    clusters: set[str] = field(default_factory=set)
 
-    def add(self, x: float) -> None:
+    def add(self, x: float, cluster: str | None = None) -> None:
         self.n += 1
         self.sum += x
         self.sumsq += x * x
+        if cluster is not None and len(self.clusters) < _CLUSTER_CAP:
+            self.clusters.add(cluster)
+
+    @property
+    def n_clusters(self) -> int:
+        """Distinct conversations observed, saturating at ``_CLUSTER_CAP``.
+
+        0 for an accumulator written before conversations were tracked, which
+        is why that data cannot clear :data:`MEASURED_MIN_CLUSTERS`: an
+        unverifiable arm is treated as an unqualified one.
+        """
+        return len(self.clusters)
 
     @property
     def mean(self) -> float:
@@ -105,16 +138,23 @@ class _Accum:
         self.n += other.n
         self.sum += other.sum
         self.sumsq += other.sumsq
+        self.clusters |= set(list(other.clusters)[: _CLUSTER_CAP - len(self.clusters)])
 
-    def to_dict(self) -> dict[str, float]:
-        return {"n": self.n, "sum": self.sum, "sumsq": self.sumsq}
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {"n": self.n, "sum": self.sum, "sumsq": self.sumsq}
+        # Omitted when empty so a baseline model (which has no conversations to
+        # track) serializes exactly as it did before.
+        if self.clusters:
+            d["clusters"] = sorted(self.clusters)
+        return d
 
     @classmethod
-    def from_dict(cls, d: dict[str, float]) -> _Accum:
+    def from_dict(cls, d: dict[str, Any]) -> _Accum:
         a = cls()
         a.n = int(d.get("n", 0))
         a.sum = float(d.get("sum", 0.0))
         a.sumsq = float(d.get("sumsq", 0.0))
+        a.clusters = {str(c) for c in (d.get("clusters") or ())}
         return a
 
 
@@ -268,9 +308,11 @@ class SavingsLedger:
 
     # ---- recording -------------------------------------------------------
 
-    def record(self, arm: str, key: str, output_tokens: int) -> None:
+    def record(
+        self, arm: str, key: str, output_tokens: int, conversation: str | None = None
+    ) -> None:
         target = self.treatment if arm == "treatment" else self.control
-        target.setdefault(key, _Accum()).add(output_tokens)
+        target.setdefault(key, _Accum()).add(output_tokens, conversation)
 
     # ---- estimation ------------------------------------------------------
 
@@ -305,9 +347,19 @@ class SavingsLedger:
     def estimate_from_holdout(self) -> SavingsEstimate | None:
         """A/B measurement: per-stratum control mean minus treatment mean.
 
-        Only strata with data in BOTH arms contribute. Returns ``None`` if no
-        such stratum exists (no holdout traffic yet). Weighted by treatment
+        Only strata with data in BOTH arms contribute, and only once both
+        arms hold :data:`MEASURED_MIN_CLUSTERS` distinct conversations.
+        Returns ``None`` if no such stratum exists (no holdout traffic yet, or
+        none of it spread across enough conversations). Weighted by treatment
         volume; this is the unbiased causal number.
+
+        The cluster gate is not a sample-size nicety. Assignment is
+        conversation-stable, so the requests inside one conversation are one
+        draw answering one question, and the variance below (which divides by
+        the REQUEST count) reads a single 2,500-request session as a precise
+        measurement. Strata that thin get excluded rather than down-weighted:
+        the arm they describe is one conversation's worth of work, and no
+        weighting recovers a comparison that was never made.
         """
         total_saved = 0.0
         total_baseline = 0.0
@@ -317,6 +369,8 @@ class SavingsLedger:
         for key, t in self.treatment.items():
             c = self.control.get(key)
             if c is None or c.n == 0 or t.n == 0:
+                continue
+            if c.n_clusters < MEASURED_MIN_CLUSTERS or t.n_clusters < MEASURED_MIN_CLUSTERS:
                 continue
             contributing += 1
             n = t.n
@@ -495,19 +549,33 @@ class SavingsRecorder:
 
     def record_from_labels(self, labels: Any, output_tokens: int) -> bool:
         """Record one outcome given its transforms_applied labels. Returns True
-        if a shaping label was found and recorded."""
+        if a shaping label was found and recorded.
+
+        The conversation label may sit either side of the stratum label, so the
+        labels are scanned once for both before recording. A request that
+        carries no conversation label (an older client, or a path that has not
+        adopted it) still records its output tokens; it just does not advance
+        the stratum's cluster count.
+        """
+        arm_key: tuple[str, str] | None = None
+        conversation: str | None = None
         for label in labels or ():
-            parsed = parse_stratum_label(str(label))
-            if parsed is None:
-                continue
-            arm, key = parsed
-            with self._lock:
-                self._ledger.record(arm, key, output_tokens)
-                self._since_flush += 1
-                if self._since_flush >= self._flush_every:
-                    self._flush_locked()
-            return True
-        return False
+            text = str(label)
+            if arm_key is None:
+                arm_key = parse_stratum_label(text)
+                if arm_key is not None:
+                    continue
+            if conversation is None:
+                conversation = parse_conversation_label(text)
+        if arm_key is None:
+            return False
+        arm, key = arm_key
+        with self._lock:
+            self._ledger.record(arm, key, output_tokens, conversation)
+            self._since_flush += 1
+            if self._since_flush >= self._flush_every:
+                self._flush_locked()
+        return True
 
     def estimate_request_savings(self, labels: Any, output_tokens: int) -> int:
         """Per-request output tokens saved, for the savings rollup.
