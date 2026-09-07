@@ -235,3 +235,81 @@ def test_unpriced_legacy_ledger_waits_instead_of_freezing_list_prices(tmp_path):
 def test_fresh_install_is_marked_realized(tmp_path):
     snapshot = st.SavingsTracker(path=str(tmp_path / "proxy_savings.json")).snapshot()
     assert snapshot["pricing_basis"] == "realized"
+
+
+@pytest.mark.parametrize(
+    ("day2_saved", "expected_series"),
+    [
+        # Day 2 is cache-heavy and saves nothing new. Its CUMULATIVE average
+        # rate is $1.9/M, so pricing each point at its own cumulative average
+        # would restate day 1 from $10 down to $1.90: a decreasing series whose
+        # negative delta the rollup clamps to zero, leaving days that no longer
+        # add up to the lifetime.
+        (1_000_000, [10.0, 10.0]),
+        # Day 2 also saves: those 500k tokens price at day 2's own $1/M warm
+        # rate, not at day 1's $10/M and not at the $1.9/M cumulative average.
+        (1_500_000, [10.0, 10.5]),
+    ],
+)
+def test_cold_to_warm_rate_change_keeps_history_monotonic_and_reconciled(
+    tmp_path, day2_saved, expected_series
+):
+    """A cold day followed by a cache-heavy one is ordinary traffic, not corrupt
+    input, and it must not break the ledger's invariants: the cumulative series
+    only ever rises, and the daily deltas add back up to the lifetime."""
+    path = tmp_path / "proxy_savings.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 5,
+                "lifetime": {
+                    "requests": 200,
+                    "tokens_saved": day2_saved,
+                    "compression_savings_usd": 15.0,
+                    "total_input_tokens": 10_000_000,
+                    "total_input_cost_usd": 19.0,
+                },
+                "history": [
+                    {
+                        "timestamp": "2026-01-01T00:00:00+00:00",
+                        "total_tokens_saved": 1_000_000,
+                        "compression_savings_usd": 10.0,
+                        "total_input_tokens": 1_000_000,
+                        "total_input_cost_usd": 10.0,
+                    },
+                    {
+                        "timestamp": "2026-01-02T00:00:00+00:00",
+                        "total_tokens_saved": day2_saved,
+                        "compression_savings_usd": 15.0,
+                        "total_input_tokens": 10_000_000,
+                        "total_input_cost_usd": 19.0,
+                    },
+                ],
+                "by_model": {
+                    "m": {
+                        "requests": 200,
+                        "tokens_saved": day2_saved,
+                        "compression_savings_usd": 15.0,
+                        "total_input_tokens": 10_000_000,
+                        "total_input_cost_usd": 19.0,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    tracker = st.SavingsTracker(path=str(path))
+    snapshot = tracker.snapshot()
+
+    series = [p["compression_savings_usd"] for p in snapshot["history"]]
+    assert series == [pytest.approx(value) for value in expected_series]
+    assert series == sorted(series)
+
+    lifetime = snapshot["lifetime"]["compression_savings_usd"]
+    assert lifetime == pytest.approx(expected_series[-1])
+    daily = tracker.history_response()["series"]["daily"]
+    assert sum(day["compression_savings_usd_delta"] for day in daily) == pytest.approx(lifetime)
+    # One model covers all the saved tokens, so its bucket must equal the
+    # headline rather than carrying a separately weighted total.
+    assert snapshot["by_model"]["m"]["compression_savings_usd"] == pytest.approx(lifetime)

@@ -500,13 +500,10 @@ def _realized_input_rate(entry: Any) -> float | None:
     return cost / float(tokens)
 
 
-def _reprice_entry_to_realized(entry: Any, tokens_key: str, fallback_rate: float) -> None:
-    """Restate one aggregate's compression dollars at the realized rate."""
+def _reprice_entry_to_realized(entry: Any, tokens_key: str, rate: float) -> None:
+    """Restate one aggregate's compression dollars at ``rate``."""
     if not isinstance(entry, dict):
         return
-    rate = _realized_input_rate(entry)
-    if rate is None:
-        rate = fallback_rate
     saved = max(_coerce_int(entry.get(tokens_key)), 0)
     entry["compression_savings_usd"] = round(float(saved) * rate, 6)
 
@@ -519,29 +516,75 @@ def _reprice_state_to_realized_basis(state: dict[str, Any]) -> bool:
     the headline converging only as old entries age out - which leaves the
     reported bug substantially unfixed for existing installs.
 
-    No new per-entry field is needed to tell the eras apart: ``tokens_saved``
-    and the realized rate are both already persisted on every aggregate, so the
-    dollars are simply recomputed from them. Each aggregate uses its own rate
-    where it has one (so a history point is restated at the rate that prevailed
-    up to that point and the derived day/provider/model deltas stay consistent),
-    falling back to the lifetime rate. Returns False when there is nothing to
-    reprice against yet, in which case the marker is not written and the
-    restatement is retried on the next load.
+    No new per-entry field is needed to tell the eras apart: saved tokens and
+    realized input spend are both already persisted, so the dollars are simply
+    recomputed from them.
+
+    History points are cumulative snapshots, so they are restated from the
+    INCREMENTS between them and re-accumulated, never by multiplying a point's
+    cumulative saved tokens by its cumulative average rate. That average moves
+    with the traffic mix - a cold day followed by a cache-heavy one drops it -
+    so cumulative-average pricing can rewrite the series DOWNWARD, and
+    ``_build_rollup`` clamps negative deltas to zero, which would leave the
+    days no longer adding up to the lifetime. Increments are non-negative by
+    construction, so the restated series is monotonic and the day / provider /
+    model deltas still sum to the lifetime.
+
+    Per-project and per-model attribution is not recoverable from cumulative
+    snapshots, so those buckets take the lifetime's effective compression rate
+    (its restated dollars over its saved tokens) instead of each inventing its
+    own weighting - one basis for every aggregate, so the buckets reconcile
+    with the headline. Returns False when there is nothing to reprice against
+    yet, in which case the marker is not written and the restatement is retried
+    on the next load.
     """
     lifetime = state.get("lifetime")
-    rate = _realized_input_rate(lifetime)
-    if rate is None:
+    fallback_rate = _realized_input_rate(lifetime)
+    if fallback_rate is None:
         # Nothing priced yet: only stamp when there are no legacy dollars to
         # restate, otherwise wait for a rate rather than freezing list prices in.
         return _coerce_float((lifetime or {}).get("compression_savings_usd")) <= 0.0
 
-    _reprice_entry_to_realized(lifetime, "tokens_saved", rate)
-    _reprice_entry_to_realized(state.get("display_session"), "tokens_saved", rate)
+    cumulative_usd = 0.0
+    covered_tokens = 0
+    prev_saved = 0
+    prev_input_tokens = 0
+    prev_input_cost = 0.0
     for point in state.get("history") or []:
-        _reprice_entry_to_realized(point, "total_tokens_saved", rate)
+        if not isinstance(point, dict):
+            continue
+        saved = _coerce_int(point.get("total_tokens_saved"))
+        input_tokens = _coerce_int(point.get("total_input_tokens"))
+        input_cost = _coerce_float(point.get("total_input_cost_usd"))
+        # Same clamped-delta reading _build_rollup applies, so the restated
+        # series and the rollup agree point for point.
+        delta_saved = max(saved - prev_saved, 0)
+        delta_input_tokens = max(input_tokens - prev_input_tokens, 0)
+        delta_input_cost = max(input_cost - prev_input_cost, 0.0)
+        rate = (
+            delta_input_cost / float(delta_input_tokens)
+            if delta_input_tokens > 0 and delta_input_cost > 0.0
+            else fallback_rate
+        )
+        cumulative_usd += float(delta_saved) * rate
+        point["compression_savings_usd"] = round(cumulative_usd, 6)
+        prev_saved = saved
+        prev_input_tokens = input_tokens
+        prev_input_cost = input_cost
+        covered_tokens = max(covered_tokens, saved)
+
+    lifetime_saved = max(_coerce_int((lifetime or {}).get("tokens_saved")), 0)
+    # Savings booked outside the retained history (aged-out points, checkpoint
+    # writers) have no increments left to price, so they take the lifetime rate.
+    lifetime_usd = cumulative_usd + float(max(lifetime_saved - covered_tokens, 0)) * fallback_rate
+    if isinstance(lifetime, dict):
+        lifetime["compression_savings_usd"] = round(lifetime_usd, 6)
+    effective_rate = lifetime_usd / float(lifetime_saved) if lifetime_saved > 0 else fallback_rate
+
+    _reprice_entry_to_realized(state.get("display_session"), "tokens_saved", effective_rate)
     for bucket in ("projects", "by_model"):
         for entry in (state.get(bucket) or {}).values():
-            _reprice_entry_to_realized(entry, "tokens_saved", rate)
+            _reprice_entry_to_realized(entry, "tokens_saved", effective_rate)
 
     metrics = state.get("lifetime_metrics")
     if isinstance(metrics, dict):
@@ -549,7 +592,7 @@ def _reprice_state_to_realized_basis(state: dict[str, Any]) -> bool:
         tokens = metrics.get("tokens")
         if isinstance(cost, dict) and isinstance(tokens, dict):
             saved = max(_coerce_int(tokens.get("saved")), 0)
-            cost["compression_savings_usd"] = round(float(saved) * rate, 6)
+            cost["compression_savings_usd"] = round(float(saved) * effective_rate, 6)
     return True
 
 
