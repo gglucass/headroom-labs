@@ -356,65 +356,76 @@ if __name__ == "__main__":
 class TestFirstAppearanceAccounting:
     """A matured Read's savings must book once, on the turn it matures.
 
-    The client re-sends the raw conversation every turn, so the handler's
-    original-vs-optimized diff re-counts a replayed marker's removal on
-    every request until end of session; replayed_pairs plus
-    replayed_token_debt exist so the handler can subtract that share.
+    The client re-sends the raw conversation every turn, so a plain
+    original-vs-optimized token diff re-counts the same removal on every
+    later request. ``replayed_token_debt`` measures that from the
+    request's own endpoints — raw client snapshot vs forwarded messages —
+    rather than from what ``apply`` replaced, because after maturation
+    the marker normally reaches the wire through the cached-prefix replay
+    and ``apply`` replaces nothing at all.
     """
 
-    def _mature_then_replay(self):
+    def _matured(self):
+        """Returns (manager, raw client messages, forwarded messages)."""
         m = manager(quiesce_turns=5)
-        msgs = [*base_conv(), *quiet(5)]
-        r1 = m.apply(msgs)
-        assert r1.newly_matured == 1
-        # Next request: the client re-sends the raw form.
-        r2 = m.apply(msgs)
-        return m, r1, r2
+        raw = [*base_conv(), *quiet(5)]
+        res = m.apply(raw)
+        assert res.newly_matured == 1
+        return m, raw, res.messages
 
-    def test_newly_matured_is_not_a_replay(self):
-        _, r1, _ = self._mature_then_replay()
-        assert r1.replayed_pairs == []
+    @staticmethod
+    def _marker(sent):
+        return sent[2]["content"][0]["content"]
 
-    def test_replay_reports_the_pair(self):
-        _, r1, r2 = self._mature_then_replay()
-        marker = read_content(r1)
-        assert r2.replayed_pairs == [("r1", CONTENT, marker)]
+    def test_first_appearance_books_in_full(self):
+        m, raw, sent = self._matured()
+        assert m.replayed_token_debt(raw, sent, len) == 0
+
+    def test_later_request_is_charged_even_without_a_replacement(self):
+        # The second call passes the same forwarded form WITHOUT running
+        # apply again: that is the cached-prefix replay, the path that
+        # actually re-books the removal in production.
+        m, raw, sent = self._matured()
+        m.replayed_token_debt(raw, sent, len)
+        expected = len(CONTENT) - len(self._marker(sent))
+        assert m.replayed_token_debt(raw, sent, len) == expected
 
     def test_marker_echo_is_not_a_replay(self):
-        m, r1, _ = self._mature_then_replay()
-        # Client echoes the marker form back verbatim: nothing is
-        # replaced, so nothing was re-saved.
-        r3 = m.apply(r1.messages)
-        assert r3.replayed_pairs == []
-        assert r3.replacements_applied == 0
+        # The client echoes the marker form back: nothing was removed this
+        # request, so there is nothing to un-book.
+        m, _, sent = self._matured()
+        assert m.replayed_token_debt(sent, sent, len) == 0
 
-    def test_debt_is_tokenized_once_and_summed(self):
-        m, _, r2 = self._mature_then_replay()
+    def test_unchanged_wire_form_is_not_a_replay(self):
+        # Forwarded verbatim (maturation state lost, hold re-established):
+        # no removal on the wire, no debt.
+        m, raw, _ = self._matured()
+        assert m.replayed_token_debt(raw, raw, len) == 0
+
+    def test_delta_is_tokenized_once_per_tool_call(self):
+        m, raw, sent = self._matured()
+        m.replayed_token_debt(raw, sent, len)
         calls = []
 
         def count(text: str) -> int:
             calls.append(text)
             return len(text)
 
-        marker = r2.replayed_pairs[0][2]
-        expected = len(CONTENT) - len(marker)
-        assert m.replayed_token_debt(r2, count) == expected
+        expected = len(CONTENT) - len(self._marker(sent))
+        assert m.replayed_token_debt(raw, sent, count) == expected
         assert len(calls) == 2  # content + marker, once
-        # Cached: the same replay on the next request tokenizes nothing.
-        assert m.replayed_token_debt(r2, count) == expected
-        assert len(calls) == 2
+        assert m.replayed_token_debt(raw, sent, count) == expected
+        assert len(calls) == 2  # cached for the session
 
     def test_replay_request_nets_zero_savings(self):
-        m, _, r2 = self._mature_then_replay()
-        # With a compositional counter, the handler's diff on the replay
-        # request equals exactly the replayed share, so first-appearance
-        # accounting books zero new savings for it.
-        diff = len(CONTENT) - len(read_content(r2))
-        debt = m.replayed_token_debt(r2, len)
-        assert diff == debt
-        assert max(0, diff - debt) == 0
+        # With a compositional counter the diff on a replay request equals
+        # exactly the debt, so first-appearance accounting books nothing new.
+        m, raw, sent = self._matured()
+        m.replayed_token_debt(raw, sent, len)
+        diff = len(CONTENT) - len(self._marker(sent))
+        assert max(0, diff - m.replayed_token_debt(raw, sent, len)) == 0
 
-    def test_empty_result_has_zero_debt(self):
+    def test_nothing_matured_has_zero_debt(self):
         m = manager()
         res = m.apply(base_conv())
-        assert m.replayed_token_debt(res, len) == 0
+        assert m.replayed_token_debt(base_conv(), res.messages, len) == 0

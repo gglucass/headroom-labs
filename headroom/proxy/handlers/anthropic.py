@@ -2277,6 +2277,11 @@ class AnthropicHandlerMixin:
             # request. Session state (matured markers) rides on the
             # prefix tracker — same affinity and TTL cleanup as the
             # freeze state. Advisory: must never fail the request.
+            # Bound when maturation runs, so the final accounting step below
+            # can charge this request's replayed-marker debt. Every earlier
+            # `tokens_saved` assignment is overwritten by that recount, so the
+            # adjustment belongs there and nowhere else.
+            _maturation_mgr = None
             if self.config.read_maturation and not _bypass:
                 try:
                     from headroom.config import ReadMaturationConfig
@@ -2297,6 +2302,7 @@ class AnthropicHandlerMixin:
                             compression_store=get_compression_store(),
                         )
                         prefix_tracker.read_maturation_manager = maturation_mgr
+                    _maturation_mgr = maturation_mgr
                     maturation = maturation_mgr.apply(
                         optimized_messages,
                         frozen_message_count=frozen_message_count,
@@ -2307,17 +2313,7 @@ class AnthropicHandlerMixin:
                             maturation.holding_msg_indices,
                         )
                         optimized_tokens = tokenizer.count_messages(optimized_messages)
-                        # First-appearance accounting: the client re-sends
-                        # the raw conversation every turn, so this diff
-                        # re-books every replayed marker's removal on every
-                        # request until end of session. Subtract the
-                        # replayed share, tokenized on the same scale as
-                        # the diff; matured content books exactly once, on
-                        # the turn it matures.
-                        replay_debt = maturation_mgr.replayed_token_debt(
-                            maturation, tokenizer.count_text
-                        )
-                        tokens_saved = max(0, original_tokens - optimized_tokens - replay_debt)
+                        tokens_saved = max(0, original_tokens - optimized_tokens)
                         if maturation.newly_matured:
                             transforms_applied.append(f"read_maturation:{maturation.newly_matured}")
                         logger.debug(
@@ -2325,7 +2321,6 @@ class AnthropicHandlerMixin:
                             f"holding={len(maturation.holding_msg_indices)} "
                             f"matured={maturation.newly_matured} "
                             f"replayed={maturation.replacements_applied} "
-                            f"replay_debt={replay_debt} "
                             f"bytes_saved={maturation.bytes_saved}"
                         )
                 except Exception as e:
@@ -3188,7 +3183,27 @@ class AnthropicHandlerMixin:
                 if 0 < _tool_tokens_after < _tool_tokens_before:
                     original_tokens += _tool_tokens_before
                     optimized_tokens += _tool_tokens_after
-                tokens_saved = max(0, original_tokens - optimized_tokens)
+                # First-appearance accounting for matured Reads. The client
+                # re-sends the raw conversation every turn, so this diff would
+                # otherwise re-book a matured Read's removal on every request
+                # until end of session. Charged here, on the request's real
+                # endpoints, because after maturation the marker usually
+                # reaches the wire through the cached-prefix replay rather than
+                # through the maturation pass — and because every earlier
+                # `tokens_saved` assignment is overwritten right here.
+                # tok_before/tok_after stay the honest wire counts; only the
+                # booked saving is first-appearance.
+                _replay_debt = 0
+                if _maturation_mgr is not None:
+                    try:
+                        _replay_debt = _maturation_mgr.replayed_token_debt(
+                            _orig_snapshot, optimized_messages, tokenizer.count_text
+                        )
+                    except Exception:
+                        # Advisory, like the maturation pass itself: a failure
+                        # here must not skip the recount around it.
+                        logger.debug("maturation replay debt skipped", exc_info=True)
+                tokens_saved = max(0, original_tokens - optimized_tokens - _replay_debt)
                 # Attribute the fold to the hook ONLY when the hook itself reduced
                 # tokens (same-tokenizer pre vs post) — not when the recount above
                 # merely normalized a cross-estimator scale difference.
