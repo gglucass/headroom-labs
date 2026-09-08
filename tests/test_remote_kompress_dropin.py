@@ -193,31 +193,37 @@ def test_the_common_path_without_an_override_is_unchanged(monkeypatch) -> None:
     assert stored["tokens"] == 999
 
 
-def test_remote_marker_gate_matches_local_on_single_token_words(monkeypatch) -> None:
-    """Parity with KompressCompressor: 100 single-token words dropping 41 save
-    41 tokens against a 43-token marker (real source-derived hash), so the
-    remote path passes through too; a saving that covers the marker reports
-    kept words plus the measured marker cost."""
+def test_remote_marker_gate_measures_the_whole_payload_like_local(monkeypatch) -> None:
+    """Parity with KompressCompressor: the whole original against the whole
+    marked candidate in one token unit. Both boundary sources pass through
+    (41 single-token words saved against a 43-token marker; a head word that
+    retokenizes: 100 -> 103), and a real saving reports that measurement."""
     import hashlib
 
-    from headroom.transforms.kompress_compressor import ccr_marker_cost, ccr_retrieval_marker
+    from headroom.transforms.kompress_compressor import ccr_retrieval_marker, payload_tokens
 
     def _store(original, compressed, original_tokens):  # noqa: ANN001
         return hashlib.sha256(original.encode()).hexdigest()[:24]
 
     monkeypatch.setattr("headroom.transforms.kompress_remote.store_kompress_in_ccr", _store)
-    source = " ".join(["alpha"] * 99 + ["nfs"])
-    kept = " ".join(source.split()[41:])
-    c = _compressor(monkeypatch, enable_ccr=True, payload={"compressed": kept})
-    result = c.compress(source)
-    assert result.compressed == source
-    assert result.cache_key is None
-    assert result.compression_ratio == 1.0
+    for source, drop in (
+        (" ".join(["alpha"] * 99 + ["nfs"]), 41),
+        (" ".join(["alpha"] * 36 + ["bureaucratic"] + ["alpha"] * 63), 36),
+    ):
+        kept = " ".join(source.split()[drop:])
+        c = _compressor(monkeypatch, enable_ccr=True, payload={"compressed": kept})
+        result = c.compress(source)
+        assert result.compressed == source
+        assert result.cache_key is None
+        assert result.compression_ratio == 1.0
 
     big = " ".join(["alpha"] * 299 + ["nfs"])
     kept = " ".join(big.split()[60:])
     c = _compressor(monkeypatch, enable_ccr=True, payload={"compressed": kept})
     result = c.compress(big)
-    marker = ccr_retrieval_marker(300, 240, big, _store(big, kept, 300))
-    assert result.compressed == kept + marker
-    assert result.compressed_tokens == 240 + ccr_marker_cost(marker)
+    marked = kept + ccr_retrieval_marker(300, 240, big, _store(big, kept, 300))
+    assert result.compressed == marked
+    assert (result.original_tokens, result.compressed_tokens) == (
+        payload_tokens(big),
+        payload_tokens(marked),
+    )

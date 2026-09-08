@@ -60,8 +60,8 @@ import httpx
 from .kompress_compressor import (
     KompressConfig,
     KompressResult,
-    ccr_marker_cost,
     ccr_retrieval_marker,
+    payload_tokens,
     store_kompress_in_ccr,
 )
 
@@ -262,20 +262,21 @@ class RemoteKompressCompressor:
             if cache_key:
                 # Report the source line span so a reader can tell content was
                 # compressed away rather than absent (#2586).
-                marker = ccr_retrieval_marker(
+                marked = compressed + ccr_retrieval_marker(
                     result.original_tokens, result.compressed_tokens, ccr_source, cache_key
                 )
-                marker_cost = ccr_marker_cost(marker)
-                if result.original_tokens - result.compressed_tokens <= marker_cost:
+                # Whole original against whole marked candidate, one unit,
+                # and the accounting reports that measurement.
+                original_tokens = payload_tokens(content)
+                compressed_tokens = payload_tokens(marked)
+                if compressed_tokens >= original_tokens:
                     return self._passthrough(content, n_words)
                 result.cache_key = cache_key
-                result.compressed += marker
-                # The accounting covers the payload as shipped, marker included.
-                result.compressed_tokens += marker_cost
+                result.compressed = marked
+                result.original_tokens = original_tokens
+                result.compressed_tokens = compressed_tokens
                 result.compression_ratio = (
-                    result.compressed_tokens / result.original_tokens
-                    if result.original_tokens
-                    else 1.0
+                    compressed_tokens / original_tokens if original_tokens else 1.0
                 )
 
         return result
