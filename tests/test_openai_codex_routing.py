@@ -1002,12 +1002,12 @@ def test_responses_savings_keep_per_request_accounting_without_identity(monkeypa
 
 def test_responses_savings_dedupe_full_transcripts_but_not_incremental_input(monkeypatch):
     handler = _savings_handler(monkeypatch, saved=100)
-    # Full-transcript replay under Codex's prompt_cache_key: the second turn
-    # re-sends the first and its 100 is the same 100.
+    # Full-transcript replay under an explicit conversation id: the second
+    # turn re-sends the first and its 100 is the same 100.
     turn1 = {
         "model": "gpt-5.4",
         "instructions": _SHARED_INSTRUCTIONS,
-        "prompt_cache_key": "conv-1",
+        "metadata": {"conversation_id": "conv-1"},
         "input": [{"role": "user", "content": "fix the failing test"}],
     }
     turn2 = {**turn1, "input": [*turn1["input"], {"role": "user", "content": "and the lint"}]}
@@ -1019,13 +1019,34 @@ def test_responses_savings_dedupe_full_transcripts_but_not_incremental_input(mon
     # its own removal.
     inc1 = {
         "model": "gpt-5.4",
-        "prompt_cache_key": "conv-1",
+        "metadata": {"conversation_id": "conv-1"},
         "previous_response_id": "resp_1",
         "input": [{"role": "user", "content": "more"}],
     }
     _post_responses(handler, inc1)
     _post_responses(handler, {**inc1, "previous_response_id": "resp_2"})
     assert _booked(handler) == [100, 0, 100, 100]
+
+
+def test_responses_savings_ignore_a_shared_prompt_cache_key(monkeypatch):
+    # prompt_cache_key groups cache routing; OpenAI documents one key shared
+    # across a user's sessions and forks. Two conversations under one key,
+    # with and without distinct session headers, each keep their own 100.
+    handler = _savings_handler(monkeypatch, saved=100)
+    shared = {"model": "gpt-5.4", "prompt_cache_key": "shared-support-prefix"}
+    _post_responses(
+        handler, {**shared, "input": "fix the failing test"}, {"session_id": "session-0"}
+    )
+    _post_responses(handler, {**shared, "input": "write the notes"}, {"session_id": "session-1"})
+    assert _booked(handler) == [100, 100]
+    _post_responses(handler, {**shared, "input": "fix the failing test"})
+    _post_responses(handler, {**shared, "input": "write the notes"})
+    assert _booked(handler) == [100, 100, 100, 100]
+    # The session header, not the cache key, is what de-duplicates.
+    _post_responses(
+        handler, {**shared, "input": "fix the failing test"}, {"session_id": "session-0"}
+    )
+    assert _booked(handler) == [100, 100, 100, 100, 0]
 
 
 def test_responses_savings_accept_a_session_header_as_identity(monkeypatch):

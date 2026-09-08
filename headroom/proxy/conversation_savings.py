@@ -71,15 +71,19 @@ def savings_conversation_key(body: Any, *, session_id: str | None = None) -> str
     Returns ``None`` unless BOTH premises of the cumulative accounting hold, in
     which case the funnel keeps ordinary per-request accounting:
 
-    1. The request names one conversation. Only an explicit id counts: the
-       client's own conversation id (``prompt_cache_key``, which Codex sets per
-       conversation), a top-level ``conversation_id``/``session_id``/
-       ``thread_id``, one of those inside ``metadata``/``client_metadata``, or
-       a transport-scoped ``session_id`` the caller vouches for (a WebSocket, a
-       session header). The holdout key's fallbacks (the instructions prefix,
-       the literal ``responses``) are deliberately NOT accepted: two
-       independent conversations with the same instructions would share a
-       running total and suppress each other's savings.
+    1. The request names one conversation. Only an explicit id counts: a
+       top-level ``conversation_id``/``session_id``/``thread_id``, one of
+       those inside ``metadata``/``client_metadata``, or a transport-scoped
+       ``session_id`` the caller vouches for (a WebSocket, a session header).
+       Two things are deliberately NOT accepted. The holdout key's fallbacks
+       (the instructions prefix, the literal ``responses``): two independent
+       conversations with the same instructions would share a running total
+       and suppress each other's savings. And ``prompt_cache_key``: it groups
+       prompt-cache routing, and OpenAI documents one key shared across a
+       user's sessions and forks, or across independent single-turn judging
+       requests, so it aliases conversations the same way. An adapter that
+       establishes a client sets it uniquely per conversation may pass it as
+       ``session_id``; nothing here does.
     2. The request carries the whole transcript. With ``previous_response_id``
        or a server-side ``conversation`` the provider holds prior context and
        the payload is this turn's increment, so ``tokens_saved`` is already
@@ -97,7 +101,7 @@ def savings_conversation_key(body: Any, *, session_id: str | None = None) -> str
         return None
 
     identity = ""
-    for key in ("prompt_cache_key", "conversation_id", "session_id", "thread_id"):
+    for key in ("conversation_id", "session_id", "thread_id"):
         value = _explicit_id(body.get(key))
         if value:
             identity = f"{key}:{value}"

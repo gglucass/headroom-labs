@@ -5850,9 +5850,9 @@ class OpenAIHandlerMixin:
         # key mid-conversation. Left None when compression did not run: a
         # bypassed turn saves nothing and must not reset the running total.
         # ``savings_conversation_key`` is None without an explicit conversation
-        # id (Codex's ``prompt_cache_key``, a session header) or when the body
-        # carries ``previous_response_id``/``conversation`` (incremental input
-        # against server-side state); the funnel then books per request.
+        # id (a body id, a session header) or when the body carries
+        # ``previous_response_id``/``conversation`` (incremental input against
+        # server-side state); the funnel then books per request.
         responses_conversation_key: str | None = None
         _pre_compression_conversation_key = savings_conversation_key(
             body,

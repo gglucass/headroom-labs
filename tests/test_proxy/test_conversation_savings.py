@@ -296,18 +296,18 @@ def test_shared_instructions_with_distinct_input_are_not_one_conversation() -> N
     assert ledger.novel(a, 100) is None and ledger.novel(b, 100) is None
 
 
-def test_codex_prompt_cache_key_names_the_conversation() -> None:
-    turn1 = _responses_body("fix the failing test", prompt_cache_key="conv-1234")
-    turn2 = _responses_body("fix the failing test", prompt_cache_key="conv-1234")
-    turn2["input"].append(
-        {"role": "user", "content": [{"type": "input_text", "text": "now the lint"}]}
-    )
-    key = savings_conversation_key(turn1)
-    assert key is not None
-    assert savings_conversation_key(turn2) == key
-    other = _responses_body("fix the failing test", prompt_cache_key="conv-5678")
-    assert savings_conversation_key(other) not in (None, key)
-    assert savings_conversation_key(_responses_body("x", prompt_cache_key="auto")) is None
+def test_prompt_cache_key_is_cache_routing_not_identity() -> None:
+    """OpenAI documents one prompt_cache_key shared across a user's sessions
+    and forks, and across independent single-turn requests. Two conversations
+    under one key must not share a running total, so the key alone yields no
+    identity; a real session id beside it does, and wins."""
+    a = _responses_body("fix the failing test", prompt_cache_key="shared-support-prefix")
+    b = _responses_body("write the release notes", prompt_cache_key="shared-support-prefix")
+    assert savings_conversation_key(a) is None and savings_conversation_key(b) is None
+    a_key = savings_conversation_key(a, session_id="session-0")
+    b_key = savings_conversation_key(b, session_id="session-1")
+    assert a_key is not None and b_key is not None and a_key != b_key
+    assert savings_conversation_key(a, session_id="session-0") == a_key
 
 
 def test_explicit_ids_and_caller_vouched_sessions() -> None:
