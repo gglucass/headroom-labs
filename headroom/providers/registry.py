@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from collections.abc import Callable, Mapping
@@ -11,6 +12,7 @@ from typing import TYPE_CHECKING, Any, cast
 from headroom.providers.claude import DEFAULT_API_URL as DEFAULT_ANTHROPIC_API_URL
 from headroom.providers.codex import DEFAULT_API_URL as DEFAULT_OPENAI_API_URL
 from headroom.providers.gemini import DEFAULT_API_URL as DEFAULT_GEMINI_API_URL
+from headroom.proxy.upstream_guard import is_safe_upstream_url
 
 DEFAULT_CLOUDCODE_API_URL = "https://cloudcode-pa.googleapis.com"
 DEFAULT_VERTEX_API_URL = "https://us-central1-aiplatform.googleapis.com"
@@ -78,7 +80,9 @@ class ProxyProviderRuntime:
             return self.api_targets.gemini
         if headers.get("api-key"):
             azure_base = headers.get("x-headroom-base-url", "")
-            if azure_base:
+            # Same SSRF guard as `proxy_targets.select_passthrough_base_url`;
+            # both resolve a caller-named upstream (CVE-2026-77775).
+            if azure_base and is_safe_upstream_url(azure_base):
                 return azure_base.rstrip("/")
         return self.api_targets.openai
 
@@ -91,6 +95,21 @@ def _normalize_api_url(url: str | None, *, default: str) -> str:
     if normalized.endswith("/v1"):
         normalized = normalized[:-3]
     return normalized
+
+
+def _log_backend_init_failure(
+    logger: logging.Logger,
+    *,
+    backend: str,
+    provider: str,
+    exc: Exception,
+) -> None:
+    logger.error(
+        "backend initialization failed: backend=%s provider=%s error=%s",
+        backend,
+        provider,
+        exc,
+    )
 
 
 def resolve_api_overrides(
@@ -115,11 +134,55 @@ def resolve_api_overrides(
     )
 
 
+def resolve_extra_headers(
+    cli_value: str | None,
+    env_var: str,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, str] | None:
+    """Resolve extra headers to merge into (and override) forwarded provider requests.
+
+    Accepts a JSON object string from CLI or env (CLI wins). Returns ``None`` if unset.
+    Raises ``ValueError`` on invalid JSON or a non-string-keyed/valued object.
+    """
+    env = environ or os.environ
+    raw = cli_value or env.get(env_var)
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError) as exc:
+        raise ValueError(f"{env_var} must be a JSON object of header name/value strings") from exc
+    if not isinstance(parsed, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in parsed.items()
+    ):
+        raise ValueError(f"{env_var} must be a JSON object of header name/value strings")
+    return parsed or None
+
+
 def resolve_api_targets(overrides: ProviderApiOverrides) -> ProviderApiTargets:
     """Resolve normalized upstream provider targets from configured overrides."""
+    from headroom.copilot_auth import is_copilot_upstream_url
+
+    openai = _normalize_api_url(overrides.openai, default=DEFAULT_OPENAI_API_URL)
+
+    # GitHub Copilot serves BOTH its OpenAI surface (``/chat/completions``,
+    # ``/responses``) and its Anthropic surface (``/v1/messages``, for Claude
+    # models) from the same host. When the OpenAI target is a Copilot host
+    # (``wrap copilot --subscription`` / ``wrap vscode`` both point it there so
+    # GPT models work) but no Anthropic target was set, Claude-model requests
+    # fell back to ``DEFAULT_ANTHROPIC_API_URL`` (api.anthropic.com) and 401'd
+    # with the Copilot bearer — "Invalid bearer token" (#3247). Default the
+    # Anthropic target to the same Copilot host so those requests reach the
+    # surface that actually serves them. An explicit ``ANTHROPIC_TARGET_API_URL``
+    # still wins (only a ``None`` override is filled in here).
+    anthropic_override = overrides.anthropic
+    if anthropic_override is None and is_copilot_upstream_url(openai):
+        anthropic_override = openai
+
     return ProviderApiTargets(
-        anthropic=_normalize_api_url(overrides.anthropic, default=DEFAULT_ANTHROPIC_API_URL),
-        openai=_normalize_api_url(overrides.openai, default=DEFAULT_OPENAI_API_URL),
+        anthropic=_normalize_api_url(anthropic_override, default=DEFAULT_ANTHROPIC_API_URL),
+        openai=openai,
         gemini=_normalize_api_url(overrides.gemini, default=DEFAULT_GEMINI_API_URL),
         cloudcode=_normalize_api_url(overrides.cloudcode, default=DEFAULT_CLOUDCODE_API_URL),
         vertex=_normalize_api_url(overrides.vertex, default=DEFAULT_VERTEX_API_URL),
@@ -160,6 +223,7 @@ def create_proxy_backend(
 
     if backend == "anyllm" or backend.startswith("anyllm-"):
         provider = anyllm_provider
+        backend_name = "anyllm" if backend == "anyllm" else backend
         try:
             backend_cls = anyllm_backend_cls or _load_anyllm_backend()
             instance = cast("Backend", backend_cls(provider=provider, api_base=openai_api_url))
@@ -169,7 +233,12 @@ def create_proxy_backend(
             logger.warning("any-llm backend not available: %s", exc)
             return None
         except Exception as exc:  # pragma: no cover - defensive logging
-            logger.error("Failed to initialize any-llm backend: %s", exc)
+            _log_backend_init_failure(
+                logger,
+                backend=backend_name,
+                provider=provider,
+                exc=exc,
+            )
             return None
 
     normalized_backend = backend if backend.startswith("litellm-") else f"litellm-{backend}"
@@ -192,7 +261,12 @@ def create_proxy_backend(
         logger.warning("LiteLLM backend not available: %s", exc)
         return None
     except Exception as exc:  # pragma: no cover - defensive logging
-        logger.error("Failed to initialize LiteLLM backend: %s", exc)
+        _log_backend_init_failure(
+            logger,
+            backend=normalized_backend,
+            provider=provider,
+            exc=exc,
+        )
         return None
 
 

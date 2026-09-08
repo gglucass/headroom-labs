@@ -25,6 +25,28 @@ from .base import Backend, BackendResponse, StreamEvent
 
 logger = logging.getLogger(__name__)
 
+_OPENAI_STANDARD_PARAMS = (
+    "max_tokens",
+    "temperature",
+    "top_p",
+    "stop",
+    "tools",
+    "tool_choice",
+    "response_format",
+    "seed",
+    "n",
+)
+
+_OPENAI_CONSUMED_BODY_KEYS = frozenset(
+    {
+        "model",
+        "messages",
+        "stream",
+        "stream_options",
+        *_OPENAI_STANDARD_PARAMS,
+    }
+)
+
 # litellm calls `dotenv.load_dotenv()` during its own import, which loads
 # the project `.env` into `os.environ`. We don't want that side effect —
 # importing a backend module should not silently leak API keys into the
@@ -139,6 +161,17 @@ def _build_bedrock_fallback_map(region: str) -> dict[str, str]:
     return {name: f"bedrock/{prefix}.{model_id}" for name, model_id in _CLAUDE_MODELS}
 
 
+def _build_openai_extra_body(body: dict[str, Any]) -> dict[str, Any]:
+    """Return unconsumed top-level OpenAI request fields for vendor passthrough."""
+    return {
+        key: value
+        for key, value in body.items()
+        if key not in _OPENAI_CONSUMED_BODY_KEYS
+        and not key.startswith("x-headroom-")
+        and not key.startswith("x_headroom_")
+    }
+
+
 def _fetch_bedrock_inference_profiles(
     region: str | None, profile_name: str | None = None
 ) -> dict[str, str]:
@@ -226,6 +259,39 @@ def _fetch_bedrock_inference_profiles(
     return model_map
 
 
+def _parse_bedrock_model_overrides(raw: str | None) -> dict[str, str]:
+    """Parse the ``HEADROOM_BEDROCK_MODEL_MAP`` operator override.
+
+    AWS discovery keys the model map by the *normalized model name*, so it
+    cannot disambiguate application inference profiles that share one
+    underlying model — e.g. a team where ``claude-sonnet-5-kenneth`` and
+    ``claude-sonnet-5-jeremy`` both resolve to ``claude-sonnet-5``. When you
+    need requests billed to a *specific* application profile (per-user cost
+    attribution), pin the mapping explicitly here. The plain name Claude Code
+    sends (kept plain so tool-search deferral stays on) resolves to your ARN.
+
+    Format: comma-separated ``name=target`` pairs, where ``target`` is an
+    application-inference-profile ARN (routed via the converse endpoint) or
+    any LiteLLM model string. Whitespace around pairs is ignored; blank
+    entries are skipped.
+
+        HEADROOM_BEDROCK_MODEL_MAP="claude-sonnet-5=arn:aws:bedrock:...:application-inference-profile/x57j1esjrt66,claude-opus-4-8=arn:aws:bedrock:...:application-inference-profile/3dy9ytxuq2ci"
+    """
+    overrides: dict[str, str] = {}
+    if not raw:
+        return overrides
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if not pair or "=" not in pair:
+            continue
+        name, _, target = pair.partition("=")
+        name = name.strip()
+        target = target.strip()
+        if name and target:
+            overrides[name] = target
+    return overrides
+
+
 def _normalize_bedrock_profile_id(profile_id: str) -> str | None:
     """Extract standard Anthropic model name from Bedrock profile ID.
 
@@ -248,8 +314,10 @@ def _normalize_bedrock_profile_id(profile_id: str) -> str | None:
     if profile_id.startswith("bedrock/"):
         profile_id = profile_id[8:]
 
-    # Strip region prefix (us., eu., apac., au.)
-    for prefix in ["us.", "eu.", "apac.", "au."]:
+    # Strip region prefix (us., eu., apac., au.) or the newer "global."
+    # cross-region prefix used by current-gen profiles (e.g.
+    # "global.anthropic.claude-sonnet-4-6").
+    for prefix in ["us.", "eu.", "apac.", "au.", "global."]:
         if profile_id.startswith(prefix):
             profile_id = profile_id[len(prefix) :]
             break
@@ -262,8 +330,12 @@ def _normalize_bedrock_profile_id(profile_id: str) -> str | None:
     if not profile_id.startswith("claude"):
         return None
 
-    # Strip version suffix (-v1:0, -v2:0, etc.)
-    normalized = re.sub(r"-v\d+:\d+$", "", profile_id)
+    # Strip version suffix. Legacy dated profiles use "-v1:0" / "-v2:0";
+    # newer undated profiles use a bare "-v1" (no colon/revision) or carry
+    # no version suffix at all (e.g. "claude-opus-4-8"). Match all three
+    # shapes so undated current-gen profiles normalize instead of
+    # silently falling out of the resolvable model map.
+    normalized = re.sub(r"-v\d+(?::\d+)?$", "", profile_id)
     return normalized if normalized else None
 
 
@@ -341,6 +413,81 @@ PROVIDER_REGISTRY: dict[str, ProviderConfig] = {
 }
 
 
+# How long an upstream call may go silent before we give up on it.
+#
+# WHY THIS EXISTS. There was no timeout here at all, so a request the upstream
+# never answered blocked its caller forever. Observed 2026-08-07 under load:
+# four agent workers sat on ESTABLISHED connections for 36+ minutes while this
+# proxy answered /readyz in 0.11s. No error, no retry, no log line -- the
+# client just stops. That is the worst shape a failure can take, because it is
+# indistinguishable from slow work and no supervisor can tell the difference.
+#
+# A float, not an httpx.Timeout, on purpose: litellm expands a float into all
+# four httpx phases, so for a STREAMING call this becomes the maximum gap
+# BETWEEN CHUNKS rather than a cap on total generation time. A long answer
+# streaming steadily is never cut off; a stalled one dies. That is the
+# semantic we want, and it falls out of the simpler type.
+#
+# 600s is deliberately generous -- long enough that no healthy call is at
+# risk, short enough that a hang surfaces within a coffee break instead of
+# never.
+UPSTREAM_TIMEOUT_ENV = "HEADROOM_UPSTREAM_TIMEOUT"
+DEFAULT_UPSTREAM_TIMEOUT = 600.0
+
+
+def _upstream_timeout() -> float:
+    """Seconds. Never raises; a junk env value must not disable the timeout."""
+    import os
+
+    try:
+        v = float(os.getenv(UPSTREAM_TIMEOUT_ENV, DEFAULT_UPSTREAM_TIMEOUT))
+    except (TypeError, ValueError):
+        return DEFAULT_UPSTREAM_TIMEOUT
+    # 0 or negative would mean "no timeout" to httpx, which is the bug.
+    return v if v > 0 else DEFAULT_UPSTREAM_TIMEOUT
+
+
+# Providers that cannot possibly accept an Anthropic `sk-ant-` credential.
+#
+# Explicit, rather than the inverse "anything not Anthropic": an unrecognised
+# provider is usually a compatible or self-hosted gateway, and guessing wrong
+# there drops a key that WAS working. Bedrock/Vertex are absent because the
+# dispatch sites already skip them entirely (env-based auth).
+#
+# ponytail: a hand-kept tuple; grow it as targets are confirmed. A registry
+# lookup would be the upgrade if this ever outgrows a handful of entries.
+_REJECTS_ANTHROPIC_KEY = ("openai", "azure", "gemini")
+
+
+def _caller_key_travels_to(model: str, key: str) -> bool:
+    """Can this inbound credential authenticate the provider we are about to call?
+
+    The caller authenticates to the PROXY. A routing extension may then rewrite
+    the model across families mid-request (claude-opus-5 -> gpt-5-mini), and the
+    caller's key does not travel with that rewrite: we forward `sk-ant-...` to
+    OpenAI and earn a guaranteed 401, which reads downstream as "the cheap model
+    failed the task" rather than as the routing bug it is.
+
+    Only an unambiguous mismatch is refused. `sk-ant-` is Anthropic's documented
+    vendor-specific prefix, so it cannot authenticate one of the providers above.
+    Every other credential -- a plain Bearer token, an OpenAI-style `sk-` that a
+    dozen vendors also mint, anything aimed at a compatible or custom gateway --
+    is unclassifiable from the string alone and keeps the pass-through.
+
+    Returning False drops the api_key kwarg, so litellm falls back to the target
+    provider's own env credential: the only key that can work.
+    """
+    if not key.startswith("sk-ant-"):
+        return True
+    try:
+        from litellm import get_llm_provider
+
+        provider = (get_llm_provider(model)[1] or "").lower()
+    except Exception:  # noqa: BLE001 - unclassifiable model, keep pass-through
+        return True
+    return provider not in _REJECTS_ANTHROPIC_KEY
+
+
 def get_provider_config(provider: str) -> ProviderConfig:
     """Get provider config, with fallback for unknown providers."""
     if provider in PROVIDER_REGISTRY:
@@ -352,6 +499,38 @@ def get_provider_config(provider: str) -> ProviderConfig:
         model_map={},
         pass_through=True,
     )
+
+
+def _anthropic_usage_from_litellm(litellm_usage: Any) -> dict[str, Any]:
+    """Map LiteLLM usage to Anthropic-shape usage, surfacing cache tokens.
+
+    LiteLLM's ``prompt_tokens`` is the *total* prompt size including cached
+    tokens, while Anthropic's ``input_tokens`` excludes tokens served from or
+    written to the prompt cache. Without this mapping a working Bedrock prompt
+    cache is invisible to non-streaming clients: they see the full prompt count
+    and no cache fields, which looks exactly like the cache being broken
+    (see #1345). The streaming/OpenAI paths already surface these fields.
+    """
+    cache_read = int(getattr(litellm_usage, "cache_read_input_tokens", 0) or 0)
+    cache_write = int(getattr(litellm_usage, "cache_creation_input_tokens", 0) or 0)
+    details = getattr(litellm_usage, "prompt_tokens_details", None)
+    if details is not None:
+        cache_read = cache_read or int(getattr(details, "cached_tokens", 0) or 0)
+        cache_write = cache_write or int(getattr(details, "cache_creation_tokens", 0) or 0)
+    prompt_tokens = int(getattr(litellm_usage, "prompt_tokens", 0) or 0)
+    usage: dict[str, Any] = {
+        "input_tokens": max(prompt_tokens - cache_read - cache_write, 0),
+        # None-guard like the other fields: LiteLLM's Usage always carries the
+        # completion_tokens attribute, so the getattr default never fires, but a
+        # provider can leave it None. Emitting output_tokens=None would break the
+        # RequestOutcome int contract downstream (e.g. prometheus does
+        # tokens_output_total += output_tokens -> TypeError).
+        "output_tokens": int(getattr(litellm_usage, "completion_tokens", 0) or 0),
+    }
+    if cache_read or cache_write:
+        usage["cache_read_input_tokens"] = cache_read
+        usage["cache_creation_input_tokens"] = cache_write
+    return usage
 
 
 def _convert_anthropic_tool(tool: dict[str, Any]) -> dict[str, Any]:
@@ -464,6 +643,20 @@ class LiteLLMBackend(Backend):
         else:
             self._model_map = self._config.model_map
 
+        # Operator override map (all providers; only meaningful for Bedrock
+        # today). Lets you pin a plain model name to a specific target the
+        # AWS discovery can't disambiguate — e.g. a per-user application
+        # inference profile ARN for cost attribution. See
+        # `_parse_bedrock_model_overrides`.
+        self._model_overrides = _parse_bedrock_model_overrides(
+            os.environ.get("HEADROOM_BEDROCK_MODEL_MAP")
+        )
+        if self._model_overrides:
+            logger.info(
+                f"Loaded {len(self._model_overrides)} Bedrock model override(s) "
+                f"from HEADROOM_BEDROCK_MODEL_MAP: {sorted(self._model_overrides)}"
+            )
+
         logger.info(f"LiteLLM backend initialized (provider={provider}, region={region})")
 
     @property
@@ -480,6 +673,19 @@ class LiteLLMBackend(Backend):
         - "bedrock/us.anthropic.claude-sonnet-4-20250514-v1:0" (LiteLLM format)
         - "arn:aws:bedrock:...:application-inference-profile/..." (application inference profile)
         """
+        # Operator override wins over everything — an explicit pin the AWS
+        # discovery cannot express (e.g. a per-user application inference
+        # profile). Keyed by the plain name Claude Code sends.
+        override = self._model_overrides.get(anthropic_model)
+        if override:
+            if override.startswith("arn:aws:"):
+                # Application inference profile ARNs must use the converse
+                # route — the invoke route rejects ARNs with HTTP 400.
+                return f"bedrock/converse/{override}"
+            if override.startswith(f"{self.provider}/"):
+                return override
+            return f"{self.provider}/{override}"
+
         # Check direct mapping first
         if anthropic_model in self._model_map:
             return self._model_map[anthropic_model]
@@ -490,6 +696,21 @@ class LiteLLMBackend(Backend):
             # the invoke route rejects ARNs with HTTP 400.
             if anthropic_model.startswith("arn:aws:"):
                 return f"bedrock/converse/{anthropic_model}"
+
+            # Cross-region prefixed IDs are already fully qualified system-defined
+            # profile IDs — pass through directly.  Normalizing and re-looking them
+            # up in the discovery map can route the request to a wrong or
+            # unauthorized profile (e.g. an APPLICATION profile in the same account
+            # that also wraps the same foundation model). This applies whether the
+            # prefix arrives bare ("us.anthropic...") or already LiteLLM-qualified
+            # ("bedrock/us.anthropic...").
+            _CROSS_REGION_PREFIXES = ("au.", "us.", "eu.", "apac.", "global.")
+            if anthropic_model.startswith(_CROSS_REGION_PREFIXES):
+                return f"bedrock/{anthropic_model}"
+            if anthropic_model.startswith("bedrock/") and anthropic_model[
+                len("bedrock/") :
+            ].startswith(_CROSS_REGION_PREFIXES):
+                return anthropic_model
 
             normalized = _normalize_bedrock_profile_id(anthropic_model)
             if normalized and normalized in self._model_map:
@@ -576,13 +797,20 @@ class LiteLLMBackend(Backend):
                             tr_content = "\n".join(
                                 b.get("text", "") for b in tr_content if b.get("type") == "text"
                             )
-                        converted.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": tr["tool_use_id"],
-                                "content": str(tr_content),
-                            }
-                        )
+                        tool_msg: dict[str, Any] = {
+                            "role": "tool",
+                            "tool_call_id": tr["tool_use_id"],
+                            "content": str(tr_content),
+                        }
+                        # Claude Code's moving cache breakpoint usually lands on the
+                        # tail tool_result, not just the system prompt. Carry
+                        # cache_control through so LiteLLM's Bedrock Converse
+                        # transformation can inject a cachePoint here too (#1390
+                        # covers the system-prompt/text-block case; this is the
+                        # tool_result case, out of scope there).
+                        if "cache_control" in tr:
+                            tool_msg["cache_control"] = tr["cache_control"]
+                        converted.append(tool_msg)
                     continue
 
                 # tool_use blocks → OpenAI assistant message with tool_calls
@@ -614,6 +842,39 @@ class LiteLLMBackend(Backend):
 
         return converted
 
+    def _system_field_to_message(self, system: Any) -> dict[str, Any]:
+        """Convert Anthropic's top-level `system` field to an OpenAI-style message.
+
+        `system` can be a plain string or a list of content blocks, each of
+        which may carry its own `cache_control` breakpoint (Claude Code puts
+        the prompt-caching marker on the last system block). Flattening the
+        list to a joined string, as this code used to do, drops that
+        `cache_control` entirely: litellm's Bedrock Converse transformation
+        only emits a `cachePoint` when it sees content blocks with
+        `cache_control` on them, never for a plain string. That silently
+        broke prompt caching of the system prefix. #1390 covers the analogous
+        case for tool_result blocks in `_convert_messages_for_litellm` above;
+        this handles the top-level `system` field, which was out of scope
+        there. Preserve block structure and cache_control so the breakpoint
+        survives into the litellm call.
+        """
+        if isinstance(system, str):
+            return {"role": "system", "content": system}
+        if isinstance(system, list):
+            blocks: list[dict[str, Any]] = []
+            for s in system:
+                if isinstance(s, dict):
+                    block: dict[str, Any] = {"type": "text", "text": s.get("text", "")}
+                    if "cache_control" in s:
+                        block["cache_control"] = s["cache_control"]
+                else:
+                    block = {"type": "text", "text": str(s)}
+                blocks.append(block)
+            return {"role": "system", "content": blocks}
+        # Shouldn't happen in practice (None is filtered out via "system" in
+        # body), but stay defensive rather than raising.
+        return {"role": "system", "content": str(system)}
+
     def _to_anthropic_response(
         self,
         litellm_response: Any,
@@ -621,6 +882,24 @@ class LiteLLMBackend(Backend):
     ) -> dict[str, Any]:
         """Convert LiteLLM/OpenAI response to Anthropic format."""
         msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+
+        # A non-streaming upstream response can be HTTP 200 with an empty
+        # ``choices`` list (e.g. Azure OpenAI content filtering, or any
+        # OpenAI-compatible gateway on a usage-only / filtered turn). The
+        # streaming sibling already `continue`s past this (`if not
+        # chunk.choices`); indexing ``choices[0]`` here would instead raise
+        # IndexError and 500 the request. Return a valid empty assistant turn.
+        if not getattr(litellm_response, "choices", None):
+            return {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": original_model,
+                "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "usage": _anthropic_usage_from_litellm(getattr(litellm_response, "usage", None)),
+            }
 
         # Extract content from OpenAI format
         choice = litellm_response.choices[0]
@@ -653,10 +932,7 @@ class LiteLLMBackend(Backend):
         stop_reason = stop_reason_map.get(choice.finish_reason, "end_turn")
 
         # Build usage
-        usage = {
-            "input_tokens": getattr(litellm_response.usage, "prompt_tokens", 0),
-            "output_tokens": getattr(litellm_response.usage, "completion_tokens", 0),
-        }
+        usage = _anthropic_usage_from_litellm(litellm_response.usage)
 
         return {
             "id": msg_id,
@@ -700,21 +976,20 @@ class LiteLLMBackend(Backend):
 
             # Tools (convert Anthropic format to OpenAI format)
             if "tools" in body:
-                kwargs["tools"] = [_convert_anthropic_tool(t) for t in body["tools"]]
+                tools_in = body["tools"]
+                # Bedrock Converse API hard-rejects tool names over 64 chars.
+                # Claude Code injects every globally-added claude.ai MCP connector
+                # tool into every request, even disabled ones; a single oversized
+                # name 401s the whole call. Drop them before conversion instead.
+                if self.provider == "bedrock":
+                    tools_in = [t for t in tools_in if len(t.get("name", "")) <= 64]
+                kwargs["tools"] = [_convert_anthropic_tool(t) for t in tools_in]
             if "tool_choice" in body:
                 kwargs["tool_choice"] = _convert_tool_choice(body["tool_choice"])
 
             # System prompt (Anthropic puts it in body, OpenAI in messages)
             if "system" in body:
-                system = body["system"]
-                if isinstance(system, str):
-                    kwargs["messages"].insert(0, {"role": "system", "content": system})
-                elif isinstance(system, list):
-                    # Anthropic list format
-                    system_text = " ".join(
-                        s.get("text", "") if isinstance(s, dict) else str(s) for s in system
-                    )
-                    kwargs["messages"].insert(0, {"role": "system", "content": system_text})
+                kwargs["messages"].insert(0, self._system_field_to_message(body["system"]))
 
             # Provider-specific region config
             if self.region:
@@ -732,14 +1007,21 @@ class LiteLLMBackend(Backend):
             _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker")
             if self.provider not in _env_auth_providers:
                 auth_header = headers.get("authorization", headers.get("Authorization", ""))
-                if auth_header.startswith("Bearer "):
-                    kwargs["api_key"] = auth_header[7:]
-                elif headers.get("x-api-key"):
-                    kwargs["api_key"] = headers["x-api-key"]
+                _caller_key = (
+                    auth_header[7:]
+                    if auth_header.startswith("Bearer ")
+                    else headers.get("x-api-key", "")
+                )
+                # Only forward it if it can actually authenticate the TARGET.
+                if _caller_key and _caller_key_travels_to(litellm_model, _caller_key):
+                    kwargs["api_key"] = _caller_key
 
             logger.debug(f"LiteLLM request: model={litellm_model}")
 
             # Make the call
+            # Bounded, always: an upstream that never answers must not
+            # block the caller forever. setdefault so an explicit value wins.
+            kwargs.setdefault("timeout", _upstream_timeout())
             response = await acompletion(**kwargs)
 
             # Convert to Anthropic format
@@ -810,18 +1092,16 @@ class LiteLLMBackend(Backend):
             if "stop_sequences" in body:
                 kwargs["stop"] = body["stop_sequences"]
             if "tools" in body:
-                kwargs["tools"] = [_convert_anthropic_tool(t) for t in body["tools"]]
+                tools_in = body["tools"]
+                # Bedrock Converse API hard-rejects tool names over 64 chars.
+                # See send_message for the full rationale; same filter here.
+                if self.provider == "bedrock":
+                    tools_in = [t for t in tools_in if len(t.get("name", "")) <= 64]
+                kwargs["tools"] = [_convert_anthropic_tool(t) for t in tools_in]
             if "tool_choice" in body:
                 kwargs["tool_choice"] = _convert_tool_choice(body["tool_choice"])
             if "system" in body:
-                system = body["system"]
-                if isinstance(system, str):
-                    kwargs["messages"].insert(0, {"role": "system", "content": system})
-                elif isinstance(system, list):
-                    system_text = " ".join(
-                        s.get("text", "") if isinstance(s, dict) else str(s) for s in system
-                    )
-                    kwargs["messages"].insert(0, {"role": "system", "content": system_text})
+                kwargs["messages"].insert(0, self._system_field_to_message(body["system"]))
 
             # Provider-specific region config
             if self.region:
@@ -839,10 +1119,14 @@ class LiteLLMBackend(Backend):
             _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker")
             if self.provider not in _env_auth_providers:
                 auth_header = headers.get("authorization", headers.get("Authorization", ""))
-                if auth_header.startswith("Bearer "):
-                    kwargs["api_key"] = auth_header[7:]
-                elif headers.get("x-api-key"):
-                    kwargs["api_key"] = headers["x-api-key"]
+                _caller_key = (
+                    auth_header[7:]
+                    if auth_header.startswith("Bearer ")
+                    else headers.get("x-api-key", "")
+                )
+                # Only forward it if it can actually authenticate the TARGET.
+                if _caller_key and _caller_key_travels_to(litellm_model, _caller_key):
+                    kwargs["api_key"] = _caller_key
 
             msg_id = f"msg_{uuid.uuid4().hex[:24]}"
 
@@ -864,15 +1148,42 @@ class LiteLLMBackend(Backend):
                 },
             )
 
+            # Request usage in the final streaming chunk so cache metrics
+            # (cache_read_input_tokens / cache_creation_input_tokens) come back at
+            # all. Without this, LiteLLM/Bedrock never emits a usage chunk over SSE
+            # and the caller's cache stats always read 0, even when caching is
+            # working server-side.
+            kwargs["stream_options"] = {"include_usage": True}
+
             # Stream content — blocks emitted dynamically based on response
+            # Bounded, always: an upstream that never answers must not
+            # block the caller forever. setdefault so an explicit value wins.
+            kwargs.setdefault("timeout", _upstream_timeout())
             response = await acompletion(**kwargs)
             output_tokens = 0
             current_block_index = -1
             active_block_type: str | None = None  # "text" or "tool_use"
             tool_block_map: dict[int, int] = {}  # litellm tc.index → SSE block index
             stop_reason = "end_turn"
+            # Populated from the final usage chunk (stream_options.include_usage=True
+            # above). The message_start emitted before this loop always carries
+            # input_tokens=0 and no cache fields because LiteLLM/Bedrock only reports
+            # usage on the trailing chunk. Carry the final cache stats on the terminal
+            # message_delta instead of emitting a second protocol-invalid
+            # message_start after content has already streamed.
+            final_input_tokens = 0
+            final_cache_read_tokens = 0
+            final_cache_write_tokens = 0
 
             async for chunk in response:
+                if hasattr(chunk, "usage") and chunk.usage:
+                    cu = chunk.usage
+                    final_input_tokens = int(getattr(cu, "prompt_tokens", 0) or 0)
+                    final_cache_read_tokens = int(getattr(cu, "cache_read_input_tokens", 0) or 0)
+                    final_cache_write_tokens = int(
+                        getattr(cu, "cache_creation_input_tokens", 0) or 0
+                    )
+
                 if not hasattr(chunk, "choices") or not chunk.choices:
                     continue
 
@@ -978,13 +1289,21 @@ class LiteLLMBackend(Backend):
                     data={"type": "content_block_stop", "index": current_block_index},
                 )
 
+            delta_usage: dict[str, Any] = {"output_tokens": output_tokens}
+            if final_input_tokens or final_cache_read_tokens or final_cache_write_tokens:
+                delta_usage["input_tokens"] = final_input_tokens
+                if final_cache_read_tokens:
+                    delta_usage["cache_read_input_tokens"] = final_cache_read_tokens
+                if final_cache_write_tokens:
+                    delta_usage["cache_creation_input_tokens"] = final_cache_write_tokens
+
             # Emit message_delta with correct stop reason
             yield StreamEvent(
                 event_type="message_delta",
                 data={
                     "type": "message_delta",
                     "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-                    "usage": {"output_tokens": output_tokens},
+                    "usage": delta_usage,
                 },
             )
 
@@ -1036,19 +1355,13 @@ class LiteLLMBackend(Backend):
             }
 
             # Pass through OpenAI parameters
-            for param in [
-                "max_tokens",
-                "temperature",
-                "top_p",
-                "stop",
-                "tools",
-                "tool_choice",
-                "response_format",
-                "seed",
-                "n",
-            ]:
+            for param in _OPENAI_STANDARD_PARAMS:
                 if param in body:
                     kwargs[param] = body[param]
+
+            extra_body = _build_openai_extra_body(body)
+            if extra_body:
+                kwargs["extra_body"] = extra_body
 
             # Provider-specific region config
             if self.region:
@@ -1066,14 +1379,21 @@ class LiteLLMBackend(Backend):
             _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker")
             if self.provider not in _env_auth_providers:
                 auth_header = headers.get("authorization", headers.get("Authorization", ""))
-                if auth_header.startswith("Bearer "):
-                    kwargs["api_key"] = auth_header[7:]
-                elif headers.get("x-api-key"):
-                    kwargs["api_key"] = headers["x-api-key"]
+                _caller_key = (
+                    auth_header[7:]
+                    if auth_header.startswith("Bearer ")
+                    else headers.get("x-api-key", "")
+                )
+                # Only forward it if it can actually authenticate the TARGET.
+                if _caller_key and _caller_key_travels_to(litellm_model, _caller_key):
+                    kwargs["api_key"] = _caller_key
 
             logger.debug(f"LiteLLM OpenAI request: model={litellm_model}")
 
             # Make the call
+            # Bounded, always: an upstream that never answers must not
+            # block the caller forever. setdefault so an explicit value wins.
+            kwargs.setdefault("timeout", _upstream_timeout())
             response = await acompletion(**kwargs)
 
             # Build the usage block. LiteLLM normalizes prompt-cache stats from
@@ -1084,10 +1404,16 @@ class LiteLLMBackend(Backend):
             # cache_creation_tokens for the OpenAI nested dialect. Surface both
             # so PrefixCacheTracker.update_from_response on the backend-routed
             # path observes a stable shape instead of branching on key presence.
+            # None-guard the core counts (same defensive style as the cache
+            # fields just below). A provider can leave any of these None on the
+            # Usage object; emitting None here flows into the OpenAI-shape body,
+            # and the backend-routed OpenAI handler reads them straight into
+            # arithmetic and RequestOutcome (output_tokens=..., and
+            # max(0, prompt_tokens - ...)), which raises TypeError on None.
             usage_block: dict[str, Any] = {
-                "prompt_tokens": response.usage.prompt_tokens,
-                "completion_tokens": response.usage.completion_tokens,
-                "total_tokens": response.usage.total_tokens,
+                "prompt_tokens": int(getattr(response.usage, "prompt_tokens", 0) or 0),
+                "completion_tokens": int(getattr(response.usage, "completion_tokens", 0) or 0),
+                "total_tokens": int(getattr(response.usage, "total_tokens", 0) or 0),
             }
 
             # Defensive getattr: LiteLLM only attaches these top-level attrs
@@ -1211,22 +1537,16 @@ class LiteLLMBackend(Backend):
                 "stream": True,
             }
 
-            for param in [
-                "max_tokens",
-                "temperature",
-                "top_p",
-                "stop",
-                "tools",
-                "tool_choice",
-                "response_format",
-                "seed",
-                "n",
-            ]:
+            for param in _OPENAI_STANDARD_PARAMS:
                 if param in body:
                     kwargs[param] = body[param]
 
             if "stream_options" in body:
                 kwargs["stream_options"] = body["stream_options"]
+
+            extra_body = _build_openai_extra_body(body)
+            if extra_body:
+                kwargs["extra_body"] = extra_body
 
             # Provider-specific region config
             if self.region:
@@ -1244,11 +1564,18 @@ class LiteLLMBackend(Backend):
             _env_auth_providers = ("bedrock", "vertex_ai", "vertex_ai_beta", "sagemaker")
             if self.provider not in _env_auth_providers:
                 auth_header = headers.get("authorization", headers.get("Authorization", ""))
-                if auth_header.startswith("Bearer "):
-                    kwargs["api_key"] = auth_header[7:]
-                elif headers.get("x-api-key"):
-                    kwargs["api_key"] = headers["x-api-key"]
+                _caller_key = (
+                    auth_header[7:]
+                    if auth_header.startswith("Bearer ")
+                    else headers.get("x-api-key", "")
+                )
+                # Only forward it if it can actually authenticate the TARGET.
+                if _caller_key and _caller_key_travels_to(litellm_model, _caller_key):
+                    kwargs["api_key"] = _caller_key
 
+            # Bounded, always: an upstream that never answers must not
+            # block the caller forever. setdefault so an explicit value wins.
+            kwargs.setdefault("timeout", _upstream_timeout())
             response = await acompletion(**kwargs)
 
             async for chunk in response:

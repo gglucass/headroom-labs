@@ -40,12 +40,29 @@ def _is_tool_result_message(msg: dict) -> bool:
     return False
 
 
+def _extract_text_from_blocks(blocks: list) -> str | None:
+    """Extract joined text from a list-of-blocks content (e.g. Anthropic list-of-text-blocks).
+
+    Modern Claude Code sends ``tool_result`` content as a list of typed
+    blocks (``[{"type": "text", "text": "..."}]``) instead of a plain
+    string.  This helper extracts text from ``type == "text"`` blocks and
+    joins them.
+    """
+    texts = [b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text"]
+    return "\n".join(t for t in texts if t != "") or None
+
+
 def _extract_tool_result_content(msg: dict) -> str | None:
     """Extract text content from a tool result message (both formats)."""
     # OpenAI format
     if msg.get("role") == "tool":
         content = msg.get("content")
-        return content if isinstance(content, str) else None
+        if isinstance(content, str):
+            return content
+        # OpenAI content can also be a list of content parts
+        if isinstance(content, list):
+            return _extract_text_from_blocks(content)
+        return None
     # Anthropic format
     content = msg.get("content")
     if isinstance(content, list):
@@ -54,6 +71,8 @@ def _extract_tool_result_content(msg: dict) -> str | None:
                 inner = block.get("content")
                 if isinstance(inner, str):
                     return inner
+                if isinstance(inner, list):
+                    return _extract_text_from_blocks(inner)
     return None
 
 
@@ -69,7 +88,16 @@ def _swap_tool_result_content(msg: dict, new_content: str) -> dict:
     if isinstance(content, list):
         for block in content:
             if isinstance(block, dict) and block.get("type") == "tool_result":
-                block["content"] = new_content
+                inner = block.get("content")
+                if isinstance(inner, list):
+                    # Collapse list-of-blocks to a single text block.
+                    # The compressed content is a single string; preserving
+                    # multiple text blocks would produce a different joined
+                    # output on re-extraction (first text block replaced,
+                    # remaining text blocks still joined).
+                    block["content"] = [{"type": "text", "text": new_content}]
+                else:
+                    block["content"] = new_content
                 break
     return new_msg
 
@@ -95,6 +123,12 @@ class CompressionCache:
         # `RLock` (not `Lock`) so future code can call locked methods from
         # inside another locked method without self-deadlock.
         self._lock = threading.RLock()
+        # Serializes one sidecar-mode compress turn per session (pre-work,
+        # pipeline, post-work run as one block on an executor thread). The
+        # sidecar contract is sequential turns per conversation; this lock
+        # keeps a contract-violating concurrent pair from interleaving and
+        # tearing the tracker's prev-original/prev-returned snapshots.
+        self.session_turn_lock = threading.Lock()
         self._cache: OrderedDict[str, _CacheEntry] = OrderedDict()
         # `_stable_hashes` is CONTENT-KEYED, not positional. It records "we
         # have seen this content before and it is known not to compress
@@ -107,8 +141,10 @@ class CompressionCache:
         # `compute_frozen_count` (bounded above by the `min` clamp at
         # `proxy/handlers/anthropic.py`) and `update_from_result`'s
         # "unchanged content" tracking.
-        self._stable_hashes: set[str] = set()
-        self._first_seen: dict[str, float] = {}
+        # Ordered mappings preserve set/dict-style membership while allowing
+        # deterministic oldest-first eviction.
+        self._stable_hashes: OrderedDict[str, None] = OrderedDict()
+        self._first_seen: OrderedDict[str, float] = OrderedDict()
         self._hits: int = 0
         self._misses: int = 0
         self._total_tokens_saved: int = 0
@@ -144,6 +180,34 @@ class CompressionCache:
                 _, evicted = self._cache.popitem(last=False)
                 self._total_tokens_saved -= evicted.tokens_saved
 
+    def _mark_stable_locked(self, content_hash: str) -> None:
+        """Record a stable hash while bounding retained bookkeeping."""
+        self._stable_hashes[content_hash] = None
+        self._stable_hashes.move_to_end(content_hash)
+
+        while len(self._stable_hashes) > self.max_entries:
+            self._stable_hashes.popitem(last=False)
+
+    def _record_first_seen_locked(self, content_hash: str, seen_at: float) -> None:
+        """Record a first-seen timestamp while bounding retained bookkeeping."""
+        self._first_seen[content_hash] = seen_at
+        self._first_seen.move_to_end(content_hash)
+
+        while len(self._first_seen) > self.max_entries:
+            self._first_seen.popitem(last=False)
+
+    def _prune_expired_first_seen_locked(
+        self,
+        now: float,
+        ttl_seconds: float,
+    ) -> None:
+        """Remove first-seen entries whose cache timing window has expired."""
+        while self._first_seen:
+            _, oldest_seen_at = next(iter(self._first_seen.items()))
+            if now - oldest_seen_at < ttl_seconds:
+                break
+            self._first_seen.popitem(last=False)
+
     def mark_stable(self, content_hash: str) -> None:
         """Mark a content hash as stable (unchanged, not compressed).
 
@@ -152,7 +216,7 @@ class CompressionCache:
         even though no compressed version exists in the cache.
         """
         with self._lock:
-            self._stable_hashes.add(content_hash)
+            self._mark_stable_locked(content_hash)
 
     def mark_stable_from_messages(self, messages: list[dict], up_to: int) -> None:
         """Mark all tool_result hashes in messages[:up_to] as stable."""
@@ -161,7 +225,7 @@ class CompressionCache:
                 if _is_tool_result_message(msg):
                     content = _extract_tool_result_content(msg)
                     if content is not None:
-                        self._stable_hashes.add(self.content_hash(content))
+                        self._mark_stable_locked(self.content_hash(content))
 
     def should_defer_compression(
         self,
@@ -188,13 +252,18 @@ class CompressionCache:
         """
         with self._lock:
             now = time.time()
+            self._prune_expired_first_seen_locked(now, ttl_seconds)
+
             first_seen = self._first_seen.get(content_hash)
             if first_seen is None:
-                self._first_seen[content_hash] = now
+                self._record_first_seen_locked(content_hash, now)
                 return False  # First time — compress now (no cache entry to preserve)
+
             age = now - first_seen
             if age >= ttl_seconds - batch_window:
+                self._record_first_seen_locked(content_hash, now)
                 return False  # Near TTL boundary — compress now (batch window)
+
             return True  # Seen recently within TTL — defer to preserve cache
 
     def get_stats(self) -> dict:
@@ -307,7 +376,7 @@ class CompressionCache:
                     continue
                 if orig_content == comp_content:
                     # Content unchanged — mark as stable for frozen count walk
-                    self._stable_hashes.add(self.content_hash(orig_content))
+                    self._mark_stable_locked(self.content_hash(orig_content))
                     continue
                 h = self.content_hash(orig_content)
                 tokens_saved = len(orig_content) // 4 - len(comp_content) // 4

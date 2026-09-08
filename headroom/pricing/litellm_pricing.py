@@ -8,8 +8,16 @@ See: https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_windo
 
 from __future__ import annotations
 
+import json
+import logging
+import os
 from dataclasses import dataclass
 from typing import Any
+
+from headroom.pricing.litellm_model_resolution import (
+    pricing_lookup_candidates,
+    resolve_litellm_model_name,
+)
 
 # litellm calls `dotenv.load_dotenv()` during its own import, which loads
 # the project `.env` into `os.environ`. We don't want that side effect —
@@ -33,27 +41,67 @@ except ImportError:
     litellm = None  # type: ignore[assignment]
     LITELLM_AVAILABLE = False
 
-# Aliases for models removed from LiteLLM's cost database (retired/renamed).
-# Maps old model name -> current LiteLLM key that has equivalent pricing.
-_MODEL_ALIASES: dict[str, str] = {
-    # Claude 3.5 Sonnet retired Feb 2026, pricing same as claude-sonnet-4-20250514
-    "claude-3-5-sonnet-20241022": "claude-sonnet-4-20250514",
-    "claude-3-5-sonnet-20240620": "claude-sonnet-4-20250514",
-    # Claude 3 Sonnet retired
-    "claude-3-sonnet-20240229": "claude-3-haiku-20240307",
-}
-
 _resolved_model_cache: dict[str, str] = {}
+
+logger = logging.getLogger("headroom.pricing")
+
+# --- Gateway model-name resolution ---------------------------------------
+# When Headroom sits behind a gateway (Kong, LiteLLM, ...) that aliases model
+# names, the raw client name it sees (e.g. "claude-opus") is not a priced key
+# in litellm.model_cost, so dollar savings read $0. HEADROOM_MODEL_ALIAS_MAP is
+# an optional, gateway-agnostic, fail-soft static JSON map {client_name: target}
+# that reduces that name to a priced model_cost key (trying the target as-is and
+# with a bedrock/ or vertex_ai/ provider prefix stripped). Unset -> behavior is
+# identical to today's bare-prefix resolution; pricing never breaks.
+_GATEWAY_PROVIDER_PREFIXES = ("bedrock/", "vertex_ai/")
+
+
+def _static_alias_map() -> dict[str, str]:
+    raw = os.environ.get("HEADROOM_MODEL_ALIAS_MAP", "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        logger.debug("invalid HEADROOM_MODEL_ALIAS_MAP JSON", exc_info=True)
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(k): str(v) for k, v in data.items() if k and v}
+
+
+def _reduce_to_priced_key(target: str) -> str | None:
+    """Reduce a gateway target to a priced litellm.model_cost key, or None."""
+    if not LITELLM_AVAILABLE or litellm is None:
+        return None
+    candidates = [target]
+    for prefix in _GATEWAY_PROVIDER_PREFIXES:
+        if target.startswith(prefix):
+            candidates.append(target[len(prefix) :])
+    for candidate in candidates:
+        info = litellm.model_cost.get(candidate)
+        if info and info.get("input_cost_per_token") is not None:
+            return candidate
+    return None
 
 
 def resolve_litellm_model(model: str) -> str:
     """Resolve model name to one LiteLLM recognizes, adding provider prefix if needed.
     Results are cached per model name to avoid blocking the event loop
     with repeated synchronous litellm lookups.
+
+    When HEADROOM_MODEL_ALIAS_MAP is configured, a raw client name / group alias
+    is first reduced to a priced model_cost key; otherwise this falls through to
+    the bare-prefix rules. Shared by the live (cost.py) and persisted
+    (savings_tracker) pricing paths so both figures price identically.
     """
     if model in _resolved_model_cache:
         return _resolved_model_cache[model]
-    resolved = _resolve_litellm_model_uncached(model)
+    priced: str | None = None
+    alias = _static_alias_map()
+    if alias:
+        priced = _reduce_to_priced_key(alias.get(model, model))
+    resolved = priced if priced is not None else _resolve_litellm_model_uncached(model)
     _resolved_model_cache[model] = resolved
     return resolved
 
@@ -62,36 +110,15 @@ def _resolve_litellm_model_uncached(model: str) -> str:
     """Uncached resolution — called once per unique model name."""
     if not LITELLM_AVAILABLE:
         return model
-    # Try as-is first
-    try:
-        litellm.cost_per_token(model=model, prompt_tokens=1, completion_tokens=0)
-        return model
-    except Exception:
-        pass
-    # Try with provider prefix
-    prefixes = {
-        "claude-": "anthropic/",
-        "gpt-": "openai/",
-        "o1-": "openai/",
-        "o3-": "openai/",
-        "o4-": "openai/",
-        "gemini-": "google/",
-        "minimax-": "minimax/",
-        "deepseek-": "deepseek/",
-    }
-    # Case-insensitive prefix match: MiniMax uses mixed-case model
-    # names like "MiniMax-M3" (capital M's); we shouldn't require the
-    # user to lower-case their config to match.
-    model_lower = model.lower()
-    for pattern, prefix in prefixes.items():
-        if model_lower.startswith(pattern):
-            prefixed = f"{prefix}{model}"
-            try:
-                litellm.cost_per_token(model=prefixed, prompt_tokens=1, completion_tokens=0)
-                return prefixed
-            except Exception:
-                break
-    return model
+
+    def is_known_model(candidate: str) -> bool:
+        try:
+            litellm.cost_per_token(model=candidate, prompt_tokens=1, completion_tokens=0)
+            return True
+        except Exception:
+            return False
+
+    return resolve_litellm_model_name(model, is_known_model)
 
 
 def _register_minimax_pricing() -> None:
@@ -133,6 +160,13 @@ class LiteLLMModelPricing:
     max_output_tokens: int | None = None
     supports_vision: bool = False
     supports_function_calling: bool = False
+    # Prompt-cache traffic, where LiteLLM knows it. ``None`` means "not published
+    # for this model", which is distinct from 0.0 ("free"): the 1h write rate in
+    # particular is absent for most models, and a caller that needs it must either
+    # derive it (see :mod:`headroom.pricing.cache_ttl`) or report that it could not.
+    cache_read_per_1m: float | None = None
+    cache_write_5m_per_1m: float | None = None
+    cache_write_1h_per_1m: float | None = None
 
 
 def get_litellm_model_cost() -> dict[str, Any]:
@@ -160,21 +194,11 @@ def get_model_pricing(model: str) -> LiteLLMModelPricing | None:
         return None
     cost_data = litellm.model_cost
 
-    # Try exact match first
-    info = cost_data.get(model)
-
-    # Try common provider prefixes if not found
-    if info is None:
-        for prefix in ["openai/", "anthropic/", "google/", "mistral/", "deepseek/"]:
-            if f"{prefix}{model}" in cost_data:
-                info = cost_data[f"{prefix}{model}"]
-                break
-
-    # Try retired/renamed model aliases (LiteLLM removes old model keys over time)
-    if info is None:
-        alias = _MODEL_ALIASES.get(model)
-        if alias:
-            info = cost_data.get(alias)
+    info = None
+    for candidate in pricing_lookup_candidates(model):
+        info = cost_data.get(candidate)
+        if info is not None:
+            break
 
     if info is None:
         return None
@@ -192,7 +216,46 @@ def get_model_pricing(model: str) -> LiteLLMModelPricing | None:
         max_output_tokens=info.get("max_output_tokens"),
         supports_vision=info.get("supports_vision", False),
         supports_function_calling=info.get("supports_function_calling", False),
+        cache_read_per_1m=_per_1m(info.get("cache_read_input_token_cost")),
+        cache_write_5m_per_1m=_per_1m(info.get("cache_creation_input_token_cost")),
+        cache_write_1h_per_1m=_per_1m(info.get("cache_creation_input_token_cost_above_1hr")),
     )
+
+
+def _per_1m(cost_per_token: object) -> float | None:
+    """Scale a LiteLLM per-token cost to per-1M, preserving "not published".
+
+    ``None`` in, ``None`` out — the absence of a rate is information and must not
+    collapse into 0.0, which would read as free.
+    """
+    if not isinstance(cost_per_token, (int, float, str)):
+        return None
+    try:
+        return float(cost_per_token) * 1_000_000
+    except (TypeError, ValueError):
+        return None
+
+
+def pricing_per_1m(model: str) -> tuple[float, float] | None:
+    """``(input, output)`` USD per 1M tokens from LiteLLM, or ``None``.
+
+    The tuple shape providers already use for their own tables, so a provider can
+    prefer this over a hand-maintained copy with a single call. ``None`` means
+    "LiteLLM can't answer" — either it isn't installed (the dependency is gated
+    ``python_version < '3.14'``) or it doesn't know the model — which is the
+    provider's cue to fall back.
+
+    A found-but-zero price is returned as ``0.0`` rather than treated as missing:
+    some models genuinely are free, and ``savings_ledger`` already made this call
+    (see its note on "a legitimate 0.0 for genuinely free (0-priced) models").
+    """
+    pricing = get_model_pricing(model)
+    if pricing is None:
+        return None
+    # LiteLLM stores cost per token, so the x1e6 conversion leaves float noise
+    # ($0.4/1M arrives as 0.39999999999999997). Round at this boundary: 6 places
+    # is finer than any published rate and keeps the value printable.
+    return (round(pricing.input_cost_per_1m, 6), round(pricing.output_cost_per_1m, 6))
 
 
 def estimate_cost(
@@ -217,6 +280,47 @@ def estimate_cost(
     input_cost = (input_tokens / 1_000_000) * pricing.input_cost_per_1m
     output_cost = (output_tokens / 1_000_000) * pricing.output_cost_per_1m
     return input_cost + output_cost
+
+
+def estimate_cost_from_tokens(
+    model: str,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    cached_tokens: int = 0,
+) -> float | None:
+    """Cost for one request from token counts, using LiteLLM's own cost model.
+
+    Prefer this over :func:`estimate_cost` whenever a request may carry cached
+    tokens or exceed a model's long-context threshold. Flat per-1M rates cannot
+    express either: cache reads bill at their own rate, and on Anthropic's
+    Sonnet 4 / 4.5 family a prompt over 200K re-prices the *whole* request --
+    input, output and cache alike. ``litellm.cost_per_token`` applies both.
+
+    ``input_tokens`` is the TOTAL prompt, ``cached_tokens`` included. LiteLLM
+    subtracts the cached portion itself and tests the long-context threshold
+    against the total, so passing a cache-exclusive count would both
+    double-discount the cached tokens and understate the threshold.
+
+    Returns ``None`` when LiteLLM is unavailable (the dependency is gated
+    ``python_version < '3.14'``) or doesn't know the model -- the caller's cue
+    to fall back to its own table.
+    """
+    if not LITELLM_AVAILABLE:
+        return None
+    candidate = next((c for c in pricing_lookup_candidates(model) if c in litellm.model_cost), None)
+    if candidate is None:
+        return None
+    try:
+        prompt_cost, completion_cost = litellm.cost_per_token(
+            model=candidate,
+            prompt_tokens=input_tokens,
+            completion_tokens=output_tokens,
+            cache_read_input_tokens=cached_tokens,
+        )
+    except Exception as exc:  # pragma: no cover - depends on litellm internals
+        logger.debug("litellm.cost_per_token failed for %s: %s", candidate, exc)
+        return None
+    return float(prompt_cost) + float(completion_cost)
 
 
 def list_available_models() -> list[str]:

@@ -9,9 +9,52 @@ pytest.importorskip("fastapi")
 
 from fastapi.testclient import TestClient
 
+from headroom.cache.compression_store import get_compression_store, reset_compression_store
+from headroom.proxy.helpers import _reset_session_ccr_tracker_for_test
 from headroom.proxy.server import ProxyConfig, create_app
 
 _RAW_TRANSCRIPT = "\n".join(f"row {idx}: payload payload payload" for idx in range(80))
+
+# The hash most fixtures below embed in a "[... Retrieve more: hash=...]"
+# marker to drive CCR tool injection.
+_MARKER_HASH = "abc123def456abc123def456"
+
+
+@pytest.fixture(autouse=True)
+def _reset_ccr_tracker():
+    """Isolate the process-global ``SessionCcrTracker`` between tests.
+
+    Several tests here share ``session_id="stable-session"``, and the tracker's
+    ``has_done_ccr`` flag is monotonic per session. Without this, a test that
+    injects the tool leaves the flag set and the next test sees a sticky replay
+    it never set up — order-dependent, and only visible in file order, not when
+    run alone. Mirrors the fixture in ``tests/test_ccr_tool_always_on.py``.
+    """
+    _reset_session_ccr_tracker_for_test()
+    yield
+    _reset_session_ccr_tracker_for_test()
+
+
+@pytest.fixture(autouse=True)
+def _seed_marker_hash_in_store():
+    """Make ``_MARKER_HASH`` a real, verifiable compression-store entry.
+
+    CCRToolInjector.verify_ownership() (issue #2836) only advertises the
+    retrieve tool for hashes the compression store actually recognizes.
+    These fixtures hand-type marker text rather than compressing real
+    content through the store, so without this the hash would (correctly)
+    be treated as foreign and the tool would never get injected — these
+    tests are about the deferred-injection *policy*, not about exercising
+    real storage, so seed the one hash they all key off of.
+    """
+    reset_compression_store()
+    get_compression_store().store(
+        original="original tool output",
+        compressed="[100 items compressed to 10]",
+        explicit_hash=_MARKER_HASH,
+    )
+    yield
+    reset_compression_store()
 
 
 class _FakePrefixTracker:
@@ -490,7 +533,7 @@ def test_existing_retrieve_tool_keeps_reversible_ccr_path_when_prefix_is_frozen(
         assert [tool["name"] for tool in forwarded["tools"]] == ["headroom_retrieve"]
 
 
-def test_cache_mode_skip_forwards_original_prefix_when_tool_injection_is_deferred(
+def test_cache_mode_compresses_delta_but_replays_cached_prefix_when_markers_are_historical(
     monkeypatch,
 ) -> None:
     captured: dict[str, object] = {}
@@ -574,13 +617,19 @@ def test_cache_mode_skip_forwards_original_prefix_when_tool_injection_is_deferre
         )
 
         assert response.status_code == 200
-        assert captured.get("compression_calls", []) == []
+        assert len(captured.get("compression_calls", [])) == 1
         forwarded = captured["body"]
-        assert forwarded["messages"] == original_messages
-        assert "tools" not in forwarded
+        # The frozen prefix was cached COMPRESSED last turn, so it is replayed
+        # byte-identical to keep the prompt cache warm. The replayed marker is
+        # still redeemable this turn, so `headroom_retrieve` MUST be present or
+        # Anthropic 400s "Tool reference 'headroom_retrieve' not found" (#2766);
+        # injecting it whenever a marker exists is itself cache-stable (toggling
+        # is what busts the tools segment). Message prefix replayed AND tool present.
+        assert forwarded["messages"] == previous_forwarded_messages
+        assert [tool["name"] for tool in forwarded["tools"]] == ["headroom_retrieve"]
 
 
-def test_cache_mode_exact_prefix_replay_forwards_original_messages_when_tool_injection_is_deferred(
+def test_cache_mode_exact_prefix_replay_forwards_cached_compressed_prefix_and_injects_retrieve_tool(
     monkeypatch,
 ) -> None:
     captured: dict[str, object] = {}
@@ -663,8 +712,13 @@ def test_cache_mode_exact_prefix_replay_forwards_original_messages_when_tool_inj
         assert response.status_code == 200
         assert captured.get("compression_calls", []) == []
         forwarded = captured["body"]
-        assert forwarded["messages"] == original_messages
-        assert "tools" not in forwarded
+        # Single frozen message cached COMPRESSED last turn: replay it
+        # byte-identical so the cache holds instead of busting on original bytes.
+        # The replayed marker is still redeemable, so `headroom_retrieve` must be
+        # present this turn or Anthropic 400s "Tool reference 'headroom_retrieve'
+        # not found" (#2766). Message prefix replayed AND tool present.
+        assert forwarded["messages"] == previous_forwarded_messages
+        assert [tool["name"] for tool in forwarded["tools"]] == ["headroom_retrieve"]
 
 
 def test_token_mode_cached_messages_skip_cache_update_when_pipeline_result_is_unchanged(
@@ -748,7 +802,7 @@ def test_token_mode_cached_messages_skip_cache_update_when_pipeline_result_is_un
         assert forwarded["messages"] == marker_messages
 
 
-def test_non_token_non_cache_mode_still_skips_marker_emission_when_tool_is_unavailable(
+def test_non_token_non_cache_mode_keeps_compression_and_injects_tool_for_new_markers(
     monkeypatch,
 ) -> None:
     captured: dict[str, object] = {}
@@ -821,11 +875,16 @@ def test_non_token_non_cache_mode_still_skips_marker_emission_when_tool_is_unava
             },
         )
 
+        marker_message = {
+            "role": "user",
+            "content": "[100 items compressed to 10. Retrieve more: hash=abc123def456abc123def456]",
+        }
+
         assert response.status_code == 200
-        assert captured.get("compression_calls", []) == []
+        assert len(captured.get("compression_calls", [])) == 1
         forwarded = captured["body"]
-        assert forwarded["messages"] == original_messages
-        assert "tools" not in forwarded
+        assert forwarded["messages"] == [marker_message]
+        assert [tool["name"] for tool in forwarded["tools"]] == ["headroom_retrieve"]
 
 
 def test_non_token_non_cache_mode_keeps_reversible_path_and_records_waste_signals(
@@ -1035,8 +1094,16 @@ def test_cache_mode_existing_retrieve_tool_compresses_only_the_unfrozen_delta(
 
         def _fake_apply(**kwargs):
             captured.setdefault("compression_calls", []).append(kwargs["messages"])
+            captured["frozen_message_count"] = kwargs.get("frozen_message_count")
+            # fix-6 contract: the compressor is handed the frozen forwarded
+            # prefix + the delta and only compresses indices >=
+            # frozen_message_count (so the delta's tool_name resolves from the
+            # prefix). Mirror it: pass the frozen prefix through, compress the tail.
+            fz = kwargs.get("frozen_message_count") or 0
+            msgs = kwargs["messages"]
             return SimpleNamespace(
-                messages=[
+                messages=list(msgs[:fz])
+                + [
                     {
                         "role": "user",
                         "content": (
@@ -1087,7 +1154,14 @@ def test_cache_mode_existing_retrieve_tool_compresses_only_the_unfrozen_delta(
 
         assert response.status_code == 200
         assert len(captured.get("compression_calls", [])) == 1
-        assert captured["compression_calls"][0] == [original_messages[1]]
+        # fix-6 contract: the compressor receives the frozen forwarded prefix
+        # (the previously-forwarded compressed message) + the raw delta, with
+        # frozen_message_count = prefix length so ONLY the delta is compressed.
+        assert captured["compression_calls"][0] == [
+            previous_forwarded_messages[0],
+            original_messages[1],
+        ]
+        assert captured["frozen_message_count"] == 1
         forwarded = captured["body"]
         assert forwarded["messages"] == [
             previous_forwarded_messages[0],

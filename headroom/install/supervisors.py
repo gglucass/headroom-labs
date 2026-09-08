@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import getpass
 import os
 import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
+from datetime import datetime
 from pathlib import Path
+from xml.sax.saxutils import escape as _xml_escape
 
 import click
 
@@ -23,6 +27,7 @@ from .paths import (
     windows_run_cmd_path,
     windows_run_script_path,
 )
+from .providers import _powershell_literal
 from .runtime import resolve_headroom_command
 
 # After `launchctl bootout`, a follow-up `bootstrap` of the same label can
@@ -34,20 +39,71 @@ _MACOS_BOOTSTRAP_RETRY_DELAY = 0.5
 # `launchctl bootout` of an already-absent job exits with ESRCH ("No such
 # process"). That single code is the only failure we treat as already-stopped.
 _LAUNCHCTL_ESRCH = 3
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def _is_windows() -> bool:
     return sys.platform.startswith("win")
 
 
+def _validated_env_items(env: dict[str, str] | None) -> list[tuple[str, str]]:
+    items = list((env or {}).items())
+    for name, _value in items:
+        if not _ENV_NAME_RE.fullmatch(name):
+            raise click.ClickException(
+                f"Invalid environment variable name {name!r}; expected [A-Za-z_][A-Za-z0-9_]*."
+            )
+    return items
+
+
+def _bootstrap_with_retry(domain: str, plist_path: Path, *, action: str = "bootstrap") -> None:
+    """Bootstrap ``plist_path`` into ``domain``, riding out launchd's EIO window.
+
+    After a `launchctl bootout`, a follow-up `bootstrap` of the same label can
+    return EIO (error 5) for several seconds while launchd releases it. Retry
+    for ~15s before giving up. Shared by `install_supervisor` (bootout+bootstrap
+    on every apply) and `start_supervisor` (bootstrap after a failed kickstart)
+    so both self-heal instead of requiring the manual bootout+rm+reapply
+    recovery previously documented for this race.
+    """
+    last: subprocess.CompletedProcess[str] | None = None
+    for _ in range(_MACOS_BOOTSTRAP_RETRIES):
+        boot = run(
+            ["launchctl", "bootstrap", domain, str(plist_path)],
+            capture_output=True,
+            text=True,
+        )
+        if boot.returncode == 0:
+            return
+        last = boot
+        time.sleep(_MACOS_BOOTSTRAP_RETRY_DELAY)
+    detail = (last.stderr or last.stdout or "").strip() if last is not None else ""
+    raise click.ClickException(
+        f"launchctl could not {action} {domain}/{plist_path.stem}: {detail or 'unknown error'}"
+    )
+
+
 def _command_for_script(*parts: str) -> list[str]:
     return [*resolve_headroom_command(), *parts]
 
 
-def _render_unix_runner(path: Path, command: list[str]) -> ArtifactRecord:
+def _render_unix_runner(
+    path: Path, command: list[str], env: dict[str, str] | None = None
+) -> ArtifactRecord:
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Supervisors (launchd, systemd, cron) invoke this script with a bare
+    # environment — they do not inherit the interactive shell's exports (e.g.
+    # AWS_PROFILE, a custom HEADROOM_WORKSPACE_DIR). Export base_env here, before
+    # the exec, so `headroom install agent run` itself (which loads the manifest
+    # from HEADROOM_WORKSPACE_DIR) sees the same environment `install apply` was
+    # run under, not just the proxy subprocess it spawns.
+    export_lines = "".join(
+        f"export {name}={shlex.quote(value)}\n" for name, value in _validated_env_items(env)
+    )
     path.write_text(
-        "#!/usr/bin/env bash\nset -euo pipefail\nexec "
+        "#!/usr/bin/env bash\nset -euo pipefail\n"
+        + export_lines
+        + "exec "
         + " ".join(shlex.quote(x) for x in command)
         + "\n"
     )
@@ -56,13 +112,20 @@ def _render_unix_runner(path: Path, command: list[str]) -> ArtifactRecord:
 
 
 def _render_windows_runner(
-    ps1_path: Path, cmd_path: Path, command: list[str]
+    ps1_path: Path, cmd_path: Path, command: list[str], env: dict[str, str] | None = None
 ) -> list[ArtifactRecord]:
     ps1_path.parent.mkdir(parents=True, exist_ok=True)
     escaped = " ".join(
         [f'"{item}"' if (" " in item or item.endswith(".cmd")) else item for item in command]
     )
-    ps1_path.write_text(f"$ErrorActionPreference = 'Stop'\n& {escaped}\nexit $LASTEXITCODE\n")
+    # See _render_unix_runner: Windows services/tasks also start with a bare
+    # environment, so base_env must be set explicitly before invoking headroom.
+    env_lines = "".join(
+        f"$env:{name} = {_powershell_literal(value)}\n" for name, value in _validated_env_items(env)
+    )
+    ps1_path.write_text(
+        f"$ErrorActionPreference = 'Stop'\n{env_lines}& {escaped}\nexit $LASTEXITCODE\n"
+    )
     cmd_path.write_text(
         '@echo off\r\npowershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0'
         + ps1_path.name
@@ -84,6 +147,7 @@ def render_runner_scripts(manifest: DeploymentManifest) -> list[ArtifactRecord]:
                 windows_run_script_path(manifest.profile),
                 windows_run_cmd_path(manifest.profile),
                 _command_for_script("install", "agent", "run", "--profile", manifest.profile),
+                manifest.base_env,
             )
         )
         records.extend(
@@ -91,6 +155,7 @@ def render_runner_scripts(manifest: DeploymentManifest) -> list[ArtifactRecord]:
                 windows_ensure_script_path(manifest.profile),
                 windows_ensure_cmd_path(manifest.profile),
                 _command_for_script("install", "agent", "ensure", "--profile", manifest.profile),
+                manifest.base_env,
             )
         )
         return records
@@ -99,10 +164,12 @@ def render_runner_scripts(manifest: DeploymentManifest) -> list[ArtifactRecord]:
         _render_unix_runner(
             unix_run_script_path(manifest.profile),
             _command_for_script("install", "agent", "run", "--profile", manifest.profile),
+            manifest.base_env,
         ),
         _render_unix_runner(
             unix_ensure_script_path(manifest.profile),
             _command_for_script("install", "agent", "ensure", "--profile", manifest.profile),
+            manifest.base_env,
         ),
     ]
 
@@ -177,6 +244,97 @@ def _linux_task_spec(manifest: DeploymentManifest, ensure_script: Path) -> tuple
         f"{marker_start}\n@reboot {ensure_script}\n*/5 * * * * {ensure_script}\n{marker_end}\n"
     )
     return None, content
+
+
+def _windows_current_user() -> str:
+    """Best-effort ``DOMAIN\\USER`` for the S4U task principal."""
+
+    user = os.environ.get("USERNAME") or getpass.getuser()
+    domain = os.environ.get("USERDOMAIN")
+    return f"{domain}\\{user}" if domain else user
+
+
+def _windows_task_xml(command: str, *, trigger_xml: str, scope: str) -> str:
+    """Render Task Scheduler XML that runs ``command`` without a visible window.
+
+    User-scope tasks use an S4U principal ("run whether user is logged on or
+    not", no stored password) so each run happens in a non-interactive session
+    and never draws a console window (issue #2453). System-scope tasks keep the
+    LocalSystem service account, which already has no desktop.
+    """
+
+    if scope == "system":
+        principal = (
+            "    <UserId>S-1-5-18</UserId>\n"
+            "    <LogonType>ServiceAccount</LogonType>\n"
+            "    <RunLevel>HighestAvailable</RunLevel>"
+        )
+    else:
+        principal = (
+            f"    <UserId>{_xml_escape(_windows_current_user())}</UserId>\n"
+            "    <LogonType>S4U</LogonType>\n"
+            "    <RunLevel>LeastPrivilege</RunLevel>"
+        )
+    return (
+        '<?xml version="1.0" encoding="UTF-16"?>\n'
+        '<Task version="1.2" '
+        'xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\n'
+        "  <Triggers>\n"
+        f"{trigger_xml}\n"
+        "  </Triggers>\n"
+        '  <Principals>\n    <Principal id="Author">\n'
+        f"{principal}\n"
+        "    </Principal>\n  </Principals>\n"
+        "  <Settings>\n"
+        "    <Hidden>true</Hidden>\n"
+        "    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n"
+        "    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n"
+        "    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n"
+        "    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\n"
+        "    <StartWhenAvailable>true</StartWhenAvailable>\n"
+        "  </Settings>\n"
+        '  <Actions Context="Author">\n'
+        f"    <Exec>\n      <Command>{_xml_escape(command)}</Command>\n    </Exec>\n"
+        "  </Actions>\n"
+        "</Task>\n"
+    )
+
+
+def _windows_boot_trigger() -> str:
+    return "    <BootTrigger>\n      <Enabled>true</Enabled>\n    </BootTrigger>"
+
+
+def _windows_health_trigger() -> str:
+    start = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    return (
+        "    <TimeTrigger>\n"
+        f"      <StartBoundary>{start}</StartBoundary>\n"
+        "      <Enabled>true</Enabled>\n"
+        "      <Repetition>\n"
+        "        <Interval>PT5M</Interval>\n"
+        "        <StopAtDurationEnd>false</StopAtDurationEnd>\n"
+        "      </Repetition>\n"
+        "    </TimeTrigger>"
+    )
+
+
+def _register_windows_task(name: str, xml: str) -> None:
+    """Register ``xml`` as scheduled task ``name`` via ``schtasks /XML``."""
+
+    # schtasks reads the XML from a file; UTF-16 matches the declared encoding.
+    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".xml", encoding="utf-16", delete=False)
+    try:
+        tmp.write(xml)
+        tmp.close()
+        subprocess.run(
+            ["schtasks", "/Create", "/TN", name, "/XML", tmp.name, "/F"],
+            check=True,
+        )
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except OSError:
+            pass
 
 
 def install_supervisor(manifest: DeploymentManifest) -> list[ArtifactRecord]:
@@ -256,16 +414,21 @@ def install_supervisor(manifest: DeploymentManifest) -> list[ArtifactRecord]:
             and manifest.supervisor_kind == SupervisorKind.SERVICE.value
             else f"gui/{os.getuid()}"
         )
-        subprocess.run(["launchctl", "bootstrap", bootstrap_domain, str(plist_path)], check=True)
+        _bootstrap_with_retry(bootstrap_domain, plist_path)
         records.append(ArtifactRecord(kind="plist", path=str(plist_path)))
         return records
 
     if _is_windows() and manifest.supervisor_kind == SupervisorKind.SERVICE.value:
-        service_bin = f'cmd.exe /c "{windows_run_cmd_path(manifest.profile)}"'
-        subprocess.run(
-            ["sc.exe", "create", manifest.service_name, f"binPath= {service_bin}", "start= auto"],
-            check=True,
+        # sc.exe's binPath= value embeds its own quotes (cmd.exe /c "<path>").
+        # Passing this as an argv list lets subprocess.list2cmdline re-quote the
+        # token and sc.exe mis-tokenizes it (issue #1654), so build the exact
+        # command line ourselves and hand subprocess a string.
+        run_cmd = windows_run_cmd_path(manifest.profile)
+        create_cmd = (
+            f"sc.exe create {manifest.service_name} "
+            f'binPath= "cmd.exe /c \\"{run_cmd}\\"" start= auto'
         )
+        subprocess.run(create_cmd, check=True)
         subprocess.run(
             ["sc.exe", "failure", manifest.service_name, "reset= 0", "actions= restart/5000"],
             check=True,
@@ -277,35 +440,21 @@ def install_supervisor(manifest: DeploymentManifest) -> list[ArtifactRecord]:
         startup_name = f"{manifest.service_name}-startup"
         health_name = f"{manifest.service_name}-health"
         startup_cmd = str(windows_ensure_cmd_path(manifest.profile))
-        user_args = ["/RU", "SYSTEM"] if manifest.scope == "system" else []
-        start_schedule = [
-            "schtasks",
-            "/Create",
-            "/TN",
+        # Register from task XML (not schtasks flags) so the principal is S4U /
+        # hidden — flag-created tasks use an interactive token and flash a
+        # focus-stealing console on every run (issue #2453).
+        _register_windows_task(
             startup_name,
-            "/TR",
-            startup_cmd,
-            "/SC",
-            "ONSTART",
-            "/F",
-            *user_args,
-        ]
-        health_schedule = [
-            "schtasks",
-            "/Create",
-            "/TN",
+            _windows_task_xml(
+                startup_cmd, trigger_xml=_windows_boot_trigger(), scope=manifest.scope
+            ),
+        )
+        _register_windows_task(
             health_name,
-            "/TR",
-            startup_cmd,
-            "/SC",
-            "MINUTE",
-            "/MO",
-            "5",
-            "/F",
-            *user_args,
-        ]
-        subprocess.run(start_schedule, check=True)
-        subprocess.run(health_schedule, check=True)
+            _windows_task_xml(
+                startup_cmd, trigger_xml=_windows_health_trigger(), scope=manifest.scope
+            ),
+        )
         records.extend(
             [
                 ArtifactRecord(kind="windows-task", path=startup_name),
@@ -350,8 +499,6 @@ def start_supervisor(manifest: DeploymentManifest) -> None:
         # `stop`/`restart` leave behind, since they `bootout` the job, and
         # `kickstart` cannot recover it (launchctl error 113). Bootstrap fresh
         # instead — a successful bootstrap also starts the job via RunAtLoad.
-        # launchd can return EIO (error 5) from bootstrap for several seconds
-        # after a bootout while it releases the label, so retry for ~15s.
         plist_dir = (
             Path("/Library/LaunchDaemons")
             if manifest.scope == "system"
@@ -359,21 +506,8 @@ def start_supervisor(manifest: DeploymentManifest) -> None:
             else Path.home() / "Library" / "LaunchAgents"
         )
         plist_path = plist_dir / f"{label}.plist"
-        last = kick
-        for _ in range(_MACOS_BOOTSTRAP_RETRIES):
-            boot = run(
-                ["launchctl", "bootstrap", domain, str(plist_path)],
-                capture_output=True,
-                text=True,
-            )
-            if boot.returncode == 0:
-                return
-            last = boot
-            time.sleep(_MACOS_BOOTSTRAP_RETRY_DELAY)
-        detail = (last.stderr or last.stdout or "").strip()
-        raise click.ClickException(
-            f"launchctl could not start {domain}/{label}: {detail or 'unknown error'}"
-        )
+        _bootstrap_with_retry(domain, plist_path, action="start")
+        return
     if _is_windows() and manifest.supervisor_kind == SupervisorKind.SERVICE.value:
         subprocess.run(["sc.exe", "start", manifest.service_name], check=True)
 

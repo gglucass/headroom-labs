@@ -1,9 +1,11 @@
-"""Tests for headroom._ort — the Windows ORT_DYLIB_PATH auto-pin.
+"""Tests for headroom._ort -- the ORT_DYLIB_PATH auto-pin.
 
-The resolver guards the Rust core against the Windows DLL search picking
-up the Windows ML System32 onnxruntime.dll (deadlocks ort session init on
-Win11 24H2+, see headroom/_ort.py). The platform gate is monkeypatched so
-the full logic runs on any CI OS.
+The resolver points the Rust core's ort-load-dynamic runtime at the pip
+onnxruntime package's shared library on every platform: on Windows it
+guards against the DLL search picking up the Windows ML System32
+onnxruntime.dll, and on Linux/macOS it avoids static ORT import-time
+CPU feature faults on older x86_64 CPUs (#1278). The platform is
+monkeypatched so every branch runs on any CI OS.
 """
 
 from __future__ import annotations
@@ -20,6 +22,8 @@ import headroom._ort as _ort
 def _fresh_resolver(monkeypatch):
     """Reset the module-level cache and scrub the env before every test."""
     monkeypatch.setattr(_ort, "_pinned", _ort._UNSET)
+    monkeypatch.setattr(_ort, "_pinned_from_override", False)
+    monkeypatch.setattr(_ort, "_installed_ort_version", lambda: (1, 24))
     monkeypatch.delenv("ORT_DYLIB_PATH", raising=False)
 
 
@@ -37,10 +41,30 @@ def _fake_spec_for(monkeypatch, package_dir):
     )
 
 
-def test_noop_on_non_windows(monkeypatch):
+def test_pins_versioned_so_on_linux(monkeypatch, tmp_path):
     monkeypatch.setattr(sys, "platform", "linux")
-    assert _ort.ensure_ort_dylib_pinned() is None
-    assert "ORT_DYLIB_PATH" not in _ort.os.environ
+    pkg = tmp_path / "onnxruntime"
+    capi = pkg / "capi"
+    capi.mkdir(parents=True)
+    so = capi / "libonnxruntime.so.1.22.0"
+    so.write_bytes(b"not really a shared object")
+    _fake_spec_for(monkeypatch, pkg)
+
+    assert _ort.ensure_ort_dylib_pinned() == str(so)
+    assert _ort.os.environ["ORT_DYLIB_PATH"] == str(so)
+
+
+def test_pins_dylib_on_macos(monkeypatch, tmp_path):
+    monkeypatch.setattr(sys, "platform", "darwin")
+    pkg = tmp_path / "onnxruntime"
+    capi = pkg / "capi"
+    capi.mkdir(parents=True)
+    dylib = capi / "libonnxruntime.1.23.2.dylib"
+    dylib.write_bytes(b"not really a dylib")
+    _fake_spec_for(monkeypatch, pkg)
+
+    assert _ort.ensure_ort_dylib_pinned() == str(dylib)
+    assert _ort.os.environ["ORT_DYLIB_PATH"] == str(dylib)
 
 
 def test_respects_existing_env(monkeypatch):
@@ -48,6 +72,34 @@ def test_respects_existing_env(monkeypatch):
     monkeypatch.setenv("ORT_DYLIB_PATH", r"C:\custom\onnxruntime.dll")
     assert _ort.ensure_ort_dylib_pinned() == r"C:\custom\onnxruntime.dll"
     assert _ort.os.environ["ORT_DYLIB_PATH"] == r"C:\custom\onnxruntime.dll"
+    assert _ort.rust_ort_runtime_compatible()
+
+
+def test_incompatible_package_is_not_pinned(monkeypatch, tmp_path, caplog):
+    monkeypatch.setattr(_ort, "_installed_ort_version", lambda: (1, 23))
+    pkg = tmp_path / "onnxruntime"
+    capi = pkg / "capi"
+    capi.mkdir(parents=True)
+    (capi / "libonnxruntime.so.1.23.2").write_bytes(b"old")
+    _fake_spec_for(monkeypatch, pkg)
+
+    assert _ort.ensure_ort_dylib_pinned() is None
+    assert not _ort.rust_ort_runtime_compatible()
+    assert "older C API" in caplog.text
+
+
+def test_content_router_bypasses_native_detector_for_incompatible_ort(monkeypatch, caplog):
+    import headroom.transforms.content_router as router
+
+    monkeypatch.setenv("HEADROOM_DETECT_BACKEND", "rust")
+    monkeypatch.setattr(_ort, "rust_ort_runtime_compatible", lambda: False)
+    monkeypatch.setattr(router, "_detect_native_unhealthy", False)
+
+    result = router._detect_content('{"safe": true}')
+
+    assert result.content_type.value.startswith("json")
+    assert router._detect_native_unhealthy is True
+    assert "requires ONNX Runtime 1.24+" in caplog.text
 
 
 def test_pins_to_package_capi_dll(monkeypatch, tmp_path):
@@ -87,7 +139,7 @@ def test_no_pin_when_package_missing(monkeypatch):
     assert "ORT_DYLIB_PATH" not in _ort.os.environ
 
 
-def test_no_pin_when_dll_file_absent(monkeypatch, tmp_path):
+def test_no_pin_when_native_library_absent(monkeypatch, tmp_path):
     _force_windows(monkeypatch)
     pkg = tmp_path / "onnxruntime"
     pkg.mkdir()  # package exists, but no capi/onnxruntime.dll inside

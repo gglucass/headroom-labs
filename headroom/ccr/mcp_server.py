@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -34,6 +35,8 @@ from typing import Any
 
 from headroom import paths as _paths
 from headroom import savings_ledger
+from headroom.cache.compression_store import format_retrieval_miss_detail
+from headroom.telemetry import session as telemetry_session
 
 # fcntl is Unix-only; on Windows we skip file locking (stats are best-effort).
 # Keep the module typed as Any so Windows mypy runs don't try to resolve Unix-only attrs.
@@ -86,6 +89,12 @@ _READ_ENABLED = os.environ.get("HEADROOM_MCP_READ", "off").lower().strip() in (
 
 DEFAULT_PROXY_URL = os.environ.get("HEADROOM_PROXY_URL", "http://127.0.0.1:8787")
 
+# How often the parent-death watchdog polls os.getppid() (seconds). When the
+# launching MCP client is SIGKILLed, stdin EOF may never arrive and the SDK's
+# blocking stdin-reader thread wedges server.run() forever, orphaning this
+# process under init/launchd. The watchdog reaps us once we are reparented.
+PARENT_DEATH_POLL_INTERVAL = 5.0
+
 
 def _format_session_summary(
     summary: dict[str, Any],
@@ -129,6 +138,7 @@ def _format_session_summary(
             "too_small": "Too small (< 500 tokens)",
             "passthrough": "Passthrough (token counting)",
             "no_compressible_content": "No compressible content (user/assistant only)",
+            "unknown_token_accounting": "Unknown token accounting",
         }
         for key, count in uncomp.items():
             label = reason_labels.get(key, key)
@@ -165,9 +175,14 @@ def _format_session_summary(
     if isinstance(persistent_lifetime, dict):
         lifetime_tokens = persistent_lifetime.get("tokens_saved", 0) or 0
         lifetime_usd = persistent_lifetime.get("compression_savings_usd", 0.0) or 0.0
+        lifetime_cache_reads = persistent_lifetime.get("cache_read_tokens", 0) or 0
+        lifetime_cache_usd = persistent_lifetime.get("cache_savings_usd", 0.0) or 0.0
         lines.append("Lifetime Savings:")
         lines.append(f"  Tokens saved: {lifetime_tokens:,}")
         lines.append(f"  Compression savings: ${lifetime_usd:.2f}")
+        if lifetime_cache_reads:
+            lines.append(f"  Cache-read tokens: {lifetime_cache_reads:,}")
+            lines.append(f"  Cache savings: ${lifetime_cache_usd:.2f}")
         lines.append("")
 
     # Tip
@@ -245,6 +260,23 @@ def _read_shared_events(window_seconds: int = SESSION_WINDOW_SECONDS) -> list[di
     except Exception:
         pass
     return events
+
+
+def _build_proxy_unreachable_payload(
+    *,
+    proxy_url: str,
+    error: str,
+    http_status: int | None = None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "url": proxy_url,
+        "status": "unreachable",
+        "error": error,
+        "warning": f"Configured proxy {proxy_url} is unreachable ({error}).",
+    }
+    if http_status is not None:
+        payload["http_status"] = http_status
+    return payload
 
 
 @dataclass
@@ -435,7 +467,9 @@ class HeadroomMCPServer:
         """
         # Check local store first
         store = self._get_local_store()
+        entry_status = store.get_entry_status(hash_key, clean_expired=False)
         entry = store.retrieve(hash_key)
+        expired_entry_status = None
         if entry:
             self._stats.record_retrieval(hash_key)
             return {
@@ -446,6 +480,19 @@ class HeadroomMCPServer:
                 "compressed_item_count": entry.compressed_item_count,
                 "retrieval_count": entry.retrieval_count,
             }
+        if entry_status.get("status") == "expired":
+            expired_entry_status = entry_status
+        elif entry_status.get("status") == "available":
+            created_at = entry_status.get("created_at")
+            ttl_seconds = entry_status.get("ttl_seconds")
+            if isinstance(created_at, (int, float)) and isinstance(ttl_seconds, (int, float)):
+                age_seconds = time.time() - created_at
+                if age_seconds > ttl_seconds:
+                    expired_entry_status = {
+                        **entry_status,
+                        "status": "expired",
+                        "age_seconds": age_seconds,
+                    }
 
         # Fall back to proxy if available
         if self.check_proxy and HTTPX_AVAILABLE:
@@ -457,6 +504,26 @@ class HeadroomMCPServer:
                     return result
             except Exception:
                 pass  # Proxy unavailable, that's fine
+
+        if expired_entry_status:
+            ttl_seconds = expired_entry_status.get(
+                "ttl_seconds",
+                expired_entry_status["default_ttl_seconds"],
+            )
+            return {
+                "error": (
+                    f"{format_retrieval_miss_detail(expired_entry_status)}. "
+                    "Do not retry the same hash. Re-run the source command or re-read the source file."
+                ),
+                "hash": hash_key,
+                "status": "expired",
+                "ttl_seconds": ttl_seconds,
+                "age_seconds": expired_entry_status.get("age_seconds"),
+                "hint": (
+                    "Use the source of truth to regenerate fresh content. "
+                    "Re-run the command or re-read the file."
+                ),
+            }
 
         return {
             "error": "Content not found. It may have expired or the hash may be incorrect.",
@@ -487,6 +554,58 @@ class HeadroomMCPServer:
         response.raise_for_status()
         result: dict[str, Any] = response.json()
         return result
+
+    async def _probe_proxy_unreachable(self) -> dict[str, Any] | None:
+        """Return explicit proxy-unreachable state when the configured proxy is down."""
+        if not self.check_proxy or not HTTPX_AVAILABLE:
+            return None
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.get(f"{self.proxy_url}/livez")
+        except Exception as exc:
+            return _build_proxy_unreachable_payload(
+                proxy_url=self.proxy_url,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        if response.status_code != 200:
+            detail = None
+            try:
+                payload = response.json()
+            except Exception:
+                payload = None
+            if isinstance(payload, dict):
+                detail = payload.get("status")
+            if detail is None:
+                detail = response.text.strip() or None
+            error = f"HTTP {response.status_code}"
+            if detail:
+                error = f"{error} ({detail})"
+            return _build_proxy_unreachable_payload(
+                proxy_url=self.proxy_url,
+                error=error,
+                http_status=response.status_code,
+            )
+        try:
+            payload = response.json()
+        except Exception as exc:
+            return _build_proxy_unreachable_payload(
+                proxy_url=self.proxy_url,
+                error=f"invalid /livez payload: {type(exc).__name__}: {exc}",
+                http_status=response.status_code,
+            )
+        if not isinstance(payload, dict):
+            return _build_proxy_unreachable_payload(
+                proxy_url=self.proxy_url,
+                error="invalid /livez payload",
+                http_status=response.status_code,
+            )
+        if payload.get("status") != "healthy" or payload.get("alive") is not True:
+            return _build_proxy_unreachable_payload(
+                proxy_url=self.proxy_url,
+                error=f"proxy reported {payload.get('status', 'unhealthy')}",
+                http_status=response.status_code,
+            )
+        return None
 
     def _setup_handlers(self) -> None:
         """Register all MCP tool handlers."""
@@ -652,7 +771,12 @@ class HeadroomMCPServer:
         except Exception:
             logger.debug("durable savings recording failed", exc_info=True)
 
-        return [TextContent(type="text", text=json.dumps(result, indent=2))]
+        proxy_status = await self._probe_proxy_unreachable()
+        if proxy_status:
+            result["proxy"] = proxy_status
+            result["warning"] = proxy_status["warning"]
+
+        return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
 
     def _record_savings(self, result: dict[str, Any]) -> None:
         """Append a durable savings event for a completed compression."""
@@ -671,6 +795,16 @@ class HeadroomMCPServer:
             model=os.environ.get("HEADROOM_MCP_MODEL"),
             client=self._current_client(),
             source="mcp",
+        )
+        # Anonymous beacon (opt-out; no-op unless enabled). Without this the MCP
+        # path is invisible to aggregate stats even though it is a first-class
+        # way to use Headroom — and subagents make that worse, since each runs
+        # its own MCP server. Swallows its own errors; the caller's try/except
+        # is a second net, not the first.
+        telemetry_session.record_mcp_compression(
+            original_tokens=before,
+            compressed_tokens=after,
+            model=os.environ.get("HEADROOM_MCP_MODEL"),
         )
 
     def _current_client(self) -> str:
@@ -707,7 +841,7 @@ class HeadroomMCPServer:
             json.dumps(result, ensure_ascii=False, default=str),
         )
 
-        return [TextContent(type="text", text=json.dumps(result, indent=2))]
+        return [TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
 
     async def _handle_stats(self) -> list[TextContent]:
         """Handle headroom_stats tool call."""
@@ -766,8 +900,13 @@ class HeadroomMCPServer:
                 proxy_stats = self._extract_proxy_stats(proxy_data)
                 if proxy_stats:
                     stats["proxy"] = proxy_stats
+            else:
+                proxy_status = await self._probe_proxy_unreachable()
+                if proxy_status:
+                    stats["proxy"] = proxy_status
+                    stats["warning"] = proxy_status["warning"]
 
-        return [TextContent(type="text", text=json.dumps(stats, indent=2))]
+        return [TextContent(type="text", text=json.dumps(stats, indent=2, ensure_ascii=False))]
 
     async def _fetch_full_proxy_stats(self) -> dict[str, Any] | None:
         """Fetch full stats from the proxy (includes summary)."""
@@ -915,15 +1054,88 @@ class HeadroomMCPServer:
             )
         ]
 
-    async def run_stdio(self) -> None:
-        """Run the server with stdio transport."""
+    async def _await_parent_death(self, interval: float) -> None:
+        """Resolve once the launching parent process is gone.
+
+        We are started with a real parent (the MCP client, over stdio). If our
+        ppid changes we have been reparented — the client died — and stdin EOF
+        may never come (SIGKILL leaves the SDK's blocking stdin reader wedged),
+        so ``server.run`` would hang forever. Detecting the reparent lets the
+        caller shut down instead of orphaning. Watching for *any* change to the
+        captured ppid is more portable than hard-coding ``== 1``: POSIX reparents
+        to init/launchd (pid 1), but a Linux subreaper can adopt us instead.
+        """
+        initial_ppid = os.getppid()
+        while os.getppid() == initial_ppid:
+            await asyncio.sleep(interval)
+        logger.warning(
+            "parent process gone (ppid %s -> %s); shutting down MCP server",
+            initial_ppid,
+            os.getppid(),
+        )
+
+    async def run_stdio(
+        self,
+        parent_death_poll_interval: float = PARENT_DEATH_POLL_INTERVAL,
+    ) -> None:
+        """Run the server with stdio transport.
+
+        Normally the server stops on stdin EOF when the client disconnects. A
+        parent-death watchdog runs alongside it because an abrupt client SIGKILL
+        leaves the SDK's stdin reader wedged and ``server.run`` never returns; the
+        watchdog forces shutdown once we are reparented.
+        """
         async with stdio_server() as (read_stream, write_stream):
             logger.info(f"Headroom MCP Server starting (proxy: {self.proxy_url})")
-            await self.server.run(
-                read_stream,
-                write_stream,
-                self.server.create_initialization_options(),
+            serve_task = asyncio.create_task(
+                self.server.run(
+                    read_stream,
+                    write_stream,
+                    self.server.create_initialization_options(),
+                )
             )
+            watchdog = asyncio.create_task(self._await_parent_death(parent_death_poll_interval))
+            done, _pending = await asyncio.wait(
+                {serve_task, watchdog},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            if watchdog in done:
+                # Parent died. stdin EOF may never arrive — a client SIGKILL
+                # leaves the SDK's stdin-reader thread blocked, so both
+                # ``server.run`` and the ``stdio_server`` context-manager exit
+                # can hang forever. Reap from *inside* the context manager:
+                # os._exit skips the (wedged) async teardown and guarantees this
+                # orphan dies. Reached only once the parent is already gone.
+                watchdog.result()  # surface a watchdog error, if any
+                await self.cleanup()
+                os._exit(0)
+
+            # Normal shutdown: the client closed stdin and ``server.run``
+            # returned. Cancel the watchdog and let the context manager unwind
+            # cleanly — the reader is not wedged in this path.
+            watchdog.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await watchdog
+            serve_task.result()  # re-raise a real server error; no-op on clean EOF
+
+    async def run_streamable_http(
+        self,
+        host: str,
+        port: int,
+        path: str,
+        debug: bool = False,
+    ) -> None:
+        """Run the server with Streamable HTTP transport."""
+        from .mcp_http import serve_streamable_http
+
+        await serve_streamable_http(
+            self,
+            host=host,
+            port=port,
+            path=path,
+            debug=debug,
+        )
 
     async def cleanup(self) -> None:
         """Clean up resources."""

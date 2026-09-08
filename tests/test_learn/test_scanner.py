@@ -8,6 +8,7 @@ making it impossible to reconstruct names formed from three or more tokens.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Generator
 from pathlib import Path
 from uuid import uuid4
@@ -159,6 +160,32 @@ class TestGreedyPathDecode:
     def test_nonexistent_path_returns_none(self, tmp_path: Path) -> None:
         result = _greedy_path_decode(tmp_path, ["does", "not", "exist"])
         assert result is None
+
+    def test_permission_denied_sibling_does_not_abort_the_walk(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A single inaccessible sibling must not hide every other match (#1624).
+
+        Real Windows profiles routinely contain reparse-point junctions (e.g.
+        ``AppData\\Local\\Temporary Internet Files``) that raise
+        ``PermissionError`` on ``is_dir()``. The old code listed
+        ``sorted(child for child in base.iterdir() if child.is_dir())`` in one
+        expression, so a single inaccessible sibling raised OSError out of the
+        whole comprehension and the entire directory's children — including the
+        one actually being decoded — were silently discarded, returning None.
+        """
+        _make_dirs(tmp_path, "Blocked", "real-target")
+        original_is_dir = Path.is_dir
+
+        def _guarded_is_dir(self: Path) -> bool:
+            if self.name == "Blocked":
+                raise PermissionError("Access is denied")
+            return original_is_dir(self)
+
+        monkeypatch.setattr(Path, "is_dir", _guarded_is_dir)
+
+        result = _greedy_path_decode(tmp_path, ["real", "target"])
+        assert result == tmp_path / "real-target"
 
     def test_empty_parts_returns_base_when_exists(self, tmp_path: Path) -> None:
         result = _greedy_path_decode(tmp_path, [])
@@ -391,6 +418,118 @@ class TestDecodeProjectPath:
         assert projects[0].name == "work"
         assert str(projects[0].project_path).startswith("C:")
 
+    def test_discover_project_prefers_session_cwd_over_ambiguous_folder_name(
+        self, tmp_path: Path
+    ) -> None:
+        nested = tmp_path / "vibe" / "remote"
+        hyphenated = tmp_path / "vibe-remote"
+        nested.mkdir(parents=True)
+        hyphenated.mkdir()
+
+        claude_dir = tmp_path / ".claude"
+        project_dir = claude_dir / "projects" / "C--Users-rod-work-vibe-remote"
+        project_dir.mkdir(parents=True)
+        (project_dir / "session.jsonl").write_text(json.dumps({"cwd": str(hyphenated)}) + "\n")
+
+        projects = ClaudeCodeScanner(claude_dir=claude_dir).discover_projects()
+
+        assert len(projects) == 1
+        assert projects[0].name == "vibe-remote"
+        assert projects[0].project_path == hyphenated
+
+    def test_windows_double_dash_encoding_decodes(self) -> None:
+        """Real Claude Code encoding has no leading dash: C:\\Users\\x → C--Users-x (#1849).
+
+        The drive colon and first backslash each flatten to '-', producing a
+        double dash after the drive letter. The decoder must not emit doubled
+        path separators from the resulting empty split token.
+        """
+        result = _decode_project_path("C--Users-jane-proj")
+
+        assert result is not None
+        rendered = str(result)
+        assert rendered.startswith("C:")
+        assert "\\\\" not in rendered.removeprefix("C:")
+        assert rendered == "C:\\Users\\jane\\proj"
+
+    def test_windows_double_dash_dotted_username_via_greedy(self) -> None:
+        """C--...-first-last-... must rejoin 'first.last' when the dir exists (#1849)."""
+        import sys
+        import tempfile
+
+        if sys.platform != "win32":
+            pytest.skip("greedy Windows-path decode requires real Windows filesystem")
+
+        with tempfile.TemporaryDirectory() as td:
+            project = Path(td) / "john.doe" / "work"
+            project.mkdir(parents=True)
+
+            drive = Path(td).drive[0]
+            rest = str(project)[3:]  # strip 'C:\\'
+            encoded = f"{drive}--" + rest.replace("\\", "-").replace(".", "-").replace(" ", "-")
+
+            result = _decode_project_path(encoded)
+            assert result == project
+
+    def test_windows_hyphenated_leaf_under_permission_denied_ancestor(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """D:\\work\\vibe-remote must decode correctly even when an ancestor
+        directory has an inaccessible sibling (#1624).
+
+        ``headroom learn --verbosity --project`` reported "No matching
+        project" on real Windows machines: the naive full-token join
+        (``vibe-remote`` split into ``vibe`` + ``remote``) doesn't exist, so
+        decoding falls through to the greedy walk — which real Windows user
+        profiles abort early on an inaccessible junction such as
+        ``AppData\\Local\\Temporary Internet Files``, long before reaching the
+        project directory itself.
+        """
+        import sys
+        import tempfile
+
+        if sys.platform != "win32":
+            pytest.skip("greedy Windows-path decode requires real Windows filesystem")
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "Blocked").mkdir()
+            project = root / "work" / "vibe-remote"
+            project.mkdir(parents=True)
+
+            original_is_dir = Path.is_dir
+
+            def _guarded_is_dir(self: Path) -> bool:
+                if self.name == "Blocked":
+                    raise PermissionError("Access is denied")
+                return original_is_dir(self)
+
+            monkeypatch.setattr(Path, "is_dir", _guarded_is_dir)
+
+            drive = root.drive[0]
+            rest = str(root)[3:]  # strip 'C:\\'
+            rest_parts = rest.replace("\\", "-") if rest else ""
+            encoded = f"{drive}--" + "-".join(p for p in (rest_parts, "work-vibe-remote") if p)
+
+            result = _decode_project_path(encoded)
+            assert result == project
+
+    def test_discover_double_dash_windows_project_fallback(self, tmp_path: Path) -> None:
+        """Nonexistent C--Users-... project must fall back to a valid path, not \\\\\\Users (#1849)."""
+        claude_dir = tmp_path / ".claude"
+        project_dir = claude_dir / "projects" / "C--Users-jane-proj"
+        project_dir.mkdir(parents=True)
+        (project_dir / "session.jsonl").write_text("{}\n")
+
+        projects = ClaudeCodeScanner(claude_dir=claude_dir).discover_projects()
+
+        assert len(projects) == 1
+        assert projects[0].name == "proj"
+        rendered = str(projects[0].project_path)
+        assert rendered.startswith("C:")
+        assert "\\\\" not in rendered.removeprefix("C:")
+        assert not rendered.startswith("\\")
+
     def test_home_dir_username_stays_single_component(self) -> None:
         """A home-directory name must survive decoding as one component.
 
@@ -434,3 +573,42 @@ class TestDecodeProjectPath:
         assert result == project
         # The home component is reconstructed whole, never split on a separator.
         assert home.name in result.parts
+
+
+# ---------------------------------------------------------------------------
+# PermissionError on speculative candidate paths (issue #2443)
+# ---------------------------------------------------------------------------
+
+
+class TestDecodePermissionError:
+    """A candidate path that raises PermissionError must not crash decode.
+
+    When the username contains a dash (``marco-rocha``), decoding
+    ``-home-marco-rocha-butterfly-sylphina`` probes candidates like
+    ``/home/marco/rocha``. If ``/home/marco`` is another user's unreadable
+    directory, ``Path.exists()`` raises ``PermissionError`` from ``os.stat``
+    rather than returning ``False`` — this used to crash ``headroom learn``.
+    """
+
+    def test_permission_error_treated_as_absent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        real_exists = Path.exists
+
+        def fake_exists(self: Path, *args: object, **kwargs: object) -> bool:
+            if str(self) == "/home/marco/rocha":
+                raise PermissionError(13, "Permission denied", str(self))
+            return real_exists(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "exists", fake_exists)
+
+        # Must not raise; the unreadable candidate is treated as non-existent.
+        result = _decode_project_path("-home-marco-rocha-butterfly-sylphina")
+        assert result is None or isinstance(result, Path)
+
+    def test_path_exists_swallows_oserror(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from headroom.learn.plugins.claude import _path_exists
+
+        def boom(self: Path, *args: object, **kwargs: object) -> bool:
+            raise PermissionError(13, "Permission denied", str(self))
+
+        monkeypatch.setattr(Path, "exists", boom)
+        assert _path_exists(Path("/home/marco")) is False

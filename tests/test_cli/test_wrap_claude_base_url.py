@@ -5,6 +5,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import click
+import pytest
+
 from headroom.cli import wrap as wrap_cli
 
 
@@ -29,6 +32,29 @@ def test_write_preserves_other_env_keys(tmp_path: Path) -> None:
     assert payload["env"]["KEEP"] == "1"
     assert payload["env"]["ANOTHER"] == "2"
     assert payload["env"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8787"
+
+
+def test_tool_search_write_and_restore_reaches_daemon_worker_settings(tmp_path: Path) -> None:
+    path = _settings(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps({"env": {"ENABLE_TOOL_SEARCH": "true", "KEEP": "1"}}),
+        encoding="utf-8",
+    )
+
+    previous = wrap_cli._write_claude_wrap_tool_search("false", settings_path=path)
+
+    assert previous == "true"
+    assert json.loads(path.read_text(encoding="utf-8"))["env"] == {
+        "ENABLE_TOOL_SEARCH": "false",
+        "KEEP": "1",
+    }
+
+    wrap_cli._restore_claude_wrap_tool_search(previous, settings_path=path)
+    assert json.loads(path.read_text(encoding="utf-8"))["env"] == {
+        "ENABLE_TOOL_SEARCH": "true",
+        "KEEP": "1",
+    }
 
 
 def test_write_returns_none_when_key_absent(tmp_path: Path) -> None:
@@ -155,21 +181,50 @@ def test_restore_noop_when_file_corrupt(tmp_path: Path) -> None:
     wrap_cli._restore_claude_wrap_base_url(None, settings_path=path)  # must not raise
 
 
-def test_write_recovers_from_corrupt_file(tmp_path: Path) -> None:
+def test_write_refuses_to_clobber_a_corrupt_file(tmp_path: Path) -> None:
+    """A file that will not parse is DATA, not a blank slate — never overwrite it.
+
+    This previously "recovered" by resetting the payload to ``{}`` and writing
+    that back, so a single hand-edited typo (or a transient read error) silently
+    destroyed the user's whole settings file — permissions, env and hooks — on
+    every ``headroom wrap claude``. Refusing leaves the file for the user to fix.
+    """
     path = _settings(tmp_path)
     path.parent.mkdir(parents=True)
-    path.write_text("not valid json {{{{", encoding="utf-8")
-    prev = wrap_cli._write_claude_wrap_base_url("http://127.0.0.1:8787", settings_path=path)
-    assert prev is None  # treated as fresh
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    assert payload["env"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8787"
+    original = '{"permissions": {"allow": ["Bash"]}, oops'
+    path.write_text(original, encoding="utf-8")
+
+    with pytest.raises(click.ClickException, match="not valid JSON"):
+        wrap_cli._write_claude_wrap_base_url("http://127.0.0.1:8787", settings_path=path)
+
+    assert path.read_text(encoding="utf-8") == original  # untouched
 
 
-def test_write_recovers_from_non_dict_payload(tmp_path: Path) -> None:
+def test_write_refuses_non_dict_payload(tmp_path: Path) -> None:
     path = _settings(tmp_path)
     path.parent.mkdir(parents=True)
-    path.write_text("[1, 2, 3]", encoding="utf-8")  # valid JSON but not a dict
+    original = "[1, 2, 3]"  # valid JSON but not a settings object
+    path.write_text(original, encoding="utf-8")
+
+    with pytest.raises(click.ClickException, match="does not contain a JSON object"):
+        wrap_cli._write_claude_wrap_base_url("http://127.0.0.1:8787", settings_path=path)
+
+    assert path.read_text(encoding="utf-8") == original  # untouched
+
+
+def test_write_recovers_from_an_empty_file(tmp_path: Path) -> None:
+    """An empty file has no settings to lose, so recover rather than strand the user.
+
+    A zero-byte settings.json is the classic residue of an interrupted
+    non-atomic write, so this is the one case where treating the file as fresh
+    is both safe and the helpful thing to do.
+    """
+    path = _settings(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_text("   \n", encoding="utf-8")
+
     prev = wrap_cli._write_claude_wrap_base_url("http://127.0.0.1:8787", settings_path=path)
+
     assert prev is None
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["env"]["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8787"
@@ -190,3 +245,100 @@ def test_write_restore_roundtrip(tmp_path: Path) -> None:
     assert "ANTHROPIC_BASE_URL" not in payload.get("env", {})
     assert payload["env"]["OTHER"] == "x"
     assert payload["model"] == "opus"
+
+
+# --- stale wrap marker (issue #1768) --------------------------------------
+
+
+def _marker(tmp_path: Path) -> Path:
+    return wrap_cli._wrap_marker_path(_settings(tmp_path))
+
+
+def test_write_with_port_creates_marker(tmp_path: Path) -> None:
+    path = _settings(tmp_path)
+    wrap_cli._write_claude_wrap_base_url("http://127.0.0.1:8787", settings_path=path, port=8787)
+    marker = json.loads(_marker(tmp_path).read_text(encoding="utf-8"))
+    assert marker["port"] == 8787
+    assert marker["key"] == "ANTHROPIC_BASE_URL"
+    assert marker["previous"] is None
+    assert marker["pid"] > 0
+
+
+def test_write_without_port_skips_marker(tmp_path: Path) -> None:
+    path = _settings(tmp_path)
+    wrap_cli._write_claude_wrap_base_url("http://127.0.0.1:8787", settings_path=path)
+    assert not _marker(tmp_path).exists()
+
+
+def test_restore_clears_marker_for_matching_key(tmp_path: Path) -> None:
+    path = _settings(tmp_path)
+    wrap_cli._write_claude_wrap_base_url("http://127.0.0.1:8787", settings_path=path, port=8787)
+    assert _marker(tmp_path).exists()
+    wrap_cli._restore_claude_wrap_base_url(None, settings_path=path)
+    assert not _marker(tmp_path).exists()
+
+
+def test_wrap_marker_is_stale_when_pid_missing() -> None:
+    assert wrap_cli._wrap_marker_is_stale({}) is True
+
+
+def test_wrap_marker_is_stale_when_pid_dead(tmp_path: Path) -> None:
+    path = _settings(tmp_path)
+    wrap_cli._write_claude_wrap_base_url("http://127.0.0.1:8787", settings_path=path, port=8787)
+    marker = json.loads(_marker(tmp_path).read_text(encoding="utf-8"))
+    marker["pid"] = 999_999_999  # astronomically unlikely to be a live pid
+    assert wrap_cli._wrap_marker_is_stale(marker) is True
+
+
+def test_wrap_marker_is_not_stale_for_live_pid(tmp_path: Path) -> None:
+    path = _settings(tmp_path)
+    wrap_cli._write_claude_wrap_base_url("http://127.0.0.1:8787", settings_path=path, port=8787)
+    marker = json.loads(_marker(tmp_path).read_text(encoding="utf-8"))
+    assert wrap_cli._wrap_marker_is_stale(marker) is False
+
+
+def test_wrap_marker_is_stale_when_pid_reused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Inject a deterministic PID identity: _proc_identity returns None on
+    # macOS without psutil, where reuse detection is deliberately best-effort
+    # and this scenario would be undetectable.
+    monkeypatch.setattr(wrap_cli, "_proc_identity", lambda pid: ("test", 50_000.0))
+    path = _settings(tmp_path)
+    wrap_cli._write_claude_wrap_base_url("http://127.0.0.1:8787", settings_path=path, port=8787)
+    marker = json.loads(_marker(tmp_path).read_text(encoding="utf-8"))
+    marker["start_time"] = marker["start_time"] - 10_000  # fabricate a mismatched identity
+    assert wrap_cli._wrap_marker_is_stale(marker) is True
+
+
+def test_check_and_clear_stale_wrap_marker_restores_previous(tmp_path: Path) -> None:
+    path = _settings(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps({"env": {"ANTHROPIC_BASE_URL": "http://old.proxy:9000"}}), encoding="utf-8"
+    )
+    wrap_cli._write_wrap_marker(
+        path, port=8787, key="ANTHROPIC_BASE_URL", previous="http://old.proxy:9000"
+    )
+    marker = json.loads(_marker(tmp_path).read_text(encoding="utf-8"))
+    marker["pid"] = 999_999_999
+    _marker(tmp_path).write_text(json.dumps(marker), encoding="utf-8")
+
+    restored = wrap_cli._check_and_clear_stale_wrap_marker(path, key="ANTHROPIC_BASE_URL")
+    assert restored == "http://old.proxy:9000"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    assert payload["env"]["ANTHROPIC_BASE_URL"] == "http://old.proxy:9000"
+    assert not _marker(tmp_path).exists()
+
+
+def test_check_and_clear_stale_wrap_marker_leaves_live_marker(tmp_path: Path) -> None:
+    path = _settings(tmp_path)
+    wrap_cli._write_claude_wrap_base_url("http://127.0.0.1:8787", settings_path=path, port=8787)
+    restored = wrap_cli._check_and_clear_stale_wrap_marker(path, key="ANTHROPIC_BASE_URL")
+    assert restored is None
+    assert _marker(tmp_path).exists()
+
+
+def test_check_and_clear_stale_wrap_marker_noop_when_no_marker(tmp_path: Path) -> None:
+    path = _settings(tmp_path)
+    assert wrap_cli._check_and_clear_stale_wrap_marker(path, key="ANTHROPIC_BASE_URL") is None

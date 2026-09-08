@@ -3,9 +3,65 @@
 from __future__ import annotations
 
 import ctypes
+import logging
 import os
 import sys
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+# Override for the CPU memory-arena default below: "1"/"true" forces the
+# arena ON, "0"/"false" forces it OFF, unset/"auto" uses the platform default.
+ONNX_CPU_ARENA_ENV = "HEADROOM_ONNX_CPU_ARENA"
+ONNX_ALLOW_SPINNING_ENV = "HEADROOM_ONNX_ALLOW_SPINNING"
+
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+_FALSY = frozenset({"0", "false", "no", "off"})
+
+
+def _env_flag(name: str) -> bool | None:
+    raw = os.environ.get(name, "").strip().lower()
+    if raw in _TRUTHY:
+        return True
+    if raw in _FALSY:
+        return False
+    if raw and raw != "auto":
+        logger.warning("%s must be a boolean or 'auto', got %r; using auto", name, raw)
+    return None
+
+
+def cpu_arena_enabled() -> bool:
+    """Whether ONNX Runtime's CPU memory arena should stay enabled.
+
+    Disabling the arena trades peak throughput for lower retained RSS, which
+    is the right call on the small Linux VMs Headroom commonly runs on. On
+    Windows the same setting is catastrophic: without the arena every
+    ``Run()`` falls back to per-node VirtualAlloc/free, slowing transformer
+    inference by 2-3 orders of magnitude (onnxruntime#11627). That turned
+    every compression into a >30s timeout for Windows proxy users, so the
+    arena stays at ORT's default (enabled) there.
+    """
+    override = _env_flag(ONNX_CPU_ARENA_ENV)
+    if override is not None:
+        return override
+    return sys.platform == "win32"
+
+
+def onnx_thread_spinning_enabled() -> bool:
+    """Whether ONNX Runtime intra/inter-op thread pools may spin-wait when idle.
+
+    ORT's thread pools spin-wait on every core between inferences by default, so
+    a long-lived proxy that keeps compression/embedding models loaded pegs all
+    cores even while completely idle — the machine slows to a crawl after a
+    while (#2495). Default to blocking idle threads (spinning off). Set
+    ``HEADROOM_ONNX_ALLOW_SPINNING=1`` to restore ORT's spinning for peak
+    throughput on a dedicated/batch box.
+    """
+    override = _env_flag(ONNX_ALLOW_SPINNING_ENV)
+    if override is not None:
+        return override
+    return False
+
 
 # Pin model artifacts to immutable commit SHAs so a changed or compromised
 # upstream HuggingFace repo cannot be pulled silently (supply-chain integrity).
@@ -78,6 +134,25 @@ def hf_hub_download_local_first(
         return str(hf_hub_download(repo_id, filename, revision=revision))
 
 
+def hf_entry_known_absent(repo_id: str, filename: str, *, revision: str | None = None) -> bool:
+    """True only if a prior network lookup already confirmed ``filename`` does
+    not exist in ``repo_id`` at the resolved revision.
+
+    Backed by ``huggingface_hub``'s own cache of negative lookups (the
+    ``.no_exist`` marker written after a real 404), so this never makes a
+    network call itself. Returns ``False`` both when the file is cached and
+    when nothing is known yet about it, on purpose: callers in a cache-only
+    (``allow_network=False``) code path can use this to tell "confirmed
+    missing upstream, safe to use a fallback file" apart from "just never
+    checked yet, do not guess."
+    """
+    from huggingface_hub import _CACHED_NO_EXIST, try_to_load_from_cache
+
+    revision = _resolve_revision(repo_id, revision)
+    result = try_to_load_from_cache(repo_id, filename, revision=revision)
+    return result is _CACHED_NO_EXIST
+
+
 def create_cpu_session_options(
     ort: Any,
     *,
@@ -90,6 +165,9 @@ def create_cpu_session_options(
     memory usage over peak ONNX throughput. Disabling ORT's CPU arena and memory
     pattern caches reduces retained anonymous RSS after variable-size inference
     workloads, which is especially important on small VMs.
+
+    The arena is left at ORT's default on Windows (see ``cpu_arena_enabled``),
+    where disabling it degrades inference latency by orders of magnitude.
     """
     sess_options = ort.SessionOptions()
 
@@ -98,10 +176,25 @@ def create_cpu_session_options(
     if inter_op_num_threads is not None:
         sess_options.inter_op_num_threads = inter_op_num_threads
 
-    if hasattr(sess_options, "enable_cpu_mem_arena"):
-        sess_options.enable_cpu_mem_arena = False
-    if hasattr(sess_options, "enable_mem_pattern"):
-        sess_options.enable_mem_pattern = False
+    if not onnx_thread_spinning_enabled():
+        # ORT's thread pools spin-wait on all cores between inferences by
+        # default, so idle-but-loaded models peg every core in a long-lived
+        # proxy (#2495). Make idle threads block instead. Best-effort: older ORT
+        # builds may not recognize a key.
+        for spin_key in (
+            "session.intra_op.allow_spinning",
+            "session.inter_op.allow_spinning",
+        ):
+            try:
+                sess_options.add_session_config_entry(spin_key, "0")
+            except Exception:
+                pass
+
+    if not cpu_arena_enabled():
+        if hasattr(sess_options, "enable_cpu_mem_arena"):
+            sess_options.enable_cpu_mem_arena = False
+        if hasattr(sess_options, "enable_mem_pattern"):
+            sess_options.enable_mem_pattern = False
 
     return sess_options
 

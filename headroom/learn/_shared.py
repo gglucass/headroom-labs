@@ -51,8 +51,18 @@ _ERROR_PATTERNS: list[tuple[re.Pattern[str], ErrorCategory]] = [
     ),
     (re.compile(r"EISDIR|Is a directory", re.I), ErrorCategory.IS_DIRECTORY),
     (re.compile(r"SyntaxError|IndentationError", re.I), ErrorCategory.SYNTAX_ERROR),
-    (re.compile(r"Traceback \(most recent|Exception:|Error:", re.I), ErrorCategory.RUNTIME_ERROR),
+    # Specific runtime failures must be checked BEFORE the generic RUNTIME_ERROR
+    # catch-all below. Every Python exception repr is "XxxError: ..." (or
+    # "Exception: ..."), so the generic `Error:`/`Exception:` pattern would
+    # otherwise match first and a "TimeoutError: ..." / "ConnectionError: ..."
+    # would be miscategorized as RUNTIME_ERROR, making the dedicated TIMEOUT and
+    # CONNECTION_ERROR categories unreachable for the common colon-repr form.
     (re.compile(r"timed? ?out|TimeoutError|deadline exceeded", re.I), ErrorCategory.TIMEOUT),
+    (
+        re.compile(r"ConnectionError|ConnectionRefused|ECONNREFUSED|network", re.I),
+        ErrorCategory.CONNECTION_ERROR,
+    ),
+    (re.compile(r"Traceback \(most recent|Exception:|Error:", re.I), ErrorCategory.RUNTIME_ERROR),
     (re.compile(r"No (?:matches|files|results) found|0 matches", re.I), ErrorCategory.NO_MATCHES),
     (
         re.compile(r"user.*reject|user.*denied|declined|didn't want to proceed", re.I),
@@ -60,10 +70,6 @@ _ERROR_PATTERNS: list[tuple[re.Pattern[str], ErrorCategory]] = [
     ),
     (re.compile(r"[Ss]ibling tool call errored", re.I), ErrorCategory.SIBLING_ERROR),
     (re.compile(r"exit code|non-zero|exited with", re.I), ErrorCategory.EXIT_CODE),
-    (
-        re.compile(r"ConnectionError|ConnectionRefused|ECONNREFUSED|network", re.I),
-        ErrorCategory.CONNECTION_ERROR,
-    ),
     (
         re.compile(r"BUILD FAILED|compilation error|compile error", re.I),
         ErrorCategory.BUILD_FAILURE,
@@ -77,6 +83,14 @@ def classify_error(content: str) -> ErrorCategory:
         if pattern.search(content[:2000]):  # Only check first 2KB
             return category
     return ErrorCategory.UNKNOWN
+
+
+# "exit code" only signals an error for a NONZERO code. Agent harnesses (Codex,
+# Grok, opencode, ...) append "exit code 0" to every SUCCESSFUL shell command,
+# so a bare "exit code" substring wrongly flagged those as errors and inflated
+# the learned failure rate. Match a nonzero code (case-insensitive, so
+# "Exit code: 1" counts too), never "exit code 0".
+_NONZERO_EXIT_RE = re.compile(r"exit code:?\s*(?!0\b)\d", re.IGNORECASE)
 
 
 def is_error_content(content: str) -> bool:
@@ -99,10 +113,11 @@ def is_error_content(content: str) -> bool:
         "auto-denied",
         "Sibling tool call errored",
         "timed out",
-        "exit code",
         "FileNotFoundError",
     ]
-    return any(ind in snippet for ind in indicators)
+    if any(ind in snippet for ind in indicators):
+        return True
+    return bool(_NONZERO_EXIT_RE.search(snippet))
 
 
 # =============================================================================

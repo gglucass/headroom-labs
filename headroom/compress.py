@@ -115,6 +115,15 @@ class CompressConfig:
     protect_analysis_context: bool = True
     """Detect 'analyze'/'review' intent and protect code from compression."""
 
+    frozen_message_count: int = 0
+    """Number of leading messages already anchored in the provider's prompt
+    cache. Transforms will not rewrite messages inside this frozen prefix
+    (read_lifecycle skips stale-Read replacements there), so compression
+    never converts 0.1x cached prefix reads into full-price rewrites.
+    Default 0 = no frozen prefix. The proxy handlers compute and pass this
+    automatically; library-mode callers that manage their own conversation
+    loop should pass the message count of the previous request."""
+
     # How aggressive
     target_ratio: float | None = None
     """Keep ratio for Kompress. None = model decides (~15% kept, aggressive).
@@ -182,7 +191,7 @@ def compress(
         config: Compression options (CompressConfig). Overrides defaults.
         **kwargs: Shorthand for CompressConfig fields. These override config:
             compress_user_messages, target_ratio, protect_recent,
-            protect_analysis_context, kompress_model.
+            protect_analysis_context, kompress_model, frozen_message_count.
 
     Returns:
         CompressResult with compressed messages and metrics.
@@ -202,14 +211,17 @@ def compress(
     if not messages or not optimize:
         return CompressResult(messages=messages)
 
-    # Build config from explicit config + kwargs
-    cfg = config or CompressConfig()
+    # Build config from explicit config + kwargs. ``replace(config)`` up front
+    # so kwargs overrides and any savings-profile pass never mutate the
+    # caller's long-lived ``CompressConfig`` — a shared per-agent config being
+    # silently rewritten by every request that overrode a single option is the
+    # scenario this guards against.
+    cfg = replace(config) if config is not None else CompressConfig()
     config_fields = {f.name for f in cfg.__dataclass_fields__.values()}
     for key, value in kwargs.items():
         if key in config_fields:
             setattr(cfg, key, value)
     if cfg.savings_profile:
-        cfg = replace(cfg)
         apply_agent_savings_profile(cfg, cfg.savings_profile)
 
     pipeline = _get_pipeline()
@@ -253,6 +265,7 @@ def compress(
             protect_analysis_context=cfg.protect_analysis_context,
             min_tokens_to_compress=cfg.min_tokens_to_compress,
             kompress_model=cfg.kompress_model,
+            frozen_message_count=cfg.frozen_message_count,
         )
 
         tokens_before = result.tokens_before

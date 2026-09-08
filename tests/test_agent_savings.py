@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from importlib import import_module
 from types import SimpleNamespace
 
@@ -9,6 +10,7 @@ from click.testing import CliRunner
 
 from headroom.agent_savings import (
     AGENT_90_PROFILE,
+    DEFAULT_PROFILE,
     apply_agent_savings_env_defaults,
     apply_agent_savings_profile,
     get_agent_savings_profile,
@@ -63,18 +65,57 @@ def test_agent_90_profile_exports_cross_agent_proxy_env() -> None:
     assert env["HEADROOM_ACCURACY_GUARD"] == "strict"
 
 
-def test_coding_persona_protects_working_set_and_stays_visible() -> None:
+def test_coding_persona_compresses_recent_delta_and_stays_visible() -> None:
     profile = get_agent_savings_profile("coding")
 
     env = profile.proxy_env()
 
     assert env["HEADROOM_SAVINGS_PROFILE"] == "coding"
-    assert env["HEADROOM_PROTECT_RECENT"] == "2"  # keep the active code working set verbatim
-    assert env["HEADROOM_MIN_TOKENS"] == "25"  # low → compression is actually visible
-    assert env["HEADROOM_COMPRESS_USER_MESSAGES"] == "0"  # no prompt mutation / cache bust
-    assert env["HEADROOM_COMPRESS_SYSTEM_MESSAGES"] == "0"
+    assert env["HEADROOM_MODE"] == "cache"  # delta-only compression at ~0 prefix-cache busts
+    assert env["HEADROOM_PROTECT_RECENT"] == "0"  # reads guarded by type, not position
+    assert env["HEADROOM_MIN_TOKENS"] == "10"  # low → even modest deltas are eligible
+    # Cache mode compresses the newest observation delta → compress_user must be ON.
+    assert env["HEADROOM_COMPRESS_USER_MESSAGES"] == "1"
+    assert env["HEADROOM_COMPRESS_SYSTEM_MESSAGES"] == "0"  # system prompt is the hottest cache
     assert env["HEADROOM_ACCURACY_GUARD"] == "strict"
     assert "HEADROOM_TARGET_RATIO" not in env  # unset → Kompress / ambient default decides
+    # Coding posture toggles seeded through the profile.
+    assert env["HEADROOM_TOOL_SEARCH"] == "1"
+    assert env["HEADROOM_DEDUPE"] == "1"
+    assert env["HEADROOM_LOSSLESS_THEN_LOSSY"] == "1"
+    assert env["HEADROOM_PROTECT_READS"] == "1"
+    assert env["HEADROOM_CODE_AWARE_ENABLED"] == "1"
+    assert env["HEADROOM_LOSSLESS"] == "0"  # lossy enabled (CCR keeps it recoverable)
+    assert env["HEADROOM_MIN_CHARS_FOR_BLOCK"] == "25"
+
+
+def test_coding_profile_couples_zero_protect_recent_with_type_read_guard() -> None:
+    """Fidelity invariant behind #2145's protect_recent 2->0.
+
+    Dropping positional protection (protect_recent=0) is only safe because the
+    code working set stays byte-exact via the TYPE-based read guard
+    (protect_reads=True), and any *other* recent delta that does get compressed
+    stays losslessly recoverable via CCR (lossless=0 means lossy-with-CCR, not
+    silent loss) while the frozen prefix is left untouched (cache mode). This is
+    the honest boundary: recent file reads are verbatim, recent non-read deltas
+    are recoverable — not "nothing is ever touched". If a future edit drops the
+    read guard while keeping protect_recent=0, recent reads would silently
+    degrade, so this test fails closed on that pairing.
+    """
+    profile = get_agent_savings_profile("coding")
+
+    # Positional protection is off ...
+    assert profile.protect_recent == 0
+    # ... so the byte-exact guarantee for reads MUST come from the type guard.
+    assert profile.protect_reads is True
+
+    env = profile.proxy_env()
+    assert env["HEADROOM_PROTECT_RECENT"] == "0"
+    assert env["HEADROOM_PROTECT_READS"] == "1"
+    # Lossy compression is on, but CCR keeps compressed deltas recoverable, and
+    # cache mode compresses only the newest delta (frozen prefix stays byte-stable).
+    assert env["HEADROOM_LOSSLESS"] == "0"
+    assert env["HEADROOM_MODE"] == "cache"
 
 
 def test_general_persona_has_no_positional_code_protection() -> None:
@@ -88,13 +129,18 @@ def test_general_persona_has_no_positional_code_protection() -> None:
 
 
 def test_personas_omit_target_ratio_in_pipeline_kwargs() -> None:
-    for name, expected_protect in (("coding", 2), ("general", 0)):
+    # coding compresses the delta observation (cache mode) → compress_user True;
+    # general has no positional code working set and leaves user turns intact.
+    for name, expected_protect, expected_compress_user, expected_min_tokens in (
+        ("coding", 0, True, 10),
+        ("general", 0, False, 25),
+    ):
         kwargs = proxy_pipeline_kwargs(ProxyConfig(savings_profile=name))
 
         assert kwargs["protect_recent"] == expected_protect
         assert kwargs["read_protection_window"] == expected_protect
-        assert kwargs["min_tokens_to_compress"] == 25
-        assert kwargs["compress_user_messages"] is False
+        assert kwargs["min_tokens_to_compress"] == expected_min_tokens
+        assert kwargs["compress_user_messages"] is expected_compress_user
         assert kwargs["compress_system_messages"] is False
         assert kwargs["force_kompress"] is False
         assert "target_ratio" not in kwargs  # persona never pins a keep-ratio
@@ -105,8 +151,8 @@ def test_persona_apply_profile_leaves_target_ratio_untouched() -> None:
 
     apply_agent_savings_profile(cfg, "coding")
 
-    assert cfg.protect_recent == 2
-    assert cfg.min_tokens_to_compress == 25
+    assert cfg.protect_recent == 0
+    assert cfg.min_tokens_to_compress == 10
     assert cfg.target_ratio == 0.42  # persona did not override an explicit ratio
 
 
@@ -124,9 +170,30 @@ def test_agent_savings_env_defaults_preserve_user_overrides() -> None:
     assert env["HEADROOM_SMART_CRUSHER_COMPACTION"] == "0"
 
 
-def test_unknown_agent_savings_profile_lists_valid_profiles() -> None:
-    with pytest.raises(ValueError, match="agent-90"):
-        get_agent_savings_profile("missing")
+def test_unknown_agent_savings_profile_falls_back_to_default(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # An unknown profile must NOT raise: it's resolved during proxy startup, so
+    # raising takes the whole proxy down before it opens its port (desktop asked
+    # for a profile a fallback runtime predates).
+    #
+    # It must degrade to the DEFAULT profile, not to "balanced". The two are not
+    # interchangeable: balanced flips cache->token mode, turns cross-turn dedup
+    # and tool-search off, stops compressing user messages, and raises the
+    # message floor 25x (250 vs 10) and the block floor 20x (500 vs 25). A typo
+    # in HEADROOM_SAVINGS_PROFILE used to silently reconfigure the entire proxy
+    # into that posture, which is strictly worse than behaving as if the
+    # variable were unset.
+    with caplog.at_level(logging.WARNING):
+        profile = get_agent_savings_profile("missing")
+    assert profile is get_agent_savings_profile(None)
+    assert profile.name == DEFAULT_PROFILE
+    assert profile is not get_agent_savings_profile("balanced")
+    assert "unknown savings profile" in caplog.text
+    assert "missing" in caplog.text
+    # The warning has to name the resolved profile, so an operator reading it
+    # knows what they actually got rather than only what they asked for.
+    assert DEFAULT_PROFILE in caplog.text
 
 
 def test_with_target_savings_recomputes_target_ratio() -> None:
@@ -730,3 +797,45 @@ def test_agent_savings_smoke_fixture_passes_real_gate(tmp_path) -> None:
     assert "codex: 91.0% savings meets 90.0%" in gate_result.output
     assert "cursor: 93.0% savings meets 90.0%" in gate_result.output
     assert "100.0% accuracy meets 90.0%" in gate_result.output
+
+
+def test_coding_profile_min_chars_block_reaches_router_without_env_seeding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The block-char floor must travel on the config object, not env only.
+
+    Every other router pipeline kwarg this function builds travels on the config
+    object; ``min_chars_for_block`` alone was populated only from
+    ``HEADROOM_MIN_CHARS_FOR_BLOCK`` (emitted by ``proxy_env()``). A proxy whose
+    config carried ``savings_profile="coding"`` but whose process env was never
+    seeded applied every sibling coding knob while this floor silently stayed at
+    ``ContentRouterConfig.min_chars_for_block_compression`` (500) instead of the
+    profile's 25 — a 20x gap on the gate that governs tool_result blocks.
+
+    Note this does not make the profile fully config-deliverable: fields whose
+    consumers read ``os.environ`` directly (``cross_turn_dedup`` via
+    ContentRouter, ``tool_search`` via the Anthropic handler) never pass through
+    this function and remain seed-dependent.
+    """
+    monkeypatch.delenv("HEADROOM_MIN_CHARS_FOR_BLOCK", raising=False)
+
+    class _Config:
+        savings_profile = "coding"
+        min_tokens_to_crush = 500
+
+    kwargs = proxy_pipeline_kwargs(_Config())
+    assert kwargs["min_chars_for_block_compression"] == 25
+    assert kwargs["min_tokens_to_compress"] == 10
+
+
+def test_explicit_min_chars_block_env_overrides_the_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit operator override still wins over the profile value."""
+    monkeypatch.setenv("HEADROOM_MIN_CHARS_FOR_BLOCK", "120")
+
+    class _Config:
+        savings_profile = "coding"
+        min_tokens_to_crush = 500
+
+    assert proxy_pipeline_kwargs(_Config())["min_chars_for_block_compression"] == 120

@@ -38,155 +38,38 @@ Pure module: no I/O except explicit ``load``/``save``.
 
 from __future__ import annotations
 
-import hashlib
 import json
+import logging
 import math
 from dataclasses import asdict, dataclass, field
-from typing import Any, cast
+from typing import Any
 
-# Coarse input-token buckets. Coarse on purpose: too many strata make
-# per-stratum baselines sparse and noisy. Boundaries in tokens.
-_INPUT_BUCKETS = (2_000, 8_000, 32_000, 128_000)
+from .output_savings_policy import (
+    assign_arm as assign_arm,
+)
+from .output_savings_policy import (
+    conversation_key_from_body as conversation_key_from_body,
+)
+from .output_savings_policy import (
+    conversation_key_from_responses_body as conversation_key_from_responses_body,
+)
+from .output_savings_policy import (
+    input_bucket as input_bucket,
+)
+from .output_savings_policy import (
+    model_family as model_family,
+)
+from .output_savings_policy import (
+    parse_stratum_label,
+)
+from .output_savings_policy import (
+    stratum_key as stratum_key,
+)
+from .output_savings_policy import (
+    stratum_label as stratum_label,
+)
 
-
-def input_bucket(input_tokens: int) -> str:
-    """Map an input-token count to a coarse bucket label."""
-    if input_tokens < _INPUT_BUCKETS[0]:
-        return "xs"
-    if input_tokens < _INPUT_BUCKETS[1]:
-        return "s"
-    if input_tokens < _INPUT_BUCKETS[2]:
-        return "m"
-    if input_tokens < _INPUT_BUCKETS[3]:
-        return "l"
-    return "xl"
-
-
-def model_family(model: str) -> str:
-    """Collapse a model id to a coarse family for stratification.
-
-    Token-spend behaviour clusters by family far more than by point release,
-    so we bucket (e.g.) every ``claude-opus-*`` together.
-    """
-    m = model.lower()
-    for fam in ("opus", "sonnet", "haiku", "fable", "mythos", "gpt", "gemini"):
-        if fam in m:
-            return fam
-    return "other"
-
-
-def stratum_key(
-    *,
-    turn_kind: str,
-    input_tokens: int,
-    model: str,
-    has_tools: bool,
-) -> str:
-    """Build a stratum key from request features observable BEFORE the response.
-
-    Order is most→least specific so :meth:`BaselineModel.lookup` can back off
-    by trimming trailing fields.
-    """
-    return "|".join(
-        (
-            model_family(model),
-            turn_kind,
-            input_bucket(input_tokens),
-            "tools" if has_tools else "notools",
-        )
-    )
-
-
-def _unwrap_response_create_body(body: dict[str, Any]) -> dict[str, Any]:
-    response = body.get("response")
-    if body.get("type") == "response.create" and isinstance(response, dict):
-        return cast("dict[str, Any]", response)
-    return body
-
-
-def _stable_response_identifier(body: dict[str, Any]) -> str:
-    def _string_value(value: Any) -> str:
-        if isinstance(value, str):
-            return value
-        if isinstance(value, dict):
-            for key in ("id", "conversation_id", "session_id", "thread_id"):
-                nested = value.get(key)
-                if isinstance(nested, str) and nested:
-                    return nested
-        return ""
-
-    for key in ("conversation", "conversation_id", "session_id", "thread_id"):
-        value = _string_value(body.get(key))
-        if value and value.lower() != "auto":
-            return f"{key}:{value}"
-
-    for container_key in ("client_metadata", "metadata"):
-        container = body.get(container_key)
-        if not isinstance(container, dict):
-            continue
-        for key in (
-            "conversation_id",
-            "conversation_key",
-            "session_id",
-            "thread_id",
-            "codex_session_id",
-        ):
-            value = _string_value(container.get(key))
-            if value and value.lower() != "auto":
-                return f"{container_key}.{key}:{value}"
-
-    instructions = body.get("instructions")
-    if isinstance(instructions, str) and instructions:
-        return f"instructions:{instructions[:512]}"
-    return ""
-
-
-def conversation_key_from_body(body: dict[str, Any]) -> str:
-    """Derive a conversation-stable key for holdout assignment.
-
-    Stable across every turn of one conversation (so the whole conversation
-    lands in one arm) and cheap: a hash of the model plus the first user
-    message's text. The first user turn is immutable for a conversation's
-    lifetime, which is exactly the stability we need.
-    """
-    body = _unwrap_response_create_body(body)
-    model = str(body.get("model", ""))
-    seed = model
-    for msg in body.get("messages", []):
-        if isinstance(msg, dict) and msg.get("role") == "user":
-            content = msg.get("content")
-            if isinstance(content, str):
-                seed += "\x00" + content[:512]
-            elif isinstance(content, list):
-                for block in content:
-                    if isinstance(block, dict) and block.get("type") == "text":
-                        seed += "\x00" + str(block.get("text", ""))[:512]
-                        break
-            break
-    if "input" in body:
-        stable_response_key = _stable_response_identifier(body)
-        if stable_response_key:
-            seed += "\x00" + stable_response_key
-        elif not body.get("messages"):
-            seed += "\x00responses"
-    return hashlib.sha256(seed.encode("utf-8", "ignore")).hexdigest()
-
-
-def assign_arm(conversation_key: str, holdout_fraction: float) -> str:
-    """Deterministically assign a conversation to ``treatment`` or ``control``.
-
-    ``holdout_fraction`` in [0, 1] is the share routed to ``control`` (left
-    unshaped for measurement). Hashing the conversation key keeps assignment
-    stable across the conversation's turns and uniform across conversations.
-    """
-    if holdout_fraction <= 0.0:
-        return "treatment"
-    if holdout_fraction >= 1.0:
-        return "control"
-    digest = hashlib.sha256(("arm:" + conversation_key).encode()).hexdigest()
-    # Map the first 8 hex digits to [0, 1).
-    frac = int(digest[:8], 16) / 0xFFFFFFFF
-    return "control" if frac < holdout_fraction else "treatment"
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -302,6 +185,54 @@ class BaselineModel:
         return self.glob.n
 
 
+# Benchmark-derived reduction factors, consulted ONLY when a deployment has
+# neither a holdout nor a learned baseline.
+#
+# THIS TABLE SHIPS EMPTY, AND THAT IS THE INTENDED OPEN-SOURCE BEHAVIOUR.
+# Headroom can apply verbosity steering out of the box -- set
+# ``HEADROOM_VERBOSITY_LEVEL`` and the tokens are really saved. What it cannot
+# do out of the box is tell you HOW MUCH it saved without measuring your own
+# traffic, because a credible factor is not a constant: it depends on the model
+# family, the shape of the turn, and the exact steering text, and producing one
+# means running a paired benchmark across models and paying for both arms.
+#
+# Two ways to populate it, in order of strength:
+#
+#   1. Run a holdout. ``SavingsLedger.estimate_from_holdout`` measures YOUR
+#      traffic and outranks anything here -- see :meth:`best_estimate`. This is
+#      the honest answer and it needs no factor table at all.
+#   2. Register factors from a benchmark, via :func:`register_modelled_factors`.
+#      An extension that has done the measurement can install them at startup.
+#
+# An empty table means :meth:`estimate_from_model` returns ``None`` for every
+# level, so the dashboard shows a dash rather than a number nobody measured.
+# A dash is the correct rendering of "not measured"; an invented constant is
+# not, and would be the one failure mode this module exists to prevent.
+MODELLED_REDUCTION: dict[int, tuple[float, float]] = {}
+
+
+def register_modelled_factors(level: int, conservative: float, optimistic: float) -> None:
+    """Install benchmark-derived reduction factors for one verbosity level.
+
+    Extension seam. ``conservative`` and ``optimistic`` are fractions in
+    ``(0, 1)`` -- the low and high ends of the measured reduction, where the
+    low end becomes the headline so the number under-reports rather than
+    flatters.
+
+    Registering a level twice replaces it, so an extension may refresh factors
+    after a re-measurement. Values outside ``(0, 1)`` are rejected: the
+    estimator inverts them as ``r/(1-r)``, which is nonsense at 0 and divides
+    by zero at 1.
+    """
+    if not 0.0 < conservative < 1.0 or not 0.0 < optimistic < 1.0:
+        raise ValueError(
+            f"reduction factors must lie in (0, 1); got ({conservative}, {optimistic})"
+        )
+    if conservative > optimistic:
+        raise ValueError(f"conservative factor {conservative} exceeds optimistic {optimistic}")
+    MODELLED_REDUCTION[level] = (conservative, optimistic)
+
+
 @dataclass
 class SavingsEstimate:
     """Result of an estimation pass."""
@@ -312,7 +243,9 @@ class SavingsEstimate:
     ci_low_pct: float
     ci_high_pct: float
     n_requests: int
-    kind: str  # "estimated" (synthetic control) or "measured" (A/B holdout)
+    # "measured" (A/B holdout) > "estimated" (synthetic control) >
+    # "modelled" (benchmark default factor -- not this deployment's traffic)
+    kind: str
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -422,10 +355,71 @@ class SavingsLedger:
             kind=kind,
         )
 
-    def best_estimate(self) -> SavingsEstimate:
-        """Prefer the measured A/B number; fall back to the baseline estimate."""
+    def estimate_from_model(self, level: int) -> SavingsEstimate | None:
+        """Weakest tier: apply a benchmark factor to observed treatment output.
+
+        Used only when this deployment has produced no counterfactual of its
+        own. Returns ``None`` for a level that was never benchmarked, so an
+        unmeasured level shows nothing rather than a guess.
+
+        The arithmetic is the part worth getting right. Observed output is
+        already POST-shaping, so the saving is not ``observed x r``. If the
+        unshaped response would have been ``U`` and we observed
+        ``O = U(1-r)``, then ``saved = U - O = O * r/(1-r)``. At r=0.20 that is
+        0.25 of observed, not 0.20 -- the naive form understates, and by more
+        as r grows.
+        """
+        factors = MODELLED_REDUCTION.get(level)
+        if factors is None:
+            return None
+        observed = 0.0
+        n_requests = 0
+        for acc in self.treatment.values():
+            if acc.n == 0:
+                continue
+            observed += acc.n * acc.mean
+            n_requests += acc.n
+        if n_requests == 0 or observed <= 0:
+            return None
+
+        def saved_for(r: float) -> float:
+            return observed * r / (1.0 - r)
+
+        lo_r, hi_r = factors
+        saved = saved_for(lo_r)
+        baseline = observed + saved
+        # The band is the spread between the two benchmarked models, NOT a
+        # sampling CI -- there is no sample here. Callers must not label it
+        # "95% CI"; the dashboard branches on kind for exactly this reason.
+        lo_pct = lo_r * 100.0
+        hi_pct = hi_r * 100.0
+        return SavingsEstimate(
+            tokens_saved=saved,
+            baseline_tokens=baseline,
+            pct=lo_pct,
+            ci_low_pct=lo_pct,
+            ci_high_pct=hi_pct,
+            n_requests=n_requests,
+            kind="modelled",
+        )
+
+    def best_estimate(self, level: int | None = None) -> SavingsEstimate:
+        """Strongest available tier: measured > estimated > modelled.
+
+        ``level`` enables the modelled fallback; without it the behaviour is
+        unchanged from before, which keeps every existing caller honest.
+        """
         measured = self.estimate_from_holdout()
-        return measured if measured is not None else self.estimate_from_baseline()
+        if measured is not None:
+            return measured
+        estimated = self.estimate_from_baseline()
+        if estimated.n_requests > 0:
+            return estimated
+        if level is not None:
+            modelled = self.estimate_from_model(level)
+            if modelled is not None:
+                return modelled
+        return estimated
 
     # ---- persistence -----------------------------------------------------
 
@@ -448,9 +442,13 @@ class SavingsLedger:
     def save(self, path: Any) -> None:
         from pathlib import Path
 
+        from headroom import fsutil
+
         p = Path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(self.to_dict(), separators=(",", ":")))
+        # fsutil.write_text is atomic (temp file + os.replace), so a crash
+        # mid-write cannot truncate the ledger already on disk (#18).
+        fsutil.write_text(p, json.dumps(self.to_dict(), separators=(",", ":")))
 
     @classmethod
     def load(cls, path: Any) -> SavingsLedger:
@@ -461,7 +459,11 @@ class SavingsLedger:
             return cls()
         try:
             return cls.from_dict(json.loads(p.read_text()))
-        except (json.JSONDecodeError, ValueError, OSError):
+        except (json.JSONDecodeError, ValueError, OSError) as exc:
+            # Fail open (empty ledger), but surface the loss — silently
+            # swallowing a corrupt file made lost history indistinguishable
+            # from no history yet (#18).
+            logger.warning("output-savings ledger %s unreadable, starting empty: %s", p, exc)
             return cls()
 
 
@@ -470,24 +472,6 @@ class SavingsLedger:
 # every response path (streaming, non-streaming, backend) feeds the ledger with
 # no changes to RequestOutcome or its construction sites.
 # --------------------------------------------------------------------------
-
-_STRATUM_LABEL = "output_shaper:stratum:"
-_CONTROL_LABEL = "output_shaper:control:"
-
-
-def stratum_label(arm: str, key: str) -> str:
-    """Encode (arm, stratum) as a transforms_applied label."""
-    prefix = _STRATUM_LABEL if arm == "treatment" else _CONTROL_LABEL
-    return prefix + key
-
-
-def parse_stratum_label(label: str) -> tuple[str, str] | None:
-    """Decode a label into ``(arm, stratum)``, or None if not one of ours."""
-    if label.startswith(_STRATUM_LABEL):
-        return "treatment", label[len(_STRATUM_LABEL) :]
-    if label.startswith(_CONTROL_LABEL):
-        return "control", label[len(_CONTROL_LABEL) :]
-    return None
 
 
 class SavingsRecorder:
@@ -524,6 +508,40 @@ class SavingsRecorder:
                     self._flush_locked()
             return True
         return False
+
+    def estimate_request_savings(self, labels: Any, output_tokens: int) -> int:
+        """Per-request output tokens saved, for the savings rollup.
+
+        For a treatment request, the synthetic-control estimate
+        ``baseline_mean(stratum) - output_tokens``; 0 for control, unknown
+        strata, or when no shaping label is present. Read-only: unlike
+        ``record_from_labels`` it does not mutate the ledger, so the two
+        compose without double-counting.
+
+        The delta is **clamped at zero here**, which is deliberate and is not
+        in tension with this module's "never clamped per-request" rule. That
+        rule governs the tier-1 estimate in :meth:`estimate`, which sums signed
+        deltas (``total_saved += n * (mu - acc.mean)``) precisely so that
+        chattier-than-baseline turns pull the headline down. This method feeds
+        something else: the per-request savings rollup on ``RequestOutcome``,
+        which flows to Prometheus and the savings ledger. Those are
+        accumulate-only surfaces — both consumers floor it again
+        (``savings_tracker`` at the ``estimate_request_savings_usd`` and
+        ``record_request`` boundaries), and ``prometheus_metrics`` clamps a
+        negative ``tokens_saved`` with an "artifact" log for the same reason.
+        Keeping the floor here makes that boundary explicit rather than
+        relying on every downstream caller to reapply it."""
+        for label in labels or ():
+            parsed = parse_stratum_label(str(label))
+            if parsed is None:
+                continue
+            arm, key = parsed
+            if arm != "treatment":
+                return 0
+            with self._lock:
+                mean, _var, n = self._ledger.baseline.lookup(key)
+            return max(0, int(round(mean - output_tokens))) if n > 0 else 0
+        return 0
 
     def _reload_baseline_locked(self) -> None:
         """Adopt the on-disk baseline written by ``learn --verbosity --apply``.
@@ -568,10 +586,10 @@ class SavingsRecorder:
         with self._lock:
             self._flush_locked()
 
-    def estimate(self) -> SavingsEstimate:
+    def estimate(self, level: int | None = None) -> SavingsEstimate:
         with self._lock:
             self._reload_baseline_locked()
-            return self._ledger.best_estimate()
+            return self._ledger.best_estimate(level)
 
 
 _RECORDER: SavingsRecorder | None = None

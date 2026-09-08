@@ -6,7 +6,6 @@ from typing import Any
 from headroom.proxy.handlers.openai import (
     OpenAIHandlerMixin,
     _compact_openai_responses_tools,
-    _ensure_responses_store_for_memory_tools,
     _openai_responses_context_budget,
 )
 from headroom.transforms.content_router import (
@@ -438,48 +437,46 @@ def test_content_router_retries_kompress_when_structured_strategy_noops(monkeypa
     assert strategy_chain == ["smart_crusher", "kompress"]
 
 
-def test_responses_memory_tools_store_false_regression() -> None:
-    """Regression: store=false makes previous_response_id continuations fail."""
+def test_responses_turn_hook_message_fold_is_applied_and_counted() -> None:
+    """On the Responses path a turn hook may fold the `input` items (in place),
+    not just tools. The fold must be written back to the outbound payload AND its
+    token saving added to tokens_saved — before, this path only wrote tools back,
+    so a message fold was silently dropped and uncounted."""
+    from headroom.proxy.turn_hooks import clear_turn_hooks, register_turn_hook
 
-    payload = {"model": "gpt-5.5", "input": "remember this", "store": False}
+    class FoldInput:
+        name = "fold_input"
 
-    changed = _ensure_responses_store_for_memory_tools(
-        payload,
-        memory_tools_injected=True,
-    )
+        def on_request(self, ctx: Any) -> None:
+            # Fold a big function_call_output IN PLACE (mutate the dict; identity
+            # of ctx.messages is unchanged) — the case an identity gate would miss.
+            for item in ctx.messages:
+                if isinstance(item, dict) and isinstance(item.get("output"), str):
+                    item["output"] = "folded"
 
-    assert changed is True
-    assert payload["store"] is True
+    router = ContentRouter(ContentRouterConfig())
+    handler = _HandlerHarness(router)
+    payload: dict[str, Any] = {
+        "type": "response.create",
+        "model": "gpt-5.5",
+        "input": [
+            {
+                "type": "function_call_output",
+                "call_id": "c1",
+                "output": " ".join(["compressible"] * 300),
+            }
+        ],
+    }
 
-
-def test_responses_memory_tools_do_not_change_unrelated_requests() -> None:
-    no_memory_payload = {"model": "gpt-5.5", "input": "plain", "store": False}
-    already_stored_payload = {"model": "gpt-5.5", "input": "plain", "store": True}
-    default_store_payload = {"model": "gpt-5.5", "input": "plain"}
-
-    assert (
-        _ensure_responses_store_for_memory_tools(
-            no_memory_payload,
-            memory_tools_injected=False,
+    clear_turn_hooks()
+    register_turn_hook(FoldInput())
+    try:
+        working, _modified, tokens_saved, *_ = handler._compress_openai_responses_payload(
+            payload, model="gpt-5.5", request_id="hr_test"
         )
-        is False
-    )
-    assert no_memory_payload["store"] is False
+    finally:
+        clear_turn_hooks()
 
-    assert (
-        _ensure_responses_store_for_memory_tools(
-            already_stored_payload,
-            memory_tools_injected=True,
-        )
-        is False
-    )
-    assert already_stored_payload["store"] is True
-
-    assert (
-        _ensure_responses_store_for_memory_tools(
-            default_store_payload,
-            memory_tools_injected=True,
-        )
-        is False
-    )
-    assert "store" not in default_store_payload
+    assert working["input"][0]["output"] == "folded"  # fold applied to the outbound payload
+    assert tokens_saved > 0  # ...and the message-fold saving is counted
+    assert payload["input"][0]["output"] != "folded"  # original untouched (deep-copied)

@@ -12,6 +12,7 @@ env:
   NPM_REGISTRY_URL: https://registry.npmjs.org
   NPM_SDK_PACKAGE: headroom-ai
   NPM_OPENCLAW_PACKAGE: headroom-openclaw
+  NPM_OPENCODE_PACKAGE: headroom-opencode
 
   # GitHub Package Registry
   GITHUB_PACKAGES_REGISTRY_URL: https://npm.pkg.github.com
@@ -50,6 +51,8 @@ on:
       - "pyproject.toml"
       - "scripts/verify-versions.py"
       - "scripts/version-sync.py"
+      - "scripts/build_npm_release_assets.mjs"
+      - "scripts/verify_npm_release_assets.mjs"
       - "Cargo.toml"
       - "Cargo.lock"
   workflow_dispatch:
@@ -84,7 +87,7 @@ jobs:
       bump: ${{ steps.ver.outputs.bump }}
       previous_tag: ${{ steps.ver.outputs.previous_tag }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -126,17 +129,17 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: "20"
 
@@ -187,20 +190,7 @@ jobs:
 
       - name: Build npm release packages
         run: |
-          mkdir -p release-assets
-
-          cd sdk/typescript
-          npm install
-          npm run build
-          npm version ${{ needs.detect-version.outputs.npm_version }} --no-git-tag-version --allow-same-version
-          npm pack --pack-destination ../../release-assets
-
-          cd ../../plugins/openclaw
-          npm install ../../release-assets/headroom-ai-${{ needs.detect-version.outputs.npm_version }}.tgz
-          npm install
-          npm run build
-          npm version ${{ needs.detect-version.outputs.npm_version }} --no-git-tag-version --allow-same-version
-          npm pack --pack-destination ../../release-assets
+          node scripts/build_npm_release_assets.mjs "${{ needs.detect-version.outputs.npm_version }}" release-assets
 
       - name: Upload release assets artifact
         uses: actions/upload-artifact@v7
@@ -247,15 +237,14 @@ jobs:
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             manylinux: 2_28
-          # NOTE: `macos-15-intel` (x86_64-apple-darwin) is intentionally
-          # NOT in the matrix. `ort-sys 2.0.0-rc.12` (transitive via our
-          # ML compression backend) does not provide prebuilt ONNX Runtime
-          # binaries for `x86_64-apple-darwin`, and building ORT from
-          # source would add CMake + ~5 minutes per build. Apple Silicon
-          # macOS is fully covered below; Intel-mac users install the
-          # platform-independent sdist (also produced by this matrix).
-          # Tracked as a follow-up: switch to `ort-tract` or upstream a
-          # request for x86_64 macOS prebuilts.
+          # Intel macOS x86_64. `ort-sys 2.0.0-rc.12` does not ship
+          # prebuilt ONNX Runtime binaries for this triple, so
+          # `headroom-core/Cargo.toml` selects `ort-load-dynamic` (same
+          # as Windows) and `headroom/_ort.py` pins `ORT_DYLIB_PATH` to
+          # the pip `onnxruntime` dylib at import time.
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            manylinux: ""
           - os: macos-14
             target: aarch64-apple-darwin
             manylinux: ""
@@ -267,19 +256,20 @@ jobs:
           # or crates.io). `manylinux` is meaningless on Windows (that tag
           # is Linux-only) — leave it empty. The ONNX Runtime story is
           # already handled: `crates/headroom-core/Cargo.toml` selects
-          # `ort-load-dynamic` under `cfg(windows)`, so the wheel does not
-          # bundle/link DirectML SDK libs and loads ORT at runtime instead.
+          # `ort-load-dynamic` under `cfg(windows)` and Intel macOS, so
+          # the wheel does not bundle/link platform ORT SDK libs and loads
+          # ORT at runtime instead.
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             manylinux: ""
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
 
@@ -507,11 +497,11 @@ jobs:
           # runners (PR #376) host the container.
           - { runner: ubuntu-24.04-arm, image: "quay.io/pypa/manylinux_2_28_aarch64", python: "3.11", wheel_target: aarch64-unknown-linux-gnu, wheel_artifact: wheels-ubuntu-24.04-arm-aarch64-unknown-linux-gnu, glibc_label: "2.28-floor" }
           - { runner: ubuntu-24.04-arm, image: "ubuntu:22.04", python: "3.12", wheel_target: aarch64-unknown-linux-gnu, wheel_artifact: wheels-ubuntu-24.04-arm-aarch64-unknown-linux-gnu, glibc_label: "2.35" }
-          # macOS arm64 — runs natively on the host runner; no
-          # container. Apple Silicon is the only macOS target we
-          # ship today (Intel macOS dropped in PR #371 — ort-sys
-          # has no x86_64-apple-darwin prebuilts).
+          # macOS arm64 — runs natively on the host runner; no container.
           - { runner: macos-14, image: "", python: "3.13", wheel_target: aarch64-apple-darwin, wheel_artifact: wheels-macos-14-aarch64-apple-darwin, glibc_label: "" }
+          # macOS x86_64 (Intel) — `ort-load-dynamic`; see build-wheels
+          # matrix comment for rationale.
+          - { runner: macos-15-intel, image: "", python: "3.12", wheel_target: x86_64-apple-darwin, wheel_artifact: wheels-macos-15-intel-x86_64-apple-darwin, glibc_label: "" }
           # Windows x86_64 — runs natively on the host runner; no
           # container. `image: ""` routes this row past the Linux docker
           # path; a dedicated PowerShell step below installs + imports the
@@ -534,7 +524,7 @@ jobs:
       # is on PATH as `python` for the smoke step below.
       - name: Set up Python (Windows host)
         if: matrix.image == '' && runner.os == 'Windows'
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
 
@@ -608,18 +598,30 @@ jobs:
                 fi
               elif command -v apt-get >/dev/null 2>&1; then
                 export DEBIAN_FRONTEND=noninteractive
-                apt-get update -qq
+                apt_retry() {
+                  apt_get_args="$*"
+                  for attempt in 1 2 3; do
+                    if apt-get "$@"; then
+                      return 0
+                    fi
+                    echo "apt-get ${apt_get_args} failed on attempt ${attempt}; refreshing package lists" >&2
+                    apt-get update -qq || true
+                    sleep $((attempt * 5))
+                  done
+                  apt-get "$@"
+                }
+                apt_retry update -qq
                 # ubuntu:20.04s default repo only ships 3.8; 3.10 lives
                 # in deadsnakes. Add it on demand. ubuntu:22.04 has
                 # 3.10/3.11 in main and 3.12 via deadsnakes.
-                apt-get install -y -qq --no-install-recommends ca-certificates software-properties-common >/dev/null
+                apt_retry install -y -qq --fix-missing --no-install-recommends ca-certificates software-properties-common >/dev/null
                 add-apt-repository -y ppa:deadsnakes/ppa >/dev/null 2>&1 || true
-                apt-get update -qq
-                apt-get install -y -qq --no-install-recommends \
+                apt_retry update -qq
+                apt_retry install -y -qq --fix-missing --no-install-recommends \
                   "python$PYTHON_VERSION" \
                   "python$PYTHON_VERSION-venv" \
                   "python$PYTHON_VERSION-distutils" >/dev/null 2>&1 \
-                || apt-get install -y -qq --no-install-recommends \
+                || apt_retry install -y -qq --fix-missing --no-install-recommends \
                   "python$PYTHON_VERSION" \
                   "python$PYTHON_VERSION-venv" >/dev/null
                 python_bin="python$PYTHON_VERSION"
@@ -680,16 +682,21 @@ jobs:
         if: matrix.image == '' && runner.os == 'macOS'
         env:
           PYTHON_VERSION: ${{ matrix.python }}
+          WHEEL_TARGET: ${{ matrix.wheel_target }}
         run: |
           set -e
           py_tag=cp$(echo "$PYTHON_VERSION" | tr -d .)
-          # macOS wheels are tagged macosx_*_arm64 (Apple Silicon only).
-          whl=$(find dist -maxdepth 1 -type f -name "headroom_ai-*-${py_tag}-${py_tag}-macosx_*_arm64.whl" -print -quit)
+          case "$WHEEL_TARGET" in
+            aarch64-apple-darwin) mac_arch=arm64 ;;
+            x86_64-apple-darwin) mac_arch=x86_64 ;;
+            *) echo "ERROR: unknown macOS wheel target $WHEEL_TARGET" >&2; exit 1 ;;
+          esac
+          whl=$(find dist -maxdepth 1 -type f -name "headroom_ai-*-${py_tag}-${py_tag}-macosx_*_${mac_arch}.whl" -print -quit)
           if [ -z "$whl" ]; then
             # Stable-ABI (abi3) fallback — see the Linux path above. A
             # cp3<floor>-abi3 wheel installs on any CPython >= floor.
             py_minor=${PYTHON_VERSION#*.}
-            abi3=$(find dist -maxdepth 1 -type f -name "headroom_ai-*-abi3-macosx_*_arm64.whl" -print -quit)
+            abi3=$(find dist -maxdepth 1 -type f -name "headroom_ai-*-abi3-macosx_*_${mac_arch}.whl" -print -quit)
             if [ -n "$abi3" ]; then
               abi3_base=${abi3##*/}
               abi3_floor=${abi3_base#*-cp3}
@@ -699,7 +706,7 @@ jobs:
             fi
           fi
           if [ -z "$whl" ]; then
-            echo "ERROR: no macOS wheel matching python=$PYTHON_VERSION"
+            echo "ERROR: no macOS wheel matching python=$PYTHON_VERSION arch=$mac_arch target=$WHEEL_TARGET"
             find dist -maxdepth 1 -type f -exec basename {} \;
             exit 1
           fi
@@ -782,6 +789,7 @@ jobs:
           # recommended pattern for release workflows that may run
           # multiple times against the same version.
           skip-existing: true
+          attestations: false
 
   publish-npm:
     needs: [detect-version, build]
@@ -792,12 +800,12 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: "20"
           registry-url: ${{ env.NPM_REGISTRY_URL }}
@@ -816,10 +824,11 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
+          version="${{ needs.detect-version.outputs.npm_version }}"
           cd sdk/typescript
-          npm install
+          npm ci
           npm run build
-          npm version ${{ needs.detect-version.outputs.npm_version }} --no-git-tag-version --allow-same-version
+          npm version "$version" --no-git-tag-version --allow-same-version
           npm publish --access public
         continue-on-error: true
 
@@ -828,17 +837,46 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
+          version="${{ needs.detect-version.outputs.npm_version }}"
           cd plugins/openclaw
-          npm install
+          npm ci
           npm run build
-          npm version ${{ needs.detect-version.outputs.npm_version }} --no-git-tag-version --allow-same-version
+          npm version "$version" --no-git-tag-version --allow-same-version
+          HEADROOM_NPM_VERSION="$version" node <<'EOF'
+          const fs = require("fs");
+          const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+          pkg.dependencies = pkg.dependencies || {};
+          pkg.dependencies["headroom-ai"] = `^${process.env.HEADROOM_NPM_VERSION}`;
+          fs.writeFileSync("package.json", `${JSON.stringify(pkg, null, 2)}\n`);
+          EOF
+          node prepare-dist.mjs
+          npm publish --access public
+        continue-on-error: true
+
+      - name: Publish ${{ env.NPM_OPENCODE_PACKAGE }} to npmjs.org
+        id: npm-opencode-publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          version="${{ needs.detect-version.outputs.npm_version }}"
+          cd plugins/opencode
+          npm ci
+          npm run build
+          npm version "$version" --no-git-tag-version --allow-same-version
+          HEADROOM_NPM_VERSION="$version" node <<'EOF'
+          const fs = require("fs");
+          const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+          pkg.dependencies = pkg.dependencies || {};
+          pkg.dependencies["headroom-ai"] = `^${process.env.HEADROOM_NPM_VERSION}`;
+          fs.writeFileSync("package.json", `${JSON.stringify(pkg, null, 2)}\n`);
+          EOF
           npm publish --access public
         continue-on-error: true
 
       - name: npm publish notice
-        if: steps.npm-sdk-publish.outcome == 'failure' || steps.npm-openclaw-publish.outcome == 'failure'
+        if: steps.npm-sdk-publish.outcome == 'failure' || steps.npm-openclaw-publish.outcome == 'failure' || steps.npm-opencode-publish.outcome == 'failure'
         run: |
-          echo "::notice::One or more npm publishes failed. Set NPM_SKIP=true in repo Variables to skip both npm publishes if tokens are not configured."
+          echo "::notice::One or more npm publishes failed. Set NPM_SKIP=true in repo Variables to skip npm publishes if tokens are not configured."
 
   publish-github-packages:
     needs: [detect-version, build]
@@ -848,7 +886,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -859,7 +897,7 @@ jobs:
           printf 'scope=%s\n' "$scope" >> "$GITHUB_OUTPUT"
 
       - name: Set up Node.js for GitHub Package Registry
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: "20"
           registry-url: ${{ env.GITHUB_PACKAGES_REGISTRY_URL }}
@@ -980,7 +1018,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 

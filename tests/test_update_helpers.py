@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.metadata as md
+import sys
 import sysconfig
 
 import pytest
@@ -130,6 +131,46 @@ def test_format_cmd_windows(monkeypatch):
     assert "Program Files" in out and out.endswith("-m pip")
 
 
+def test_windows_pip_update_needs_handoff(monkeypatch):
+    monkeypatch.setattr(up.sys, "platform", "win32")
+    assert up._windows_pip_update_needs_handoff(
+        up.InstallMethod(kind="pip", can_self_update=True, argv=["python"])
+    )
+    assert up._windows_pip_update_needs_handoff(
+        up.InstallMethod(kind="pip-user", can_self_update=True, argv=["python"])
+    )
+    assert not up._windows_pip_update_needs_handoff(
+        up.InstallMethod(kind="pipx", can_self_update=True, argv=["pipx"])
+    )
+
+
+def test_windows_pip_update_handoff_false_off_windows(monkeypatch):
+    monkeypatch.setattr(up.sys, "platform", "linux")
+    assert not up._windows_pip_update_needs_handoff(
+        up.InstallMethod(kind="pip", can_self_update=True, argv=["python"])
+    )
+
+
+@pytest.mark.parametrize("operator", ["&", "|", ">"])
+def test_build_windows_handoff_argv_preserves_pip_argv(monkeypatch, operator):
+    monkeypatch.setattr(up.sys, "platform", "win32")
+    pip_argv = [
+        r"C:\\Program Files\\Python\\python.exe",
+        "-m",
+        "pip",
+        "install",
+        "-U",
+        f"headroom-ai[foo{operator}calc]",
+    ]
+
+    handoff_argv = up._build_windows_handoff_argv(pip_argv)
+
+    assert handoff_argv[:2] == [sys.executable, "-c"]
+    assert "subprocess.run" in handoff_argv[2]
+    assert "cmd.exe" not in handoff_argv
+    assert handoff_argv[3:] == pip_argv[1:]
+
+
 def test_externally_managed_true(tmp_path, monkeypatch):
     (tmp_path / "EXTERNALLY-MANAGED").write_text("[externally-managed]")
     monkeypatch.setattr(sysconfig, "get_path", lambda key: str(tmp_path))
@@ -224,6 +265,64 @@ def test_update_externally_managed_refuses_via_command(monkeypatch):
     res = CliRunner().invoke(main, ["update", "--yes"])
     assert res.exit_code == 0
     assert "PEP 668" in res.output
+
+
+def test_venv_inside_bare_dockerenv_still_self_updates(monkeypatch):
+    """A venv/pip install inside a container (bare /.dockerenv, no explicit
+    HEADROOM_IN_DOCKER) must self-update, not be refused with image guidance (#2816).
+    """
+    monkeypatch.setattr(up, "_is_source_checkout", lambda: False)
+    monkeypatch.setattr(up, "_is_editable_install", lambda: False)
+    monkeypatch.delenv("HEADROOM_IN_DOCKER", raising=False)
+    # Deterministic, pipx/uv-free venv layout (mirrors the issue's environment).
+    monkeypatch.setenv("PIPX_HOME", "")
+    monkeypatch.setenv("UV_TOOL_DIR", "")
+    monkeypatch.setattr(up.sys, "executable", "/config/.headroom-venv/bin/python")
+    monkeypatch.setattr(up.sys, "prefix", "/config/.headroom-venv")
+    monkeypatch.setattr(
+        up, "_package_location", lambda: "/config/.headroom-venv/lib/python3.12/headroom"
+    )
+    # The container is real (/.dockerenv), but a venv owns the install.
+    monkeypatch.setattr(up, "_in_docker", lambda: True)
+    monkeypatch.setattr(up, "_in_virtualenv", lambda: True)
+
+    method = up.detect_install_method()
+    assert method.kind == "pip"
+    assert method.can_self_update is True
+    assert method.argv[:4] == [up.sys.executable, "-m", "pip", "install"]
+
+
+def test_explicit_headroom_in_docker_still_refuses_over_venv(monkeypatch):
+    """The official image's explicit HEADROOM_IN_DOCKER opt-out wins up front,
+    even when a venv owns the install."""
+    monkeypatch.setattr(up, "_is_source_checkout", lambda: False)
+    monkeypatch.setattr(up, "_is_editable_install", lambda: False)
+    monkeypatch.setenv("HEADROOM_IN_DOCKER", "1")
+    monkeypatch.setattr(up, "_in_virtualenv", lambda: True)
+
+    method = up.detect_install_method()
+    assert method.kind == "docker"
+    assert method.can_self_update is False
+
+
+def test_bare_dockerenv_without_owner_refuses(monkeypatch):
+    """A container whose system interpreter owns the install (bare /.dockerenv, no
+    venv/pipx/uv/user-site) still refuses with the pull-a-new-image guidance."""
+    monkeypatch.setattr(up, "_is_source_checkout", lambda: False)
+    monkeypatch.setattr(up, "_is_editable_install", lambda: False)
+    monkeypatch.delenv("HEADROOM_IN_DOCKER", raising=False)
+    monkeypatch.setenv("PIPX_HOME", "")
+    monkeypatch.setenv("UV_TOOL_DIR", "")
+    monkeypatch.setattr(up.sys, "executable", "/usr/bin/python3")
+    monkeypatch.setattr(up.sys, "prefix", "/usr")
+    monkeypatch.setattr(up, "_package_location", lambda: "/usr/lib/python3.12/headroom")
+    monkeypatch.setattr(up, "_in_docker", lambda: True)
+    monkeypatch.setattr(up, "_in_virtualenv", lambda: False)
+    monkeypatch.setattr(up, "_is_user_site_install", lambda loc: False)
+
+    method = up.detect_install_method()
+    assert method.kind == "docker"
+    assert method.can_self_update is False
 
 
 # --------------------------------------------------------------------------- #

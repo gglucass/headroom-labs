@@ -30,17 +30,33 @@ import pytest
 from fastapi.testclient import TestClient
 
 from headroom.pipeline import PipelineStage
-from headroom.proxy.helpers import (
+from headroom.proxy.body_forwarding import (
     BodyMutationTracker,
-    append_text_to_latest_user_chat_message,
+    OutboundBody,
     get_python_forwarder_mode,
-    log_outbound_request,
+    outbound_body_is_client_bytes,
     prepare_outbound_body_bytes,
+    select_outbound_body,
     serialize_body_canonical,
+    thinking_blocks_survived_mutation,
+)
+from headroom.proxy.helpers import (
+    _reset_session_beta_tracker_for_test,
+    append_text_to_latest_user_chat_message,
+    get_session_beta_tracker,
+    log_outbound_request,
 )
 from headroom.proxy.server import ProxyConfig, create_app
 
 pytest.importorskip("fastapi")
+
+
+@pytest.fixture(autouse=True)
+def _disable_output_shaper(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Isolate this suite from the opt-in HEADROOM_OUTPUT_SHAPER a developer shell
+    # may export, which otherwise perturbs the byte-faithful assertions.
+    monkeypatch.delenv("HEADROOM_OUTPUT_SHAPER", raising=False)
+
 
 # ---------------------------------------------------------------------------
 # Unit tests for serializer + tracker
@@ -127,6 +143,26 @@ def test_prepare_outbound_unmutated_returns_passthrough_bytes() -> None:
     assert source == "passthrough"
 
 
+def test_select_outbound_body_returns_value_object() -> None:
+    original = b'{"a":1}'
+    outbound = select_outbound_body(
+        body={"a": 1},
+        original_body_bytes=original,
+        body_mutated=False,
+        forwarder_mode="byte_faithful",
+    )
+    assert outbound == OutboundBody(content=original, source="passthrough")
+
+
+def test_helpers_preserve_body_forwarding_compatibility_exports() -> None:
+    from headroom.proxy import helpers
+
+    assert helpers.BodyMutationTracker is BodyMutationTracker
+    assert helpers.get_python_forwarder_mode is get_python_forwarder_mode
+    assert helpers.prepare_outbound_body_bytes is prepare_outbound_body_bytes
+    assert helpers.serialize_body_canonical is serialize_body_canonical
+
+
 def test_prepare_outbound_mutated_uses_canonical() -> None:
     out, source = prepare_outbound_body_bytes(
         body={"a": 1, "b": "🔥"},
@@ -136,6 +172,236 @@ def test_prepare_outbound_mutated_uses_canonical() -> None:
     )
     assert out == b'{"a":1,"b":"\xf0\x9f\x94\xa5"}'
     assert source == "canonical"
+
+
+@pytest.mark.parametrize("block_type", ["thinking", "redacted_thinking"])
+def test_signed_thinking_history_with_original_bytes_uses_passthrough(
+    block_type: str,
+) -> None:
+    body = {
+        "model": "claude-sonnet-4-5",
+        "messages": [
+            {"role": "user", "content": "Solve this"},
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": block_type,
+                        "thinking": "private reasoning",
+                        "signature": "sig123",
+                    },
+                    {"type": "text", "text": "The answer is 42."},
+                ],
+            },
+            {"role": "user", "content": "Continue"},
+        ],
+    }
+    original = json.dumps(body, indent=2).encode("utf-8")
+    # The lock triggers on a MODIFIED thinking block, not merely a present one:
+    # the signature covers the block's own content, so a body whose blocks are
+    # untouched has no seal to break. Tamper with the block so this test still
+    # exercises the guard it was written for.
+    body["messages"][1]["content"][0]["thinking"] = "rewritten by a transform"
+
+    outbound = select_outbound_body(
+        body=body,
+        original_body_bytes=original,
+        body_mutated=True,
+        forwarder_mode="byte_faithful",
+    )
+
+    assert outbound.source == "passthrough"
+    assert outbound.content == original
+
+
+def test_signed_thinking_history_without_original_bytes_uses_canonical() -> None:
+    body = {
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": "private reasoning",
+                        "signature": "sig123",
+                    }
+                ],
+            }
+        ]
+    }
+
+    outbound = select_outbound_body(
+        body=body,
+        original_body_bytes=None,
+        body_mutated=True,
+        forwarder_mode="byte_faithful",
+    )
+
+    assert outbound.source == "canonical"
+    assert outbound.content == serialize_body_canonical(body)
+
+
+def test_signed_thinking_history_overrides_legacy_encoder() -> None:
+    body = {
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [{"type": "thinking", "signature": "sig123"}],
+            }
+        ]
+    }
+    original = json.dumps(body, indent=2).encode("utf-8")
+    # Modified block => the lock engages and still outranks the legacy encoder.
+    # (An UNmodified block no longer overrides legacy mode: with every seal
+    # provably intact there is nothing for the override to protect, and honoring
+    # the operator's explicit rollback request is the more useful behaviour.)
+    body["messages"][0]["content"][0]["signature"] = "tampered"
+
+    outbound = select_outbound_body(
+        body=body,
+        original_body_bytes=original,
+        body_mutated=True,
+        forwarder_mode="legacy_json_kwarg",
+    )
+
+    assert outbound == OutboundBody(content=original, source="passthrough", dropped_mutations=True)
+
+
+def test_signed_thinking_passthrough_reports_the_mutations_it_discarded() -> None:
+    """Passthrough silently winning over a mutated body is what hid #2952."""
+    body = {
+        "stream": False,
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [{"type": "thinking", "signature": "sig123"}],
+            }
+        ],
+    }
+    original = json.dumps({**body, "stream": True}).encode("utf-8")
+    # A thinking block the transforms did NOT touch no longer forces
+    # passthrough, so the CCR stream flip in this very scenario now reaches
+    # upstream — which is the outcome #2952 wanted in the first place. The
+    # discard-reporting path still has to work when a block really was edited,
+    # so tamper with it here and keep guarding that.
+    body["messages"][0]["content"][0]["signature"] = "rewritten"
+
+    outbound = select_outbound_body(
+        body=body,
+        original_body_bytes=original,
+        body_mutated=True,
+        forwarder_mode="byte_faithful",
+        mutation_reasons=["ccr_streaming_retrieve_buffered_non_stream"],
+    )
+
+    assert outbound.source == "passthrough"
+    assert outbound.dropped_mutations is True
+    assert outbound.dropped_mutation_reasons == ("ccr_streaming_retrieve_buffered_non_stream",)
+
+
+def test_original_signed_thinking_still_locks_when_mutation_removed_the_block() -> None:
+    original_body = {
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [{"type": "thinking", "signature": "sig123"}],
+            }
+        ]
+    }
+    mutated_body = {"messages": [{"role": "assistant", "content": "rewritten"}]}
+    original = json.dumps(original_body, indent=2).encode()
+
+    outbound = select_outbound_body(
+        body=mutated_body,
+        original_body_bytes=original,
+        body_mutated=True,
+        forwarder_mode="byte_faithful",
+        mutation_reasons=["compression"],
+    )
+
+    assert outbound.content == original
+    assert outbound.source == "passthrough"
+    assert outbound.dropped_mutation_reasons == ("compression",)
+
+
+def test_signed_thinking_passthrough_reports_nothing_when_body_unmutated() -> None:
+    body = {
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [{"type": "thinking", "signature": "sig123"}],
+            }
+        ]
+    }
+    original = json.dumps(body).encode("utf-8")
+
+    outbound = select_outbound_body(
+        body=body,
+        original_body_bytes=original,
+        body_mutated=False,
+        forwarder_mode="byte_faithful",
+        mutation_reasons=["irrelevant"],
+    )
+
+    assert outbound.source == "passthrough"
+    assert outbound.dropped_mutations is False
+    assert outbound.dropped_mutation_reasons == ()
+
+
+def test_canonical_path_reports_no_dropped_mutations() -> None:
+    body = {"messages": [{"role": "user", "content": "hi"}]}
+
+    outbound = select_outbound_body(
+        body=body,
+        original_body_bytes=b'{"messages": []}',
+        body_mutated=True,
+        forwarder_mode="byte_faithful",
+        mutation_reasons=["compression"],
+    )
+
+    assert outbound.source == "canonical"
+    assert outbound.dropped_mutations is False
+    assert outbound.dropped_mutation_reasons == ()
+
+
+@pytest.mark.parametrize(
+    ("original_body_bytes", "expected"),
+    [(b'{"messages": []}', True), (None, False)],
+)
+def test_outbound_body_is_client_bytes_matches_selection(
+    original_body_bytes: bytes | None, expected: bool
+) -> None:
+    """Handlers gate on this before mutating a body for their own upstream call."""
+    body = {
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [{"type": "thinking", "signature": "sig123"}],
+            }
+        ]
+    }
+
+    assert (
+        outbound_body_is_client_bytes(body=body, original_body_bytes=original_body_bytes)
+        is expected
+    )
+    outbound = select_outbound_body(
+        body=body,
+        original_body_bytes=original_body_bytes,
+        body_mutated=True,
+        forwarder_mode="byte_faithful",
+    )
+    assert (outbound.source == "passthrough") is expected
+
+
+def test_outbound_body_is_client_bytes_false_without_thinking_blocks() -> None:
+    assert (
+        outbound_body_is_client_bytes(
+            body={"messages": [{"role": "user", "content": "hi"}]},
+            original_body_bytes=b'{"messages": []}',
+        )
+        is False
+    )
 
 
 def test_prepare_outbound_no_original_bytes_uses_canonical() -> None:
@@ -340,6 +606,179 @@ def _make_anthropic_app(*, optimize: bool) -> tuple[TestClient, _CapturingTransp
 def _make_no_optimize_app() -> tuple[TestClient, _CapturingTransport]:
     """Boot a proxy with all transforms disabled and a capturing transport."""
     return _make_anthropic_app(optimize=False)
+
+
+def test_signed_thinking_discarded_mutation_uses_wire_truth_for_all_accounting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Exercised with the relaxation DISABLED, which is both the documented
+    # rollback and the pre-existing behaviour. Keeping #3015's wire-truth
+    # assertions under the kill switch proves two things at once: the accounting
+    # neutralisation still works whenever the lock does engage, and the env-var
+    # rollback really is a complete restoration rather than a partial one.
+    monkeypatch.setenv("HEADROOM_THINKING_PRESERVING_MUTATIONS", "0")
+    config = ProxyConfig(
+        optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        log_requests=False,
+        ccr_inject_tool=False,
+        ccr_handle_responses=False,
+        ccr_context_tracking=False,
+        image_optimize=False,
+    )
+    app = create_app(config)
+    proxy = app.state.proxy
+    transport = _CapturingTransport()
+    proxy.http_client = httpx.AsyncClient(transport=transport)
+    proxy._record_request_outcome = AsyncMock(wraps=proxy._record_request_outcome)
+
+    tracker = _FakePrefixTracker(frozen_count=0)
+    proxy.session_tracker_store.compute_session_id = lambda request, model, messages: "signed"
+    proxy.session_tracker_store.get_or_create = lambda session_id, provider: tracker
+
+    inbound = {
+        "model": "claude-opus-5",
+        "max_tokens": 64,
+        "messages": [
+            {"role": "user", "content": "Solve this."},
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": "private",
+                        "signature": "sig123",
+                    },
+                    {"type": "text", "text": "Working."},
+                ],
+            },
+            {"role": "user", "content": "Continue."},
+        ],
+        "tools": [
+            {
+                "name": "lookup",
+                "description": "  Look up a value.  ",
+                "input_schema": {
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "type": "object",
+                    "properties": {"key": {"type": "string"}},
+                },
+            }
+        ],
+    }
+    inbound_bytes = json.dumps(inbound, indent=2).encode()
+
+    response = TestClient(app).post(
+        "/v1/messages",
+        headers={
+            "x-api-key": "test-key",
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        content=inbound_bytes,
+    )
+
+    assert response.status_code == 200
+    assert transport.captured_body == inbound_bytes
+    assert response.headers["x-headroom-tokens-saved"] == "0"
+    assert "x-headroom-transforms" not in response.headers
+
+    outcome = proxy._record_request_outcome.await_args.args[0]
+    assert outcome.tokens_saved == 0
+    assert outcome.optimized_tokens == outcome.original_tokens
+    assert outcome.transforms_applied == ()
+    assert outcome.tags["wire_mutations_discarded"] > 0
+    assert "anthropic:tool_schema_compaction" not in outcome.transforms_applied
+    assert "tool_search_deferred_tokens" not in outcome.tags
+    assert outcome.tags.get("_headroom_savings_attribution") == []
+    assert proxy.metrics.tokens_saved_total == 0
+    assert proxy.metrics.tool_search_saved_total == 0
+    assert tracker._last_forwarded_messages[: len(inbound["messages"])] == inbound["messages"]
+
+
+def test_untouched_thinking_lets_tool_compaction_reach_the_wire(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end counterpart: the same request, with the relaxation active.
+
+    This is the whole point of the change. Tool schemas are a top-level field --
+    not inside ``messages`` at all, so no per-block thinking signature can
+    possibly cover them -- yet the blanket lock discarded their compaction on
+    every turn of a thinking-bearing session. Here the compaction must reach
+    upstream AND be credited, while the thinking block goes out untouched.
+    """
+    monkeypatch.delenv("HEADROOM_THINKING_PRESERVING_MUTATIONS", raising=False)
+    config = ProxyConfig(
+        optimize=True,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        log_requests=False,
+        ccr_inject_tool=False,
+        ccr_handle_responses=False,
+        ccr_context_tracking=False,
+        image_optimize=False,
+    )
+    app = create_app(config)
+    proxy = app.state.proxy
+    transport = _CapturingTransport()
+    proxy.http_client = httpx.AsyncClient(transport=transport)
+    proxy._record_request_outcome = AsyncMock(wraps=proxy._record_request_outcome)
+
+    tracker = _FakePrefixTracker(frozen_count=0)
+    proxy.session_tracker_store.compute_session_id = lambda request, model, messages: "signed"
+    proxy.session_tracker_store.get_or_create = lambda session_id, provider: tracker
+
+    signed_block = {"type": "thinking", "thinking": "private", "signature": "sig123"}
+    inbound = {
+        "model": "claude-opus-5",
+        "max_tokens": 64,
+        "messages": [
+            {"role": "user", "content": "Solve this."},
+            {
+                "role": "assistant",
+                "content": [dict(signed_block), {"type": "text", "text": "Working."}],
+            },
+            {"role": "user", "content": "Continue."},
+        ],
+        "tools": [
+            {
+                "name": "lookup",
+                "description": "  Look up a value.  ",
+                "input_schema": {
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "title": "LookupArgs",
+                    "type": "object",
+                    "properties": {"q": {"type": "string", "title": "Q"}},
+                },
+            }
+        ],
+    }
+    inbound_bytes = json.dumps(inbound, indent=2).encode()
+
+    response = TestClient(app).post(
+        "/v1/messages",
+        headers={
+            "x-api-key": "test-key",
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        },
+        content=inbound_bytes,
+    )
+
+    assert response.status_code == 200
+    # The edit shipped: the annotation keys the compaction strips are gone.
+    assert transport.captured_body != inbound_bytes
+    wire = json.loads(transport.captured_body)
+    assert "$schema" not in wire["tools"][0]["input_schema"]
+    assert "title" not in wire["tools"][0]["input_schema"]
+    # ...and the seal went out byte-identical, which is what makes it safe.
+    assert wire["messages"][1]["content"][0] == signed_block
+
+    outcome = proxy._record_request_outcome.await_args.args[0]
+    assert "wire_mutations_discarded" not in outcome.tags
 
 
 def _openai_responses_body_bytes(*, stream: bool) -> bytes:
@@ -570,7 +1009,15 @@ def test_anthropic_tools_unsorted_order_preserves_byte_faithful_request() -> Non
     assert [tool["name"] for tool in forwarded["tools"]] == ["zeta", "alpha"]
 
 
-def test_anthropic_tools_unsorted_reordered_and_canonicalized_when_optimized() -> None:
+def test_anthropic_tools_unsorted_reordered_and_canonicalized_when_optimized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # This asserts an exact upstream body to pin *tool* canonicalization, so
+    # isolate it from output shaping, which is on by default for an optimized
+    # proxy and appends a steering block to the system tail. Shaping is
+    # covered by its own suites; folding its text into this expectation would
+    # make a tool-ordering test fail every time the steering copy is edited.
+    monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "0")
     client, transport = _make_anthropic_app(optimize=True)
     proxy = client.app.state.proxy
     proxy.config.mode = "token"
@@ -928,15 +1375,17 @@ class _StreamingCapturingTransport(httpx.AsyncBaseTransport):
         self.captured_body = body
         self.captured_headers = dict(request.headers.items())
 
-        async def _empty_sse():  # pragma: no cover - generator
-            yield b'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_s","type":"message","role":"assistant","model":"claude","usage":{"input_tokens":1,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}\n\n'
-            yield b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
-
         return httpx.Response(
             200,
             headers={"content-type": "text/event-stream"},
-            stream=httpx.AsyncByteStream(_empty_sse()),  # type: ignore[arg-type]
+            stream=_SSEByteStream(),
         )
+
+
+class _SSEByteStream(httpx.AsyncByteStream):
+    async def __aiter__(self):
+        yield b'event: message_start\ndata: {"type":"message_start","message":{"id":"msg_s","type":"message","role":"assistant","model":"claude","usage":{"input_tokens":1,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}\n\n'
+        yield b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
 
 
 def test_streaming_forwarder_byte_faithful() -> None:
@@ -990,6 +1439,147 @@ def test_streaming_forwarder_byte_faithful() -> None:
         f"Streaming byte-faithfulness broken: inbound {inbound_sha} vs "
         f"upstream {upstream_sha}; upstream={upstream!r}"
     )
+
+
+def test_vertex_stream_rawpredict_preserves_client_beta_header_on_passthrough() -> None:
+    _reset_session_beta_tracker_for_test()
+    try:
+        client, transport = _make_anthropic_app(optimize=False)
+        get_session_beta_tracker().record_and_get_sticky_betas(
+            provider="anthropic",
+            session_id="s1",
+            client_value="sticky-beta-2024-01-01",
+        )
+
+        inbound_bytes = (
+            b'{"model":"claude-sonnet-4-6","stream":true,'
+            b'"messages":[{"role":"user","content":"hi"}]}'
+        )
+        client_beta = "claude-code-20250219"
+
+        with client.stream(
+            "POST",
+            "/projects/p/locations/us-central1/publishers/anthropic/models/"
+            "claude-sonnet-4-6:streamRawPredict",
+            headers={
+                "x-api-key": "test-key",
+                "x-headroom-session-id": "vertex-stream-beta-1",
+                "anthropic-version": "2023-06-01",
+                "anthropic-beta": client_beta,
+                "content-type": "application/json",
+            },
+            content=inbound_bytes,
+        ) as resp:
+            response_body = b"".join(resp.iter_bytes())
+            assert resp.status_code == 200, response_body
+
+        assert transport.captured_body == inbound_bytes
+        assert transport.captured_headers is not None
+        captured_headers = {key.lower(): value for key, value in transport.captured_headers.items()}
+        assert captured_headers["anthropic-beta"] == client_beta
+    finally:
+        _reset_session_beta_tracker_for_test()
+
+
+def test_messages_custom_upstream_stream_preserves_client_beta_header() -> None:
+    _reset_session_beta_tracker_for_test()
+    old_anthropic_url = None
+    try:
+        config = ProxyConfig(
+            optimize=False,
+            cache_enabled=False,
+            rate_limit_enabled=False,
+            cost_tracking_enabled=False,
+            log_requests=False,
+            ccr_inject_tool=False,
+            ccr_handle_responses=False,
+            ccr_context_tracking=False,
+            image_optimize=False,
+        )
+        app = create_app(config)
+        proxy = app.state.proxy
+        old_anthropic_url = type(proxy).ANTHROPIC_API_URL
+        type(proxy).ANTHROPIC_API_URL = "https://custom.example"
+        fake_tracker = _FakePrefixTracker(frozen_count=0)
+        proxy.session_tracker_store.compute_session_id = lambda request, model, messages: (
+            "custom-stream-beta-1"
+        )
+        proxy.session_tracker_store.get_or_create = lambda session_id, provider: fake_tracker
+
+        transport = _StreamingCapturingTransport()
+        proxy.http_client = httpx.AsyncClient(transport=transport)
+        client = TestClient(app)
+
+        get_session_beta_tracker().record_and_get_sticky_betas(
+            provider="anthropic",
+            session_id="custom-stream-beta-1",
+            client_value="sticky-beta-2024-01-01",
+        )
+
+        inbound_bytes = (
+            b'{"model":"claude-sonnet-4-6","max_tokens":16,"stream":true,'
+            b'"messages":[{"role":"user","content":"hi"}]}'
+        )
+        client_beta = "claude-code-20250219"
+
+        with client.stream(
+            "POST",
+            "/v1/messages",
+            headers={
+                "x-api-key": "test-key",
+                "x-headroom-session-id": "custom-stream-beta-1",
+                "anthropic-version": "2023-06-01",
+                "anthropic-beta": client_beta,
+                "content-type": "application/json",
+            },
+            content=inbound_bytes,
+        ) as resp:
+            response_body = b"".join(resp.iter_bytes())
+            assert resp.status_code == 200, response_body
+
+        assert transport.captured_body == inbound_bytes
+        assert transport.captured_headers is not None
+        captured_headers = {key.lower(): value for key, value in transport.captured_headers.items()}
+        assert captured_headers["anthropic-beta"] == client_beta
+    finally:
+        if old_anthropic_url is not None:
+            type(proxy).ANTHROPIC_API_URL = old_anthropic_url
+        _reset_session_beta_tracker_for_test()
+
+
+def test_vertex_rawpredict_keeps_sticky_beta_union_on_non_stream_passthrough() -> None:
+    _reset_session_beta_tracker_for_test()
+    try:
+        client, transport = _make_anthropic_app(optimize=False)
+        get_session_beta_tracker().record_and_get_sticky_betas(
+            provider="anthropic",
+            session_id="s1",
+            client_value="sticky-beta-2024-01-01",
+        )
+
+        inbound_bytes = b'{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}]}'
+        client_beta = "claude-code-20250219"
+
+        response = client.post(
+            "/projects/p/locations/us-central1/publishers/anthropic/models/"
+            "claude-sonnet-4-6:rawPredict",
+            headers={
+                "x-api-key": "test-key",
+                "x-headroom-session-id": "vertex-raw-beta-1",
+                "anthropic-version": "2023-06-01",
+                "anthropic-beta": client_beta,
+                "content-type": "application/json",
+            },
+            content=inbound_bytes,
+        )
+
+        assert response.status_code == 200
+        assert transport.captured_body == inbound_bytes
+        assert transport.captured_headers is not None
+        captured_headers = {key.lower(): value for key, value in transport.captured_headers.items()}
+        assert captured_headers["anthropic-beta"] == "sticky-beta-2024-01-01,claude-code-20250219"
+    finally:
+        _reset_session_beta_tracker_for_test()
 
 
 def test_openai_responses_gzip_nonstream_passthrough_strips_content_encoding() -> None:
@@ -1134,3 +1724,229 @@ def test_ws_http_fallback_uses_canonical_serializer() -> None:
     assert b"\\u" not in out
     # Round-trip equality via JSON parse.
     assert json.loads(out.decode("utf-8")) == body
+
+
+# ---------------------------------------------------------------------------
+# Thinking-preserving mutations (relaxing the blanket signed-thinking byte-lock)
+#
+# Anthropic signs the thinking BLOCK, not the request. The signature covers that
+# block's own content, so edits elsewhere -- a compressed ``tool_result`` twenty
+# turns back, a compacted ``tools`` array that is not even inside ``messages``
+# -- cannot invalidate it. The original lock (#2254) froze the entire body
+# whenever any thinking block was present, which on Claude Code traffic meant
+# every computed compression was discarded from turn 2 of a session onward.
+#
+# The relaxation ships dark behind ``HEADROOM_THINKING_PRESERVING_MUTATIONS``
+# and only engages when every thinking block is provably byte-equal to the one
+# the client sent. These tests pin both directions: what must now ship, and what
+# must still lock.
+# ---------------------------------------------------------------------------
+
+_TB_SIGNED_BLOCK = {
+    "type": "thinking",
+    "thinking": "Let me think about this… café",
+    "signature": "EuYBCkQYBCKMAQ==",
+}
+
+
+def _tb_body(tool_text: str = "LOG LINE\n" * 500) -> dict:
+    """Claude-Code-shaped turn: signed thinking in history + a fat tool_result."""
+    return {
+        "model": "claude-sonnet-5",
+        "tools": [{"name": "Bash", "description": "x" * 400, "input_schema": {"type": "object"}}],
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+            {
+                "role": "assistant",
+                "content": [dict(_TB_SIGNED_BLOCK), {"type": "text", "text": "ok"}],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "t1",
+                        "content": [{"type": "text", "text": tool_text}],
+                    }
+                ],
+            },
+        ],
+    }
+
+
+def _tb_select(mutated: dict, original_bytes: bytes):
+    return select_outbound_body(
+        body=mutated,
+        original_body_bytes=original_bytes,
+        body_mutated=True,
+        forwarder_mode="byte_faithful",
+        mutation_reasons=["content_router", "anthropic:tool_schema_compaction"],
+    )
+
+
+def test_thinking_preserving_mutation_ships_compression(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Untouched thinking block => the rest of the body may be re-serialized."""
+    monkeypatch.setenv("HEADROOM_THINKING_PRESERVING_MUTATIONS", "1")
+    original = json.dumps(_tb_body()).encode()
+    mutated = json.loads(original)
+    mutated["messages"][2]["content"][0]["content"][0]["text"] = "[compressed]"
+
+    outbound = _tb_select(mutated, original)
+
+    assert outbound.source == "canonical"
+    assert outbound.dropped_mutations is False
+    assert b"[compressed]" in outbound.content
+    # The seal itself must survive verbatim, or we have merely moved the bug.
+    assert _TB_SIGNED_BLOCK["signature"].encode() in outbound.content
+    assert json.loads(outbound.content)["messages"][1]["content"][0] == _TB_SIGNED_BLOCK
+
+
+@pytest.mark.parametrize(
+    ("label", "tamper"),
+    [
+        ("edited_text", lambda b: b["messages"][1]["content"][0].__setitem__("thinking", "x")),
+        (
+            "edited_signature",
+            lambda b: b["messages"][1]["content"][0].__setitem__("signature", "x"),
+        ),
+        ("dropped_block", lambda b: b["messages"][1]["content"].__delitem__(0)),
+        ("reordered_blocks", lambda b: b["messages"][1]["content"].reverse()),
+    ],
+)
+def test_touching_a_thinking_block_still_locks(
+    monkeypatch: pytest.MonkeyPatch, label: str, tamper
+) -> None:
+    """Any detectable change to a thinking block keeps today's verbatim passthrough."""
+    monkeypatch.setenv("HEADROOM_THINKING_PRESERVING_MUTATIONS", "1")
+    original = json.dumps(_tb_body()).encode()
+    mutated = json.loads(original)
+    tamper(mutated)
+
+    outbound = _tb_select(mutated, original)
+
+    assert outbound.source == "passthrough", label
+    assert outbound.dropped_mutations is True
+    assert outbound.content == original
+
+
+def test_thinking_relaxation_is_on_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unset flag => relaxation active (maintainer chose on-by-default)."""
+    monkeypatch.delenv("HEADROOM_THINKING_PRESERVING_MUTATIONS", raising=False)
+    original = json.dumps(_tb_body()).encode()
+    mutated = json.loads(original)
+    mutated["messages"][2]["content"][0]["content"][0]["text"] = "[compressed]"
+
+    outbound = _tb_select(mutated, original)
+
+    assert outbound.source == "canonical"
+    assert outbound.dropped_mutations is False
+
+
+@pytest.mark.parametrize("off_value", ["0", "false", "no", "off", "OFF"])
+def test_kill_switch_restores_the_blanket_lock(
+    monkeypatch: pytest.MonkeyPatch, off_value: str
+) -> None:
+    """The documented rollback must work without a deploy, on every falsey spelling."""
+    monkeypatch.setenv("HEADROOM_THINKING_PRESERVING_MUTATIONS", off_value)
+    original = json.dumps(_tb_body()).encode()
+    mutated = json.loads(original)
+    mutated["messages"][2]["content"][0]["content"][0]["text"] = "[compressed]"
+
+    outbound = _tb_select(mutated, original)
+
+    assert outbound.source == "passthrough", off_value
+    assert outbound.dropped_mutations is True
+    assert outbound.content == original
+
+
+def test_thinking_block_key_reorder_is_not_an_edit(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The contract is over parsed values, so dict key order must not matter."""
+    monkeypatch.setenv("HEADROOM_THINKING_PRESERVING_MUTATIONS", "1")
+    original = json.dumps(_tb_body()).encode()
+    mutated = json.loads(original)
+    block = mutated["messages"][1]["content"][0]
+    mutated["messages"][1]["content"][0] = {
+        "signature": block["signature"],
+        "thinking": block["thinking"],
+        "type": block["type"],
+    }
+
+    assert thinking_blocks_survived_mutation(mutated, original) is True
+
+
+def test_is_client_bytes_agrees_with_selection(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The CCR buffering probe must never disagree with the forwarder (#2952)."""
+    monkeypatch.setenv("HEADROOM_THINKING_PRESERVING_MUTATIONS", "1")
+    original = json.dumps(_tb_body()).encode()
+
+    preserved = json.loads(original)
+    preserved["messages"][2]["content"][0]["content"][0]["text"] = "[compressed]"
+    tampered = json.loads(original)
+    tampered["messages"][1]["content"][0]["thinking"] = "tampered"
+
+    for mutated in (preserved, tampered):
+        probe_says_locked = outbound_body_is_client_bytes(
+            body=mutated, original_body_bytes=original
+        )
+        forwarder_locked = _tb_select(mutated, original).source == "passthrough"
+        assert probe_says_locked is forwarder_locked
+
+
+def test_unparseable_original_cannot_prove_preservation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No proof => no relaxation. Fail closed."""
+    monkeypatch.setenv("HEADROOM_THINKING_PRESERVING_MUTATIONS", "1")
+    assert thinking_blocks_survived_mutation(_tb_body(), b"{not json") is False
+    assert thinking_blocks_survived_mutation(_tb_body(), None) is False
+
+
+def test_lone_surrogate_in_thinking_body_serializes_instead_of_raising():
+    """A lone surrogate must not turn a mutated thinking body into a 500.
+
+    ``"\\ud800"`` is valid JSON, so ``json.loads`` accepts it and a tool result
+    carrying truncated UTF-16 produces one. Before #3124 a mutated
+    thinking-bearing body returned the client's bytes verbatim and never reached
+    canonical serialization; now it does, and both forwarders resolve outbound
+    bytes outside their retry loop, so a raise here escapes as an unretried 500.
+    """
+    import json
+
+    from headroom.proxy.body_forwarding import select_outbound_body
+
+    lone_surrogate = chr(0xD800)
+    original = {
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "thinking",
+                        "thinking": f"reasoning {lone_surrogate}",
+                        "signature": "sig",
+                    }
+                ],
+            }
+        ]
+    }
+    original_bytes = json.dumps(original, ensure_ascii=True).encode("utf-8")
+    mutated = json.loads(original_bytes)
+    mutated["messages"].append({"role": "user", "content": "compressed"})
+
+    outbound = select_outbound_body(
+        body=mutated,
+        original_body_bytes=original_bytes,
+        body_mutated=True,
+        forwarder_mode="byte_faithful",
+    )
+
+    # The relaxation still applies (the thinking block is untouched) and the
+    # mutation reaches the wire rather than being discarded or crashing.
+    assert outbound.source == "canonical"
+    assert not outbound.dropped_mutations
+    reparsed = json.loads(outbound.content)
+    assert reparsed == mutated
+    # The signed block round-trips to exactly the values the client sent.
+    assert reparsed["messages"][0] == original["messages"][0]

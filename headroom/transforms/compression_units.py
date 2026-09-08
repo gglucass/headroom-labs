@@ -52,8 +52,10 @@ class CompressionUnit:
 # - compressor_noop:   router returned identical bytes (no compression possible)
 # - already_compressed: input already carried a CCR retrieval marker
 # - rejected_not_smaller: compressor produced output >= input tokens
-# - cache_hit:         result returned from result_cache (placeholder; not
-#                      currently wired into the unit path — see follow-up)
+# - cache_hit:         reserved; cached unit reuse is caller-level (the OpenAI
+#                      Responses handler's unit-result cache) and is surfaced
+#                      via RouterCompressionResult.cache_hit, not as a reason
+#                      here — no code path produces this category today
 UNIT_REASON_CATEGORIES = {
     None: "applied",
     "protected_user_message": "protected_role",
@@ -189,7 +191,7 @@ def _compress_marker_free_text(
         return text, [], last_router_result
 
     leading, core, trailing = boundary.groups()
-    if len(core) < unit.min_bytes:
+    if len(core.encode("utf-8", errors="replace")) < unit.min_bytes:
         return text, [], last_router_result
 
     router_result = router.compress(
@@ -261,7 +263,7 @@ def compress_unit_with_router(
         return _with_reason(reason="protected_assistant_message")
     if unit.cache_zone != "live":
         return _with_reason(reason=f"cache_zone_{unit.cache_zone}")
-    if len(unit.text) < unit.min_bytes:
+    if text_bytes < unit.min_bytes:
         return _with_reason(reason="below_unit_floor")
 
     prior_target_ratio = getattr(router, "_runtime_target_ratio", None)

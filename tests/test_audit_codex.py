@@ -6,25 +6,20 @@ import json
 
 import pytest
 
-from headroom.audit.codex import audit_codex, classify_command, render_codex_text, strip_wrappers
+from headroom.audit.codex import audit_codex, classify_command, render_codex_text
 
 
 class TestClassifier:
-    def test_strip_wrappers(self):
-        assert strip_wrappers("rtk cat foo.py") == "cat foo.py"
-        assert strip_wrappers("rtk proxy sed -n '1,20p' foo.py") == "sed -n '1,20p' foo.py"
-        assert strip_wrappers("git status") == "git status"
-
     @pytest.mark.parametrize(
         ("cmd", "category", "partial"),
         [
             ("cat src/foo.py", "read", False),
             ("sed -n '1,200p' src/foo.py", "read", True),
-            ("rtk read src/foo.py --lines 10-50", "read", True),
+            ("bat src/foo.py --lines 10-50", "read", True),
             ("head -50 src/foo.py", "read", True),
             ("nl headroom/config.py", "read", False),
             ("rg -n 'def apply' headroom/", "search", False),
-            ("rtk grep -n pattern .", "search", False),
+            ("grep -rn pattern .", "search", False),
             ("git diff HEAD~1", "git", False),
             ("apply_patch <<'EOF'\n*** Begin Patch\nEOF", "edit", False),
             ("pytest tests/ -x -q", "build/test", False),
@@ -51,6 +46,24 @@ class TestClassifier:
         cat, path, _ = classify_command("cat foo.py | grep def", workdir="/r")
         assert cat == "read"
         assert path == "/r/foo.py"
+
+    @pytest.mark.parametrize(
+        ("cmd", "expected"),
+        [
+            (
+                "apply_patch <<'PATCH'\n*** Begin Patch\n*** Update File: src/foo.py\n@@\n*** End Patch\nPATCH",
+                "/repo/src/foo.py",
+            ),
+            ("sed -i 's/old/new/' src/foo.py", "/repo/src/foo.py"),
+            ("printf 'x' | tee src/foo.py", "/repo/src/foo.py"),
+            ("cat <<'EOF' > src/foo.py\nx\nEOF", "/repo/src/foo.py"),
+        ],
+    )
+    def test_edit_path_extraction(self, cmd, expected):
+        cat, path, partial = classify_command(cmd, workdir="/repo")
+        assert cat == "edit"
+        assert path == expected
+        assert partial is False
 
 
 def _call(call_id: str, cmd: str, workdir: str = "/repo") -> str:
@@ -82,7 +95,7 @@ def codex_dir(tmp_path):
         _output("c2", content[:500]),
         _call("c3", "rg -n 'def ' src/"),
         _output("c3", "src/foo.py:1:def x():"),
-        _call("c4", "rtk read src/bar.py --lines 1-50"),
+        _call("c4", "bat src/bar.py --lines 1-50"),
         _output("c4", "bar content " * 10),
     ]
     sessions = tmp_path / "sessions" / "2026" / "06"
@@ -111,6 +124,77 @@ class TestAuditCodex:
 
     def test_empty_dir(self, tmp_path):
         assert audit_codex(tmp_path).sessions == 0
+
+
+class TestCodexMaturationSim:
+    def test_metrics(self, codex_dir):
+        from headroom.audit.maturation import simulate_codex_maturation
+
+        r = simulate_codex_maturation(codex_dir)
+        assert r.read_calls == 3
+        assert r.rereads_any == 1
+        assert r.rereads_partial == 1
+        assert r.big_reads == 1
+        assert r.never_touched_again == 0
+        assert r.next_touch_p50 == 1
+
+    def test_cli_codex_simulate_maturation(self, codex_dir):
+        from click.testing import CliRunner
+
+        from headroom.cli.main import main
+
+        runner = CliRunner()
+        res = runner.invoke(
+            main, ["audit-reads", "--codex", "--path", str(codex_dir), "--simulate-maturation"]
+        )
+        assert res.exit_code == 0, res.output
+        assert "codex read-pattern audit" in res.output
+        assert "maturation simulation" in res.output
+        assert "re-reads: 1/3" in res.output
+
+        res = runner.invoke(
+            main,
+            [
+                "audit-reads",
+                "--codex",
+                "--path",
+                str(codex_dir),
+                "--simulate-maturation",
+                "--format",
+                "json",
+            ],
+        )
+        assert res.exit_code == 0, res.output
+        data = json.loads(res.output)
+        assert data["read_calls"] == 3
+        assert data["maturation_simulation"]["read_calls"] == 3
+        assert data["maturation_simulation"]["rereads_any"] == 1
+
+    def test_edit_risk_metrics_from_codex_mutations(self, tmp_path):
+        from headroom.audit.maturation import simulate_codex_maturation
+
+        lines = [
+            _call("c1", "cat src/foo.py"),
+            _output("c1", "line\n" * 600),
+            _call("c2", "rg -n TODO src"),
+            _output("c2", "src/foo.py:1:TODO"),
+            _call("c3", "sed -i 's/TODO/done/' src/foo.py"),
+            _output("c3", ""),
+            _call(
+                "c4",
+                "apply_patch <<'PATCH'\n*** Begin Patch\n*** Update File: src/bar.py\n@@\n*** End Patch\nPATCH",
+            ),
+            _output("c4", "Done!"),
+        ]
+        sessions = tmp_path / "sessions"
+        sessions.mkdir()
+        (sessions / "rollout.jsonl").write_text("\n".join(lines))
+
+        r = simulate_codex_maturation(sessions)
+        assert r.edits_with_prior_read == 1
+        assert r.edits_without_prior_read == 1
+        assert r.at_risk_edits[1] == 1
+        assert r.at_risk_edits[2] == 0
 
 
 class TestCli:

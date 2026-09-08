@@ -1,4 +1,4 @@
-"""Output token shaping for proxied Anthropic requests.
+"""Output token shaping for proxied Anthropic and OpenAI Responses requests.
 
 Headroom's transforms compress what goes INTO the model. This module is the
 first request-side lever on what comes OUT of it. The proxy never generates
@@ -29,119 +29,149 @@ Safety rules (each prevents a concrete failure mode):
 
 Turn classification is purely structural (block types, roles, ``is_error``
 flags) — no content regexes or keyword patterns.
+
+The same lever exists for the OpenAI Responses format (Codex et al.):
+:func:`apply_responses_verbosity_steering` appends the byte-stable steering
+block to the tail of the ``instructions`` string, and
+:func:`shape_responses_request` is the Responses-format counterpart of
+:func:`shape_request`.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
-from enum import Enum
 from typing import Any
 
 from headroom.proxy import runtime_env
+from headroom.proxy.output_steering import (
+    apply_openai_chat_verbosity_steering,
+    apply_openai_responses_verbosity_steering,
+    apply_verbosity_steering,
+    replace_or_append_steering_block,
+    steering_text,
+)
+from headroom.proxy.output_turn_policy import (
+    TurnKind,
+    classify_openai_responses_input,
+    classify_turn,
+)
+from headroom.rollout import FeatureDecisionReason
 
 logger = logging.getLogger(__name__)
 
-# Documented Anthropic API minimum for thinking.budget_tokens on models
-# that still accept the legacy enabled/budget_tokens form.
-LEGACY_THINKING_FLOOR = 1024
+__all__ = [
+    "OutputShaperSettings",
+    "ShapeResult",
+    "TurnKind",
+    "apply_openai_chat_verbosity_steering",
+    "apply_openai_responses_verbosity_steering",
+    "apply_verbosity_steering",
+    "classify_openai_responses_input",
+    "classify_turn",
+    "resolve_verbosity_level",
+    "shape_openai_chat_request",
+    "shape_openai_responses_request",
+    "shape_request",
+    "steering_text",
+]
 
-# Ordering for output_config.effort values. Unknown values are left alone.
-_EFFORT_RANK = {"low": 0, "medium": 1, "high": 2, "xhigh": 3, "max": 4}
-
-_TEXT_VERBOSITY_RANK = {"low": 0, "medium": 1, "high": 2}
-
-_OPENAI_RESPONSES_OUTPUT_ITEM_TYPES = frozenset(
-    {
-        "custom_tool_call_output",
-        "function_call_output",
-        "local_shell_call_output",
-        "apply_patch_call_output",
-    }
-)
-
-# Sentinel prefix marks the steering block so application is idempotent and
-# the block is recognizable in logs/diffs.
-_STEERING_SENTINEL = "<headroom_output_shaping>"
-_STEERING_SUFFIX = "</headroom_output_shaping>"
-
-# Levels are cumulative: each includes everything above it. Text must stay
-# byte-stable across releases for prefix-cache friendliness — treat edits to
-# these strings as cache-busting changes.
-_VERBOSITY_LEVELS = {
-    1: (
-        "Skip preamble and postamble. Do not announce what you are about to "
-        "do or recap what you just did; start with the substance."
-    ),
-    2: (
-        "Skip preamble and postamble; start with the substance. Never restate "
-        "code, file contents, diffs, or tool output that already appear in "
-        "this conversation — reference them by path and line instead. After a "
-        "tool call succeeds, continue without narrating the result."
-    ),
-    3: (
-        "Skip preamble and postamble. Never restate code, file contents, "
-        "diffs, or tool output already in this conversation — reference by "
-        "path and line. Give conclusions only; omit rationale unless the user "
-        "asks why. Prefer the smallest edit over rewriting whole files. Keep "
-        "prose to the minimum needed to be unambiguous."
-    ),
-    4: (
-        "Minimum tokens. Fragments fine. No preamble, no postamble, no "
-        "restating context, no rationale. Answer, smallest-possible edits, "
-        "nothing else."
-    ),
-}
-
-
-class TurnKind(Enum):
-    """Structural classification of the latest conversation turn."""
-
-    NEW_USER_ASK = "new_user_ask"
-    MECHANICAL_CONTINUATION = "mechanical_continuation"
-    ERROR_CONTINUATION = "error_continuation"
-    UNKNOWN = "unknown"
+_replace_or_append_steering_block = replace_or_append_steering_block
 
 
 @dataclass(frozen=True)
 class OutputShaperSettings:
-    """Runtime settings, resolved once per request from the environment.
-
-    Env-driven (like HEADROOM_INTERCEPT_ENABLED) so the proxy picks it up
-    without config plumbing through the server. Off by default.
-    """
+    """Output-shaping settings with rollout enablement injected by the proxy."""
 
     enabled: bool = False
-    verbosity_level: int = 2
-    effort_router_enabled: bool = True
-    mechanical_effort: str = "low"
+    verbosity_level: int = 3
+    # False in ``mode="cache"``. Steering is the one lever that writes into the
+    # provider prefix-cache key (it appends to the system-prompt tail, and on a
+    # body with no system field it creates one); effort routing and the
+    # thinking budget sit outside the key and stay on. See
+    # :func:`steering_allowed_for`.
+    steering_enabled: bool = True
 
     @classmethod
-    def from_env(cls) -> OutputShaperSettings:
-        enabled = runtime_env.getenv("HEADROOM_OUTPUT_SHAPER", "").lower() in (
-            "1",
-            "true",
-            "yes",
-        )
+    def from_env(
+        cls, *, enabled: bool | None = None, steering_enabled: bool = True
+    ) -> OutputShaperSettings:
+        """Resolve tuning; running proxies always inject the resolved gate.
+
+        ``None`` preserves the helper's direct-call compatibility for SDK/tests,
+        but proxy request paths never use it and therefore never re-resolve the
+        rollout alias.
+        """
+        if enabled is None:
+            enabled = runtime_env.getenv("HEADROOM_OUTPUT_SHAPER", "").lower() in (
+                "1",
+                "true",
+                "yes",
+            )
         try:
-            level = int(runtime_env.getenv("HEADROOM_VERBOSITY_LEVEL", "2"))
+            level = int(runtime_env.getenv("HEADROOM_VERBOSITY_LEVEL", "3"))
         except ValueError:
             level = 2
         level = max(0, min(4, level))
-        router = runtime_env.getenv("HEADROOM_EFFORT_ROUTER", "1").lower() not in (
-            "0",
-            "false",
-            "no",
-        )
-        mech = runtime_env.getenv("HEADROOM_MECHANICAL_EFFORT", "low")
-        if mech not in _EFFORT_RANK:
-            mech = "low"
         return cls(
             enabled=enabled,
             verbosity_level=level,
-            effort_router_enabled=router,
-            mechanical_effort=mech,
+            steering_enabled=steering_enabled,
         )
+
+
+def shaper_enabled_for(config: Any) -> bool | None:
+    """Resolve the output-shaper gate for a proxy config.
+
+    Output shaping is deliberately independent of input compression — an
+    operator can run ``optimize=False`` and still want terser responses, and
+    the WS/Responses shaper tests pin that combination. So ``optimize`` does
+    not veto shaping outright. What it vetoes is shaping that nobody asked
+    for.
+
+    Since the feature defaults on, ``optimize=False`` plus *no* explicit
+    request means an operator who turned every transform off would silently
+    start getting a steering block appended to their system-prompt tail — and
+    on a request carrying no ``system`` field at all, would have one created.
+    That breaks the byte-faithful forwarding invariant. So in that one
+    combination the default loses:
+
+    * enabled explicitly (``HEADROOM_OUTPUT_SHAPER=1``, ``HEADROOM_FEATURES``)
+      → shape, whatever ``optimize`` says;
+    * enabled only by default, with ``optimize=False`` → do not shape;
+    * enabled only by default, with ``optimize=True`` → shape.
+
+    Returns ``None`` when there is no rollout snapshot to consult, which
+    preserves :meth:`OutputShaperSettings.from_env`'s env-var fallback for the
+    SDK and test callers that construct a config without one.
+    """
+    rollout = getattr(config, "rollout", None)
+    if rollout is None:
+        return None
+    try:
+        decision = rollout.decision("proxy_output_shaper")
+    except (KeyError, AttributeError):
+        return None
+    if not decision.enabled:
+        return False
+    if getattr(config, "optimize", True):
+        return True
+    return decision.reason is not FeatureDecisionReason.DEFAULT
+
+
+def steering_allowed_for(config: Any) -> bool:
+    """False when the proxy is in prefix-freezing cache mode.
+
+    ``mode="cache"`` freezes prior turns specifically to keep the provider's
+    prefix-cache key byte-stable (see ``ProxyConfig.mode``). Verbosity steering
+    writes into that key, so running it there trades a large, certain cache
+    cost for a small, uncertain output saving — the wrong side of a roughly
+    60x margin on a long context. Effort routing and the thinking budget are
+    unaffected: they ride request parameters outside the cache key, so they
+    keep saving in cache mode.
+    """
+    return getattr(config, "mode", None) != "cache"
 
 
 def resolve_verbosity_level(settings: OutputShaperSettings) -> tuple[int, str]:
@@ -156,6 +186,13 @@ def resolve_verbosity_level(settings: OutputShaperSettings) -> tuple[int, str]:
     Returns ``(level, source)``. Kept separate from :func:`shape_request` so the
     body-mutating core stays a pure function of an explicit level.
     """
+    if not settings.steering_enabled:
+        # Level 0 is the documented "no steering" value, so this disables the
+        # only cache-key-mutating lever while leaving effort routing on. It
+        # deliberately outranks the manual override below: a level set in the
+        # environment must not reintroduce a prefix mutation the mode exists
+        # to prevent.
+        return 0, "cache_mode"
     if runtime_env.getenv("HEADROOM_VERBOSITY_LEVEL"):
         return settings.verbosity_level, "env"
 
@@ -206,292 +243,6 @@ class ShapeResult:
             self.labels = []
 
 
-def classify_turn(messages: list[dict[str, Any]]) -> TurnKind:
-    """Classify the latest turn from message structure alone.
-
-    - Any text block in the last user message → the user is asking something
-      new: full effort.
-    - Only tool_result blocks, none flagged ``is_error`` → mechanical
-      continuation: the model is resuming after a routine tool call.
-    - Any tool_result with ``is_error: true`` → error continuation: the model
-      must reason about a failure, keep full effort.
-    """
-    if not messages:
-        return TurnKind.UNKNOWN
-    last = messages[-1]
-    if not isinstance(last, dict) or last.get("role") != "user":
-        return TurnKind.UNKNOWN
-
-    content = last.get("content")
-    if isinstance(content, str):
-        return TurnKind.NEW_USER_ASK if content.strip() else TurnKind.UNKNOWN
-    if not isinstance(content, list) or not content:
-        return TurnKind.UNKNOWN
-
-    saw_tool_result = False
-    saw_error = False
-    for block in content:
-        if not isinstance(block, dict):
-            return TurnKind.UNKNOWN
-        btype = block.get("type")
-        if btype == "tool_result":
-            saw_tool_result = True
-            if block.get("is_error") is True:
-                saw_error = True
-        elif btype == "text":
-            # Fresh user text alongside (or instead of) tool results means
-            # the user interjected — treat as a new ask.
-            return TurnKind.NEW_USER_ASK
-        elif btype in ("image", "document"):
-            return TurnKind.NEW_USER_ASK
-        # Unknown block types are ignored rather than guessed at.
-
-    if saw_error:
-        return TurnKind.ERROR_CONTINUATION
-    if saw_tool_result:
-        return TurnKind.MECHANICAL_CONTINUATION
-    return TurnKind.UNKNOWN
-
-
-def steering_text(level: int) -> str | None:
-    """The full steering block for a verbosity level, or None for level 0."""
-    text = _VERBOSITY_LEVELS.get(level)
-    if text is None:
-        return None
-    return f"{_STEERING_SENTINEL}\n{text}\n{_STEERING_SUFFIX}"
-
-
-def _replace_or_append_steering_block(existing: str, block: str) -> tuple[str, bool]:
-    """Replace an existing steering block in text, or append one at the tail."""
-    start = existing.find(_STEERING_SENTINEL)
-    if start >= 0:
-        end = existing.find(_STEERING_SUFFIX, start)
-        end = len(existing) if end < 0 else end + len(_STEERING_SUFFIX)
-        prefix = existing[:start].rstrip()
-        suffix = existing[end:].lstrip("\n")
-        parts = [part for part in (prefix, block, suffix) if part]
-        updated = "\n\n".join(parts)
-        return updated, updated != existing
-
-    updated = f"{existing.rstrip()}\n\n{block}" if existing.strip() else block
-    return updated, updated != existing
-
-
-def apply_verbosity_steering(body: dict[str, Any], level: int) -> bool:
-    """Append the steering block to the tail of the system prompt.
-
-    Appending AFTER the last system block keeps any ``cache_control``
-    breakpoint on an earlier block intact — the cached prefix is unchanged
-    and only the (small, byte-stable) steering block is reprocessed.
-
-    A string system prompt is converted to block form so the original text
-    keeps its exact bytes as the first block.
-    """
-    text = steering_text(level)
-    if text is None:
-        return False
-
-    system = body.get("system")
-    if system is None:
-        body["system"] = [{"type": "text", "text": text}]
-        return True
-    if isinstance(system, str):
-        body["system"] = [
-            {"type": "text", "text": system},
-            {"type": "text", "text": text},
-        ]
-        return True
-    if isinstance(system, list):
-        for block in system:
-            if isinstance(block, dict) and block.get("text", "").startswith(_STEERING_SENTINEL):
-                if block["text"] == text:
-                    return False  # already applied at this level
-                block["text"] = text  # level changed mid-session
-                return True
-        system.append({"type": "text", "text": text})
-        return True
-    return False
-
-
-def route_effort(
-    body: dict[str, Any],
-    kind: TurnKind,
-    settings: OutputShaperSettings,
-) -> list[str]:
-    """Lower thinking/effort spend on mechanical continuations.
-
-    Returns labels for each mutation made (empty list = untouched).
-    """
-    if kind is not TurnKind.MECHANICAL_CONTINUATION:
-        return []
-
-    labels: list[str] = []
-
-    # Modern lever: output_config.effort. Only lower a value the client
-    # explicitly sent — presence proves the target model accepts the param.
-    output_config = body.get("output_config")
-    if isinstance(output_config, dict):
-        effort = output_config.get("effort")
-        if (
-            isinstance(effort, str)
-            and effort in _EFFORT_RANK
-            and _EFFORT_RANK[effort] > _EFFORT_RANK[settings.mechanical_effort]
-        ):
-            output_config["effort"] = settings.mechanical_effort
-            labels.append(f"output_shaper:effort:{effort}->{settings.mechanical_effort}")
-
-    # Legacy lever: clamp thinking.budget_tokens on models still using the
-    # enabled/budget_tokens form. The type field itself is never touched.
-    thinking = body.get("thinking")
-    if isinstance(thinking, dict) and thinking.get("type") == "enabled":
-        budget = thinking.get("budget_tokens")
-        if isinstance(budget, int) and budget > LEGACY_THINKING_FLOOR:
-            thinking["budget_tokens"] = LEGACY_THINKING_FLOOR
-            labels.append(f"output_shaper:thinking_budget:{budget}->{LEGACY_THINKING_FLOOR}")
-
-    return labels
-
-
-def _responses_part_text(value: Any) -> str:
-    if isinstance(value, str):
-        return value
-    if isinstance(value, list):
-        texts: list[str] = []
-        for part in value:
-            if isinstance(part, str):
-                texts.append(part)
-            elif isinstance(part, dict) and isinstance(part.get("text"), str):
-                texts.append(part["text"])
-        return "\n".join(text for text in texts if text)
-    return ""
-
-
-def _responses_user_signal(item: dict[str, Any]) -> bool:
-    item_type = item.get("type")
-    role = item.get("role")
-    if role == "user":
-        content = item.get("content")
-        if isinstance(content, list):
-            for part in content:
-                if isinstance(part, dict) and part.get("type") in {
-                    "input_file",
-                    "input_image",
-                }:
-                    return True
-        text = _responses_part_text(content)
-        return bool(text.strip())
-    if item_type == "input_text":
-        text = _responses_part_text(item.get("text"))
-        return bool(text.strip())
-    if item_type == "input_image":
-        return True
-    return False
-
-
-def classify_openai_responses_input(input_data: Any) -> TurnKind:
-    """Classify OpenAI Responses ``input`` without content heuristics."""
-    if isinstance(input_data, str):
-        return TurnKind.NEW_USER_ASK if input_data.strip() else TurnKind.UNKNOWN
-    if not isinstance(input_data, list) or not input_data:
-        return TurnKind.UNKNOWN
-
-    saw_tool_output = False
-    saw_unknown = False
-    for item in input_data:
-        if not isinstance(item, dict):
-            saw_unknown = True
-            continue
-        item_type = item.get("type")
-        if item_type in _OPENAI_RESPONSES_OUTPUT_ITEM_TYPES:
-            saw_tool_output = True
-            continue
-        if _responses_user_signal(item):
-            return TurnKind.NEW_USER_ASK
-        if item_type in {"message", "function_call", "reasoning"}:
-            continue
-        saw_unknown = True
-
-    if saw_tool_output and not saw_unknown:
-        return TurnKind.MECHANICAL_CONTINUATION
-    return TurnKind.UNKNOWN
-
-
-def apply_openai_responses_verbosity_steering(
-    body: dict[str, Any],
-    level: int,
-) -> bool:
-    """Append or replace steering in OpenAI Responses ``instructions``."""
-    text = steering_text(level)
-    if text is None:
-        return False
-
-    instructions = body.get("instructions")
-    if instructions is None:
-        body["instructions"] = text
-        return True
-    if not isinstance(instructions, str):
-        return False
-
-    updated, changed = _replace_or_append_steering_block(instructions, text)
-    if changed:
-        body["instructions"] = updated
-    return changed
-
-
-def route_openai_reasoning_effort(
-    body: dict[str, Any],
-    kind: TurnKind,
-    settings: OutputShaperSettings,
-) -> list[str]:
-    """Lower explicitly-present OpenAI reasoning effort on mechanical turns."""
-    if kind is not TurnKind.MECHANICAL_CONTINUATION:
-        return []
-
-    reasoning = body.get("reasoning")
-    if not isinstance(reasoning, dict):
-        return []
-    effort = reasoning.get("effort")
-    target = settings.mechanical_effort
-    if (
-        isinstance(effort, str)
-        and effort in _EFFORT_RANK
-        and target in _EFFORT_RANK
-        and _EFFORT_RANK[effort] > _EFFORT_RANK[target]
-    ):
-        reasoning["effort"] = target
-        return [f"output_shaper:reasoning_effort:{effort}->{target}"]
-    return []
-
-
-def route_openai_text_verbosity(body: dict[str, Any]) -> list[str]:
-    """Set or lower OpenAI ``text.verbosity`` conservatively."""
-    model = str(body.get("model") or "").lower()
-    text_config = body.get("text")
-    can_create = model.startswith("gpt-5")
-    if text_config is None:
-        if not can_create:
-            return []
-        body["text"] = {"verbosity": "low"}
-        return ["output_shaper:text_verbosity:unset->low"]
-    if not isinstance(text_config, dict):
-        return []
-
-    verbosity = text_config.get("verbosity")
-    if verbosity is None:
-        if not can_create:
-            return []
-        text_config["verbosity"] = "low"
-        return ["output_shaper:text_verbosity:unset->low"]
-    if (
-        isinstance(verbosity, str)
-        and verbosity in _TEXT_VERBOSITY_RANK
-        and _TEXT_VERBOSITY_RANK[verbosity] > _TEXT_VERBOSITY_RANK["low"]
-    ):
-        text_config["verbosity"] = "low"
-        return [f"output_shaper:text_verbosity:{verbosity}->low"]
-    return []
-
-
 def shape_openai_responses_request(
     body: dict[str, Any],
     settings: OutputShaperSettings | None = None,
@@ -510,19 +261,6 @@ def shape_openai_responses_request(
     if level > 0 and apply_openai_responses_verbosity_steering(body, level):
         result.changed = True
         result.labels.append(f"output_shaper:verbosity:L{level}")
-
-    kind = classify_openai_responses_input(body.get("input"))
-    if settings.effort_router_enabled:
-        labels = route_openai_reasoning_effort(body, kind, settings)
-        if labels:
-            result.changed = True
-            result.labels.extend(labels)
-            logger.debug("OpenAIOutputShaper: turn=%s mutations=%s", kind.value, labels)
-
-    labels = route_openai_text_verbosity(body)
-    if labels:
-        result.changed = True
-        result.labels.extend(labels)
 
     return result
 
@@ -551,12 +289,163 @@ def shape_request(
         result.changed = True
         result.labels.append(f"output_shaper:verbosity:L{level}")
 
-    if settings.effort_router_enabled:
-        kind = classify_turn(body.get("messages", []))
-        labels = route_effort(body, kind, settings)
-        if labels:
-            result.changed = True
-            result.labels.extend(labels)
-        logger.debug("OutputShaper: turn=%s mutations=%s", kind.value, labels)
+    return result
+
+
+def shape_openai_chat_request(
+    body: dict[str, Any],
+    settings: OutputShaperSettings | None = None,
+    level_override: int | None = None,
+) -> ShapeResult:
+    """Apply output-shaping levers to an OpenAI chat/completions body in place.
+
+    The chat counterpart of :func:`shape_request`. Chat carries the system
+    prompt as a ``role: "system"`` message, so verbosity steering uses the
+    chat-specific injector.
+    """
+    if settings is None:
+        settings = OutputShaperSettings.from_env()
+    result = ShapeResult()
+    if not settings.enabled:
+        return result
+
+    assert result.labels is not None  # __post_init__ guarantees this
+
+    level = settings.verbosity_level if level_override is None else level_override
+    if level > 0 and apply_openai_chat_verbosity_steering(body, level):
+        result.changed = True
+        result.labels.append(f"output_shaper:verbosity:L{level}")
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# OpenAI Responses format (Codex, /v1/responses HTTP + WebSocket)
+# ---------------------------------------------------------------------------
+
+# Trailing ``input`` item types that represent tool output coming back to the
+# model — the Responses counterpart of an Anthropic ``tool_result`` block.
+_RESPONSES_TOOL_OUTPUT_TYPES = frozenset(
+    {
+        "custom_tool_call_output",
+        "function_call_output",
+        "local_shell_call_output",
+        "apply_patch_call_output",
+    }
+)
+
+
+def _responses_tool_output_is_error(item: dict[str, Any]) -> bool:
+    """Structural error sniff on a Responses tool-output item.
+
+    The Responses format has no ``is_error`` flag, but agent harnesses encode
+    failure structurally in the ``output`` payload: a JSON object with a
+    nonzero ``exit_code``, ``success: false``, or a truthy ``error`` field.
+    Only those JSON fields are inspected — never prose content.
+    """
+    output = item.get("output")
+    data: Any = output
+    if isinstance(output, str):
+        stripped = output.strip()
+        if not (stripped.startswith("{") and stripped.endswith("}")):
+            return False
+        try:
+            data = json.loads(stripped)
+        except (ValueError, TypeError):
+            return False
+    if not isinstance(data, dict):
+        return False
+    # Direct fields, plus the common {"output": ..., "metadata": {...}} nesting.
+    scopes: list[dict[str, Any]] = [data]
+    metadata = data.get("metadata")
+    if isinstance(metadata, dict):
+        scopes.append(metadata)
+    for scope in scopes:
+        exit_code = scope.get("exit_code")
+        if isinstance(exit_code, int) and exit_code != 0:
+            return True
+        if scope.get("success") is False:
+            return True
+        if scope.get("error"):
+            return True
+    return False
+
+
+def classify_responses_turn(input_data: Any) -> TurnKind:
+    """Classify a Responses request's turn from its ``input`` field.
+
+    Mirrors :func:`classify_turn` semantics on the Responses item list: the
+    trailing run of tool-output items decides the turn. A trailing user
+    message is a new ask; tool outputs are mechanical unless any carries a
+    structural error marker. Purely structural — item types and JSON fields,
+    no content regexes.
+    """
+    if isinstance(input_data, str):
+        return TurnKind.NEW_USER_ASK if input_data.strip() else TurnKind.UNKNOWN
+    if not isinstance(input_data, list) or not input_data:
+        return TurnKind.UNKNOWN
+
+    saw_tool_output = False
+    saw_error = False
+    for item in reversed(input_data):
+        if not isinstance(item, dict):
+            return TurnKind.UNKNOWN
+        itype = item.get("type")
+        if itype in _RESPONSES_TOOL_OUTPUT_TYPES:
+            saw_tool_output = True
+            if _responses_tool_output_is_error(item):
+                saw_error = True
+            continue
+        # First non-tool-output item ends the trailing run.
+        if saw_tool_output:
+            break
+        if itype == "message" or (itype is None and "role" in item):
+            role = item.get("role")
+            if role == "user":
+                return TurnKind.NEW_USER_ASK
+            return TurnKind.UNKNOWN
+        return TurnKind.UNKNOWN
+
+    if saw_error:
+        return TurnKind.ERROR_CONTINUATION
+    if saw_tool_output:
+        return TurnKind.MECHANICAL_CONTINUATION
+    return TurnKind.UNKNOWN
+
+
+def apply_responses_verbosity_steering(body: dict[str, Any], level: int) -> bool:
+    """Append the steering block to the tail of ``instructions``.
+
+    ``instructions`` is the Responses cache hot zone: the appended block is
+    byte-stable per level, so within a conversation every shaped turn sends
+    identical instructions bytes and the provider prefix cache stays hot
+    after the first shaped turn (the same contract as the Anthropic
+    system-tail append).
+    """
+    return apply_openai_responses_verbosity_steering(body, level)
+
+
+def shape_responses_request(
+    body: dict[str, Any],
+    settings: OutputShaperSettings | None = None,
+    level_override: int | None = None,
+) -> ShapeResult:
+    """Apply all output-shaping levers to a Responses payload in place.
+
+    The Responses counterpart of :func:`shape_request`: same settings, same
+    labels, same level-resolution contract.
+    """
+    if settings is None:
+        settings = OutputShaperSettings.from_env()
+    result = ShapeResult()
+    if not settings.enabled:
+        return result
+
+    assert result.labels is not None  # __post_init__ guarantees this
+
+    level = settings.verbosity_level if level_override is None else level_override
+    if level > 0 and apply_responses_verbosity_steering(body, level):
+        result.changed = True
+        result.labels.append(f"output_shaper:verbosity:L{level}")
 
     return result

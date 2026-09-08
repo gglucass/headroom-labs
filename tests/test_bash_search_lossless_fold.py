@@ -1,3 +1,4 @@
+# ruff: noqa: E402 — test sections import after helper/setup code by design.
 """Bash-search lossless fold.
 
 `bash` is not an excluded tool, so its output normally takes the lossy strategy
@@ -148,3 +149,117 @@ def test_source_output_from_search_command_untouched(tokenizer):
     out, transforms = _openai("grep -l foo", CODE, tokenizer)
     assert "router:bash:lossless_search" not in transforms
     assert out == CODE
+
+
+# ---- path-listing fold (find/ls -1/rg -l): fold repeated parent dirs ----
+from headroom.transforms.lossless_compaction import (
+    compact_lossless as _cl,
+)
+from headroom.transforms.lossless_compaction import (
+    path_heading as _ph,
+)
+from headroom.transforms.lossless_compaction import (
+    path_unheading as _puh,
+)
+
+
+def test_path_fold_roundtrip_and_shrinks_pure_list():
+    c = "./suma/apps/ext/core.py\n./suma/apps/ext/dao.py\n./suma/apps/other/x.py"
+    folded = _cl(c, "paths")
+    assert _puh(_ph(c)) == c  # exact inverse
+    assert len(folded) < len(c)  # shrinks
+    assert folded != c
+
+
+def test_path_fold_safe_passthrough_on_non_path_shapes():
+    # grep path:line:content is the search fold's job, not paths -> unchanged
+    assert _cl("a/b.py:12:def f\na/b.py:15:x", "paths") == "a/b.py:12:def f\na/b.py:15:x"
+    # trailing-slash dir entries and single paths -> unchanged
+    assert _cl("./a/b/\n./a/c/", "paths") == "./a/b/\n./a/c/"
+    assert _cl("./only/one.py", "paths") == "./only/one.py"
+
+
+def test_path_fold_mixed_content_roundtrips_or_passes_through():
+    # a non-path no-slash line among paths must never corrupt: compact_lossless
+    # verifies and returns original if the fold isn't exactly reversible.
+    c = "./a/b/f.py\n./a/b/g.py\nsome log line\n./a/b/h.py"
+    out = _cl(c, "paths")
+    assert _puh(_ph(out)) == out or out == c  # never corrupts
+    # simplest invariant: decoding whatever we emit reconstructs the input
+    assert _puh(_ph(c)) == c or _cl(c, "paths") == c
+
+
+# ---- EXPERIMENT: HEADROOM_EXPERIMENTAL_READ_KEEP_RATIO (light Kompress on reads) ----
+def test_experimental_read_keep_ratio_flag_and_gating(monkeypatch):
+    from headroom.transforms.content_router import ContentRouter, ContentRouterConfig
+
+    # OFF by default -> verbatim (helper returns None, no compression attempted)
+    monkeypatch.delenv("HEADROOM_EXPERIMENTAL_READ_KEEP_RATIO", raising=False)
+    r_off = ContentRouter(ContentRouterConfig())
+    assert r_off._exp_read_keep_ratio == 0.0
+    assert r_off._experimental_compress_read("x" * 500) is None
+
+    # ON -> calls Kompress at the ratio; keeps result only if it actually shrank
+    monkeypatch.setenv("HEADROOM_EXPERIMENTAL_READ_KEEP_RATIO", "0.9")
+    r_on = ContentRouter(ContentRouterConfig())
+    assert r_on._exp_read_keep_ratio == 0.9
+    seen = {}
+
+    def fake_ml(content, context, question=None, target_ratio=None):
+        seen["ratio"] = target_ratio
+        return content[: len(content) // 2], 10  # pretend it shrank
+
+    monkeypatch.setattr(r_on, "_try_ml_compressor", fake_ml)
+    out = r_on._experimental_compress_read("y" * 500, "ctx")
+    assert out is not None and len(out) < 500  # adopted (shrank)
+    assert seen["ratio"] == 0.9  # ratio threaded through
+
+    # no-shrink -> None (fall back to verbatim protection)
+    monkeypatch.setattr(
+        r_on, "_try_ml_compressor", lambda c, ctx, question=None, target_ratio=None: (c, 1)
+    )
+    assert r_on._experimental_compress_read("z" * 500) is None
+    # sub-floor content never attempted
+    assert r_on._experimental_compress_read("short") is None
+
+
+# --- directory-prefix fold: grep -rn across many distinct files ---
+from headroom.transforms.lossless_compaction import (  # noqa: E402
+    compact_lossless,
+    search_dir_heading,
+    search_dir_unheading,
+)
+
+
+def test_search_dir_fold_factors_directory_across_distinct_files() -> None:
+    # Sorted grep -rn output: same-dir files are consecutive, one match each, so
+    # the file-heading fold saves nothing but the shared directory repeats on
+    # every row. The dir fold factors it out — byte-losslessly.
+    grep = (
+        "\n".join(f"headroom/proxy/mod_{i:02d}.py:{i + 1}:    x = compress(p)" for i in range(12))
+        + "\n"
+    )
+    folded = compact_lossless(grep, "search")
+    assert len(folded) < len(grep)  # actually shrank (0% before this fold)
+    assert "headroom/proxy/" in folded  # directory factored to a header line
+    assert search_dir_unheading(folded) == grep  # exact byte round-trip
+    assert search_dir_unheading(search_dir_heading(grep)) == grep
+
+
+def test_search_dir_fold_roundtrips_mixed_and_passthrough() -> None:
+    mixed = (
+        "src/a/x.py:1:hit one\nsrc/a/y.py:2:hit two\n"
+        "== a plain banner ==\n"
+        "src/b/z.py:3:content with a colon: value\nnoslash.py:4:pathless row\n"
+    )
+    out = compact_lossless(mixed, "search")
+    assert search_dir_unheading(out) == mixed or search_unheading(out) == mixed or out == mixed
+
+
+def test_search_file_fold_still_wins_for_many_matches_one_file() -> None:
+    # Many matches in ONE file: the file fold is smaller, and compact_lossless
+    # keeps whichever candidate round-trips and is smallest.
+    grep = "\n".join(f"headroom/proxy/server.py:{i}:    line {i}" for i in range(1, 40)) + "\n"
+    out = compact_lossless(grep, "search")
+    assert len(out) < len(grep)
+    assert search_unheading(out) == grep

@@ -32,6 +32,19 @@ def main(ctx: click.Context) -> None:
     """
     ctx.ensure_object(dict)
 
+    # Apply file-backed settings (settings.json) to the process environment
+    # BEFORE Click parses any subcommand's ``envvar=`` options (Click resolves
+    # those when it builds the subcommand context, which happens after this
+    # group callback runs). ``os.environ.setdefault`` keeps explicit shell
+    # exports authoritative over the stored file. Fail-open so a corrupt
+    # settings.json can never block the CLI.
+    try:
+        from headroom import settings_store
+
+        settings_store.apply_to_environ(settings_store.load())
+    except Exception:  # noqa: BLE001 — settings load must never break the CLI
+        pass
+
     # Fire a rate-limited, opt-out background check for newer releases so other
     # surfaces (e.g. the proxy banner) can show an "update available" notice.
     # Never blocks, never raises; skipped for `update` (it checks explicitly).
@@ -55,12 +68,15 @@ def _register_commands() -> None:
         doctor,  # noqa: F401
         evals,  # noqa: F401
         init,  # noqa: F401
+        inspect,  # noqa: F401
         install,  # noqa: F401
         learn,  # noqa: F401
         mcp,  # noqa: F401
         output_savings,  # noqa: F401
         perf,  # noqa: F401
         proxy,  # noqa: F401
+        recover,  # noqa: F401
+        rollout,  # noqa: F401
         savings,  # noqa: F401
         tools,  # noqa: F401
         update,  # noqa: F401
@@ -71,6 +87,15 @@ def _register_commands() -> None:
     try:
         from . import memory  # noqa: F401
     except ImportError:
+        pass
+
+    # Third-party subcommands (headroom.cli_extension entry points). Runs last so
+    # built-ins are already attached and a plugin cannot shadow one.
+    try:
+        from .extensions import register_all
+
+        register_all(main)
+    except Exception:  # noqa: BLE001 — extension discovery must never break the CLI
         pass
 
 

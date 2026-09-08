@@ -14,6 +14,7 @@ unchanged. Nothing here raises.
 
 from __future__ import annotations
 
+import os
 import re
 
 __all__ = [
@@ -21,8 +22,12 @@ __all__ = [
     "collapse_runs",
     "expand_runs",
     "is_run_collapsed",
+    "fold_repeated_blocks",
+    "unfold_repeated_blocks",
     "search_heading",
     "search_unheading",
+    "search_dir_heading",
+    "search_dir_unheading",
     "diff_strip_index",
     "compact_lossless",
 ]
@@ -34,12 +39,41 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 # syslog-style run-collapse marker. The count is captured for exact inversion.
 _RUN_MARKER_RE = re.compile(r"^\.\.\. \(repeated (\d+) times\)$")
 
+# multi-line block back-reference marker. Length and distance (both in lines,
+# in ORIGINAL coordinates) are captured for exact inversion: everything before
+# a marker expands to the exact original prefix, so `distance` lines back in
+# the expanded output is the block's first occurrence.
+_BLOCK_MARKER_RE = re.compile(r"^\.\.\. \(repeats (\d+) lines from (\d+) lines back\)$")
+
+# fold_repeated_blocks search bounds: minimum/maximum block length worth a
+# marker, candidate anchors per line, and an input size cap so the scan stays
+# negligible on huge payloads.
+_FOLD_MIN_BLOCK = 3
+_FOLD_MAX_BLOCK = 64
+_FOLD_MAX_CANDIDATES = 8
+_FOLD_MAX_LINES = 20_000
+
 # grep/ripgrep default row shape: ``path:line:content``. ``line`` is digits;
 # ``path`` must not itself look like ``line:content`` (i.e. not start with a
 # bare number) so we don't mis-split a heading-form ``line:content`` row.
 _GREP_ROW_RE = re.compile(r"^(?P<path>[^\n:]+):(?P<line>\d+):(?P<content>.*)$")
 # heading-form data row (``line:content``) produced by search_heading.
 _HEADING_ROW_RE = re.compile(r"^(?P<line>\d+):(?P<content>.*)$")
+
+# A timestamped log line is NOT a grep row, but it has the same colon-delimited
+# shape: ``2026-09-02 14:30:00 [FATAL] ...`` splits as path=``2026-09-02 14``,
+# line=``30``, content=``00 [FATAL] ...``. Folding it hoists the date+hour into
+# a heading and strips it from every row, so the model sees ``30:00 [FATAL]``
+# and has to reconstruct the clock itself. The fold round-trips exactly, so the
+# inverse-check in compact_lossless cannot catch it -- it must be excluded here.
+_TIMESTAMP_ROW_RE = re.compile(
+    r"^\s*\[?(?:"
+    r"\d{4}-\d{2}-\d{2}[ T]\d{1,2}:\d{2}"  # 2026-09-02 14:30 / ISO 8601 'T'
+    r"|\d{2}/\d{2}/\d{2,4}[ T]\d{1,2}:\d{2}"  # 09/02/2026 14:30
+    r"|[A-Z][a-z]{2}\s+\d{1,2}\s+\d{1,2}:\d{2}"  # syslog: Aug 16 11:02
+    r"|\d{1,2}:\d{2}:\d{2}(?:[.,]\d+)?(?:\s|\]|$)"  # bare 15:03:53 / [15:03:53]
+    r")"
+)
 
 # unified-diff ``index <sha>..<sha> <mode>`` line. The diff still applies
 # without it (git only uses it for rename/blob bookkeeping).
@@ -127,6 +161,79 @@ def is_run_collapsed(text: str) -> bool:
     return False
 
 
+def fold_repeated_blocks(text: str) -> str:
+    """Collapse multi-line blocks that repeat earlier content into back-refs.
+
+    The block-level generalization of :func:`collapse_runs`: a run of K
+    consecutive lines (K >= 3) that exactly reproduces K lines seen D lines
+    earlier becomes ``... (repeats K lines from D lines back)``. The repeats
+    need not be adjacent, which is what config payloads actually look like —
+    k8s container stanzas repeat with only the ``name:`` line differing, so
+    their identical tails fold even though no two whole stanzas are
+    consecutive. Coordinates are in original lines: the fold is only taken
+    when the block does not overlap its anchor (K <= D), so on expansion the
+    referenced region is always already reconstructed.
+    Exact inverse: :func:`unfold_repeated_blocks`.
+    """
+    lines, had_trailing = _split_keep_trailing(text)
+    n = len(lines)
+    if n < _FOLD_MIN_BLOCK * 2 or n > _FOLD_MAX_LINES:
+        return text
+    positions: dict[str, list[int]] = {}
+    out: list[str] = []
+    i = 0
+    while i < n:
+        best_len = 0
+        best_dist = 0
+        for q in reversed(positions.get(lines[i], ())):
+            max_len = min(_FOLD_MAX_BLOCK, n - i, i - q)
+            length = 0
+            while length < max_len and lines[q + length] == lines[i + length]:
+                length += 1
+            if length > best_len:
+                best_len = length
+                best_dist = i - q
+        if best_len >= _FOLD_MIN_BLOCK:
+            marker = f"... (repeats {best_len} lines from {best_dist} lines back)"
+            block_chars = sum(len(lines[i + k]) + 1 for k in range(best_len))
+            if block_chars > len(marker) + 1:
+                out.append(marker)
+                for k in range(best_len):
+                    _remember(positions, lines[i + k], i + k)
+                i += best_len
+                continue
+        _remember(positions, lines[i], i)
+        out.append(lines[i])
+        i += 1
+    return _join(out, had_trailing)
+
+
+def _remember(positions: dict[str, list[int]], line: str, index: int) -> None:
+    """Track recent original positions of `line`, bounded per distinct line."""
+    bucket = positions.setdefault(line, [])
+    bucket.append(index)
+    if len(bucket) > _FOLD_MAX_CANDIDATES:
+        del bucket[0]
+
+
+def unfold_repeated_blocks(text: str) -> str:
+    """Exact inverse of :func:`fold_repeated_blocks`."""
+    lines, had_trailing = _split_keep_trailing(text)
+    if not lines:
+        return text
+    out: list[str] = []
+    for line in lines:
+        m = _BLOCK_MARKER_RE.match(line)
+        if m:
+            length, dist = int(m.group(1)), int(m.group(2))
+            start = len(out) - dist
+            if start >= 0 and length <= dist:
+                out.extend(out[start : start + length])
+                continue
+        out.append(line)
+    return _join(out, had_trailing)
+
+
 def search_heading(text: str) -> str:
     """Convert grep ``path:line:content`` rows into ripgrep --heading form.
 
@@ -143,7 +250,7 @@ def search_heading(text: str) -> str:
     out: list[str] = []
     current_path: str | None = None
     for line in lines:
-        m = _GREP_ROW_RE.match(line)
+        m = None if _TIMESTAMP_ROW_RE.match(line) else _GREP_ROW_RE.match(line)
         if m:
             path = m.group("path")
             if path != current_path:
@@ -194,6 +301,74 @@ def search_unheading(text: str) -> str:
     return _join(out, had_trailing)
 
 
+# A dir-heading data row: ``<base>:<line>:<content>`` where base has no '/'.
+_DIR_DATA_RE = re.compile(r"^(?P<base>[^/\n:]+):(?P<line>\d+):(?P<content>.*)$")
+
+
+def search_dir_heading(text: str) -> str:
+    """Fold grep ``path:line:content`` rows by DIRECTORY.
+
+    Consecutive rows whose path shares a parent directory collapse to that
+    directory once (a header ending in ``/``), then ``base:line:content`` rows
+    beneath it. Complements :func:`search_heading` (which factors a repeated
+    *file*): this factors a repeated *directory* across distinct files — the
+    common ``grep -rn`` case where each file has a single match, so file-heading
+    saves nothing but the shared directory repeats on every row. Rows whose path
+    has no ``/`` pass through untouched. Exactly reversed by
+    :func:`search_dir_unheading`; ``compact_lossless`` verifies the round-trip.
+    """
+    lines, had_trailing = _split_keep_trailing(text)
+    if not lines:
+        return text
+    out: list[str] = []
+    current_dir: str | None = None
+    for line in lines:
+        m = None if _TIMESTAMP_ROW_RE.match(line) else _GREP_ROW_RE.match(line)
+        if m and "/" in m.group("path"):
+            path = m.group("path")
+            cut = path.rindex("/") + 1
+            dir_part, base = path[:cut], path[cut:]
+            if dir_part != current_dir:
+                out.append(dir_part)
+                current_dir = dir_part
+            out.append(f"{base}:{m.group('line')}:{m.group('content')}")
+        else:
+            out.append(line)
+            current_dir = None
+    return _join(out, had_trailing)
+
+
+def search_dir_unheading(text: str) -> str:
+    """Exact inverse of :func:`search_dir_heading`.
+
+    A *header* is a line ending in ``/`` immediately followed by a
+    ``base:line:content`` data row; it is consumed and re-prefixed onto each
+    following data row until a non-data line appears.
+    """
+    lines, had_trailing = _split_keep_trailing(text)
+    if not lines:
+        return text
+    out: list[str] = []
+    current_dir: str | None = None
+    n = len(lines)
+    i = 0
+    while i < n:
+        line = lines[i]
+        data = _DIR_DATA_RE.match(line)
+        if current_dir is not None and data:
+            out.append(f"{current_dir}{line}")
+            i += 1
+            continue
+        if line.endswith("/") and i + 1 < n and _DIR_DATA_RE.match(lines[i + 1]):
+            current_dir = line
+            i += 1
+            continue
+        current_dir = None
+        out.append(line)
+        i += 1
+    return _join(out, had_trailing)
+
+
 def diff_strip_index(text: str) -> str:
     """Drop ``index <sha>..<sha>`` lines from a unified diff (still applies)."""
     lines, had_trailing = _split_keep_trailing(text)
@@ -203,20 +378,109 @@ def diff_strip_index(text: str) -> str:
     return _join(out, had_trailing)
 
 
+# A whole-line file path: optional ``./``/``../`` root, >=1 directory segment,
+# then a basename. No whitespace or ':' (so grep ``path:line:content`` rows —
+# handled by search_heading — are excluded). Directory-only lines (trailing '/')
+# don't match (empty basename), which keeps the fold unambiguous.
+_PATH_ROW_RE = re.compile(r"^(?P<dir>(?:\.{0,2}/)?(?:[^/\s:]+/)+)(?P<base>[^/\s:]+)$")
+
+
+def path_heading(text: str) -> str:
+    """Fold a *pure* file-path listing (``find`` / ``ls -1`` / ``rg -l`` output)
+    into ripgrep-heading form: each parent directory printed once on its own
+    line (ending in ``/``), then the bare basenames beneath it.
+
+    Reversibility is not assumed here — ``compact_lossless`` verifies the exact
+    round-trip via :func:`path_unheading` and discards the fold on any mismatch
+    (e.g. a stray no-slash line mistaken for a basename), so mixed content is
+    always safe. Requires >=2 path rows or there is nothing to group.
+    Complements ``search_heading``, which only handles the ``path:line:content``
+    grep shape, not plain path lists.
+    """
+    lines, had_trailing = _split_keep_trailing(text)
+    if sum(1 for ln in lines if _PATH_ROW_RE.match(ln)) < 2:
+        return text
+    out: list[str] = []
+    current: str | None = None
+    for line in lines:
+        m = _PATH_ROW_RE.match(line)
+        if m:
+            d = m.group("dir")
+            if d != current:
+                out.append(d)
+                current = d
+            out.append(m.group("base"))
+        else:  # blank line inside/around the listing
+            out.append(line)
+            current = None
+    return _join(out, had_trailing)
+
+
+def path_unheading(text: str) -> str:
+    """Exact inverse of :func:`path_heading`.
+
+    A *header* is a line ending in ``/`` immediately followed by a basename row
+    (a non-empty line with no ``/``); it is consumed and re-prefixed onto each
+    following basename row until a blank line or another header.
+    """
+    lines, had_trailing = _split_keep_trailing(text)
+    if not lines:
+        return text
+    out: list[str] = []
+    current: str | None = None
+    n = len(lines)
+    i = 0
+    while i < n:
+        line = lines[i]
+        is_base = line != "" and "/" not in line
+        if current is not None and is_base:
+            out.append(current + line)
+            i += 1
+            continue
+        if line.endswith("/") and i + 1 < n and lines[i + 1] != "" and "/" not in lines[i + 1]:
+            current = line
+            i += 1
+            continue
+        current = None
+        out.append(line)
+        i += 1
+    return _join(out, had_trailing)
+
+
 def _smaller(candidate: str, original: str) -> bool:
     return len(candidate) < len(original)
+
+
+#: Env kill-switch for every fold in this module. Read per call (not cached at
+#: import) so the proxy's live ``POST /admin/runtime-env`` hot-sync applies
+#: without a restart, matching how the output-shaper switches behave.
+_LOSSLESS_COMPACTION_ENV = "HEADROOM_LOSSLESS_COMPACTION"
+
+
+def _lossless_compaction_enabled() -> bool:
+    raw = os.environ.get(_LOSSLESS_COMPACTION_ENV)
+    if raw is None:
+        return True
+    return raw.strip().lower() not in ("0", "false", "no", "off")
 
 
 def compact_lossless(content: str, kind: str) -> str:
     """Dispatch format-native lossless compaction by ``kind``.
 
-    ``kind`` in {'log', 'search', 'diff', 'text'}. For reversible kinds the
+    ``kind`` in {'log', 'search', 'diff', 'text', 'config'}. For reversible kinds the
     round-trip is verified internally (modulo the intentionally-dropped
     non-semantic bits, e.g. ANSI color for logs); if verification fails or the
     result is not smaller, the original content is returned unchanged. Never
     raises; unknown kinds pass through.
+
+    Set ``HEADROOM_LOSSLESS_COMPACTION=0`` to disable every fold here while
+    leaving the rest of the pipeline (Kompress, SmartCrusher, CCR) active. The
+    folds are byte-reversible, but the model only ever sees the folded side and
+    must reconstruct the original shape itself, which costs output tokens on
+    reasoning models. Operators need to be able to turn that off without
+    resorting to ``--no-optimize`` (which disables all compression).
     """
-    if not content:
+    if not content or not _lossless_compaction_enabled():
         return content
     try:
         if kind == "log":
@@ -229,8 +493,23 @@ def compact_lossless(content: str, kind: str) -> str:
             return candidate if _smaller(candidate, content) else content
 
         if kind == "search":
-            candidate = search_heading(content)
-            if search_unheading(candidate) != content:
+            # Two independent folds; keep the smaller that round-trips exactly.
+            # search_heading factors a repeated FILE (many matches in one file);
+            # search_dir_heading factors a repeated DIRECTORY (one match each
+            # across many files in a dir — the grep -rn case the file fold misses).
+            best = content
+            for candidate, inverse in (
+                (search_heading(content), search_unheading),
+                (search_dir_heading(content), search_dir_unheading),
+            ):
+                if inverse(candidate) == content and _smaller(candidate, best):
+                    best = candidate
+            return best
+
+        if kind == "paths":
+            # Pure path listings (find/ls -1/rg -l): fold repeated parent dirs.
+            candidate = path_heading(content)
+            if path_unheading(candidate) != content:
                 return content
             return candidate if _smaller(candidate, content) else content
 
@@ -244,6 +523,14 @@ def compact_lossless(content: str, kind: str) -> str:
             # Collapse blank-line runs; reversible against itself.
             candidate = collapse_runs(content)
             if expand_runs(candidate) != content:
+                return content
+            return candidate if _smaller(candidate, content) else content
+
+        if kind == "config":
+            # Structured config (YAML/TOML/INI): single-line runs first, then
+            # repeated multi-line stanzas. Inverse applies in reverse order.
+            candidate = fold_repeated_blocks(collapse_runs(content))
+            if expand_runs(unfold_repeated_blocks(candidate)) != content:
                 return content
             return candidate if _smaller(candidate, content) else content
     except Exception:

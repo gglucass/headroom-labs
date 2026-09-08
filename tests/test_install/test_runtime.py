@@ -44,7 +44,7 @@ def test_build_runtime_command_for_docker_includes_deployment_env(
         port=8787,
         host="127.0.0.1",
         backend="anthropic",
-        image="ghcr.io/chopratejas/headroom:latest",
+        image="ghcr.io/headroomlabs-ai/headroom:latest",
         base_env={"HEADROOM_PORT": "8787"},
         proxy_args=["--host", "127.0.0.1", "--port", "8787"],
     )
@@ -56,11 +56,78 @@ def test_build_runtime_command_for_docker_includes_deployment_env(
     assert "HEADROOM_DEPLOYMENT_PROFILE=default" in joined
     assert "HEADROOM_DEPLOYMENT_PRESET=persistent-docker" in joined
     assert "127.0.0.1:8787:8787" in joined
-    assert "ghcr.io/chopratejas/headroom:latest" in command
+    assert "ghcr.io/headroomlabs-ai/headroom:latest" in command
     # Canonical Headroom filesystem contract (issue #175) forwarded into
     # the container.
     assert "HEADROOM_WORKSPACE_DIR=/tmp/headroom-home/.headroom" in command
     assert "HEADROOM_CONFIG_DIR=/tmp/headroom-home/.headroom/config" in command
+
+
+def test_build_runtime_command_for_docker_includes_gpu_passthrough(
+    monkeypatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    manifest = DeploymentManifest(
+        profile="default",
+        preset="persistent-docker",
+        runtime_kind="docker",
+        supervisor_kind="none",
+        scope="user",
+        provider_mode="manual",
+        targets=["claude"],
+        port=8787,
+        host="127.0.0.1",
+        backend="anthropic",
+        image="ghcr.io/chopratejas/headroom:latest",
+        base_env={"HEADROOM_PORT": "8787", "HEADROOM_DOCKER_GPUS": "all"},
+        proxy_args=["--host", "127.0.0.1", "--port", "8787"],
+    )
+
+    command = build_runtime_command(manifest)
+
+    assert command[command.index("--gpus") + 1] == "all"
+
+
+def test_build_runtime_command_docker_manifest_env_beats_host_passthrough(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """A manifest value must win over a conflicting host export.
+
+    The manifest pins ``HEADROOM_BACKEND=anthropic``; the host process has a
+    stale ``HEADROOM_BACKEND=anyllm`` exported. Both start with the
+    ``HEADROOM_`` passthrough prefix, so without the dedupe the command emits
+    ``--env HEADROOM_BACKEND=anthropic`` and then a bare ``--env
+    HEADROOM_BACKEND``. Docker resolves duplicate ``--env`` last-wins, so the
+    bare passthrough reads the host value and silently overrides the manifest,
+    diverging the container from its deployment config.
+    """
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HEADROOM_BACKEND", "anyllm")
+    manifest = DeploymentManifest(
+        profile="default",
+        preset="persistent-docker",
+        runtime_kind="docker",
+        supervisor_kind="none",
+        scope="user",
+        provider_mode="manual",
+        targets=["claude"],
+        port=8787,
+        host="127.0.0.1",
+        backend="anthropic",
+        image="ghcr.io/chopratejas/headroom:latest",
+        base_env={"HEADROOM_PORT": "8787", "HEADROOM_BACKEND": "anthropic"},
+        proxy_args=["--host", "127.0.0.1", "--port", "8787"],
+    )
+
+    command = build_runtime_command(manifest)
+
+    # The manifest value is emitted...
+    assert "HEADROOM_BACKEND=anthropic" in command
+    # ...and no bare `--env HEADROOM_BACKEND` follows it to pull in the host
+    # value. `in` on the list matches the exact token, so the pinned
+    # `HEADROOM_BACKEND=anthropic` element does not count here.
+    assert "HEADROOM_BACKEND" not in command
 
 
 def test_build_runtime_command_for_docker_matches_wrapper_parity(
@@ -80,7 +147,7 @@ def test_build_runtime_command_for_docker_matches_wrapper_parity(
         port=8787,
         host="127.0.0.1",
         backend="anthropic",
-        image="ghcr.io/chopratejas/headroom:latest",
+        image="ghcr.io/headroomlabs-ai/headroom:latest",
         base_env={"HEADROOM_PORT": "8787"},
         proxy_args=["--host", "127.0.0.1", "--port", "8787"],
     )
@@ -116,7 +183,7 @@ def test_build_runtime_command_for_docker_does_not_duplicate_entrypoint(
         port=8787,
         host="127.0.0.1",
         backend="anthropic",
-        image="ghcr.io/chopratejas/headroom:latest",
+        image="ghcr.io/headroomlabs-ai/headroom:latest",
         base_env={"HEADROOM_PORT": "8787"},
         proxy_args=["--host", "127.0.0.1", "--port", "8787", "--backend", "anthropic"],
     )
@@ -214,6 +281,9 @@ def test_build_runtime_command_python_and_docker_user(monkeypatch, tmp_path: Pat
     monkeypatch.setattr("headroom.install.runtime.sys.platform", "linux")
     monkeypatch.setattr("headroom.install.runtime.os.getuid", lambda: 1000, raising=False)
     monkeypatch.setattr("headroom.install.runtime.os.getgid", lambda: 1001, raising=False)
+    # Force the Docker path deterministically regardless of the test host's
+    # `docker` binary (it might resolve to a podman shim).
+    monkeypatch.setenv("HEADROOM_CONTAINER_RUNTIME", "docker")
     docker_manifest = DeploymentManifest(
         profile="default",
         preset="persistent-docker",
@@ -225,13 +295,44 @@ def test_build_runtime_command_python_and_docker_user(monkeypatch, tmp_path: Pat
         port=8787,
         host="127.0.0.1",
         backend="anthropic",
-        image="ghcr.io/chopratejas/headroom:latest",
+        image="ghcr.io/headroomlabs-ai/headroom:latest",
         base_env={"HEADROOM_PORT": "8787"},
         proxy_args=["--host", "127.0.0.1", "--port", "8787"],
     )
     command = build_runtime_command(docker_manifest)
     assert "--user" in command
     assert "1000:1001" in command
+    assert "--userns=keep-id" not in command
+
+
+def test_build_runtime_command_podman_uses_keep_id_not_user(monkeypatch, tmp_path: Path) -> None:
+    """Under rootless Podman, --user <host-uid>:<host-gid> selects a subordinate
+    UID that owns none of the bind mounts, so writes into ~/.headroom fail. The
+    command must use --userns=keep-id and drop --user instead (#2804)."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr("headroom.install.runtime.sys.platform", "linux")
+    monkeypatch.setattr("headroom.install.runtime.os.getuid", lambda: 1000, raising=False)
+    monkeypatch.setattr("headroom.install.runtime.os.getgid", lambda: 1001, raising=False)
+    monkeypatch.setenv("HEADROOM_CONTAINER_RUNTIME", "podman")
+    manifest = DeploymentManifest(
+        profile="default",
+        preset="persistent-docker",
+        runtime_kind="docker",
+        supervisor_kind="none",
+        scope="user",
+        provider_mode="manual",
+        targets=[],
+        port=8787,
+        host="127.0.0.1",
+        backend="anthropic",
+        image="ghcr.io/headroomlabs-ai/headroom:latest",
+        base_env={"HEADROOM_PORT": "8787"},
+        proxy_args=["--host", "127.0.0.1", "--port", "8787"],
+    )
+    command = build_runtime_command(manifest)
+    assert "--userns=keep-id" in command
+    assert "--user" not in command
+    assert "1000:1001" not in command
 
 
 def test_read_pid_handles_invalid_content(monkeypatch, tmp_path: Path) -> None:
@@ -272,7 +373,12 @@ def test_runtime_start_lock_blocks_another_process(monkeypatch, tmp_path: Path) 
         "with acquire_runtime_start_lock('default') as acquired:\n"
         "    print(acquired)\n"
     )
-    env = {**os.environ, "HOME": str(tmp_path), "PYTHONPATH": str(Path.cwd())}
+    env = {
+        **os.environ,
+        "HOME": str(tmp_path),
+        "USERPROFILE": str(tmp_path),
+        "PYTHONPATH": str(Path.cwd()),
+    }
 
     with acquire_runtime_start_lock("default") as acquired:
         assert acquired is True
@@ -345,15 +451,22 @@ def test_run_foreground_and_detached_helpers(monkeypatch, tmp_path: Path) -> Non
 
     monkeypatch.setattr("headroom.install.runtime.resolve_headroom_command", lambda: ["headroom"])
     monkeypatch.setattr("headroom.install.runtime.sys.platform", "win32")
-    monkeypatch.setattr("headroom.install.runtime.subprocess.DETACHED_PROCESS", 1, raising=False)
+    monkeypatch.setattr("headroom.install.runtime.subprocess.CREATE_NO_WINDOW", 4, raising=False)
     monkeypatch.setattr(
         "headroom.install.runtime.subprocess.CREATE_NEW_PROCESS_GROUP", 2, raising=False
     )
+    nt_calls: list[tuple[list[str], dict]] = []
     fake_proc_nt = FakeProc()
-    monkeypatch.setattr(
-        "headroom.install.runtime.subprocess.Popen", lambda command, **kwargs: fake_proc_nt
-    )
+
+    def fake_popen_nt(command: list[str], **kwargs):
+        nt_calls.append((command, kwargs))
+        return fake_proc_nt
+
+    monkeypatch.setattr("headroom.install.runtime.subprocess.Popen", fake_popen_nt)
     assert start_detached_agent("demo") is fake_proc_nt
+    # DETACHED_PROCESS is not used: it makes CREATE_NO_WINDOW a no-op on
+    # Windows, so a detached console child would pop up a visible window.
+    assert nt_calls[0][1]["creationflags"] == 4 | 2
 
     monkeypatch.setattr("headroom.install.runtime.sys.platform", "linux")
     fake_proc_posix = FakeProc()
@@ -648,3 +761,97 @@ def test_runtime_status_survives_winerror87_systemerror(monkeypatch, tmp_path: P
     )
 
     assert runtime_status(_python_service_manifest()) == "stopped"
+
+
+class TestRestartCurrentDeployment:
+    """detect_current_deployment / restart_current_deployment (settings apply)."""
+
+    def _clear_deployment_env(self, monkeypatch) -> None:
+        monkeypatch.delenv("HEADROOM_DEPLOYMENT_PROFILE", raising=False)
+        monkeypatch.delenv("HEADROOM_DEPLOYMENT_PRESET", raising=False)
+
+    def test_foreground_when_no_deployment_env(self, monkeypatch) -> None:
+        from headroom.install import runtime as rt
+
+        self._clear_deployment_env(monkeypatch)
+        popen_calls: list = []
+        monkeypatch.setattr(rt.subprocess, "Popen", lambda *a, **k: popen_calls.append(a))
+
+        manifest, mode = rt.detect_current_deployment()
+        assert manifest is None
+        assert mode == "foreground"
+
+        result = rt.restart_current_deployment()
+        assert result["restarted"] is False
+        assert result["mode"] == "foreground"
+        assert "instruction" in result
+        assert popen_calls == []  # never restarts a foreground proxy
+
+    def test_docker_returns_host_command_without_restarting(self, monkeypatch) -> None:
+        from headroom.install import runtime as rt
+
+        monkeypatch.setenv("HEADROOM_DEPLOYMENT_PROFILE", "default")
+        monkeypatch.setenv("HEADROOM_DEPLOYMENT_PRESET", InstallPreset.PERSISTENT_DOCKER.value)
+        monkeypatch.setattr(rt, "load_manifest", lambda profile: None)
+        popen_calls: list = []
+        monkeypatch.setattr(rt.subprocess, "Popen", lambda *a, **k: popen_calls.append(a))
+
+        _manifest, mode = rt.detect_current_deployment()
+        assert mode == "docker"
+
+        result = rt.restart_current_deployment()
+        assert result["restarted"] is False
+        assert result["mode"] == "docker"
+        assert result["command"] == "headroom install restart --profile default"
+        assert popen_calls == []  # cannot run docker from inside the container
+
+    def test_task_mode_detected_and_not_restarted(self, monkeypatch) -> None:
+        """A persistent-task deployment must not be told it's a self-restartable 'service'.
+
+        ``headroom install start/stop/restart`` all reject SupervisorKind.TASK
+        deployments (see cli/install.py:_reject_task_lifecycle); a detached
+        ``headroom install restart`` against a task manifest would previously
+        fail silently (stdout/stderr to DEVNULL) after the API had already
+        returned ``{"restarted": true}``.
+        """
+        from headroom.install import runtime as rt
+
+        monkeypatch.setenv("HEADROOM_DEPLOYMENT_PROFILE", "default")
+        monkeypatch.setenv("HEADROOM_DEPLOYMENT_PRESET", "persistent-task")
+        stub = types.SimpleNamespace(profile="default", supervisor_kind="task")
+        monkeypatch.setattr(rt, "load_manifest", lambda profile: stub)
+        popen_calls: list = []
+        monkeypatch.setattr(rt.subprocess, "Popen", lambda *a, **k: popen_calls.append(a))
+
+        _manifest, mode = rt.detect_current_deployment()
+        assert mode == "task"
+
+        result = rt.restart_current_deployment()
+        assert result["restarted"] is False
+        assert result["mode"] == "task"
+        assert "instruction" in result
+        assert popen_calls == []  # never spawns `headroom install restart` for task deployments
+
+    def test_service_spawns_detached_restart(self, monkeypatch) -> None:
+        from headroom.install import runtime as rt
+
+        monkeypatch.setenv("HEADROOM_DEPLOYMENT_PROFILE", "default")
+        monkeypatch.setenv("HEADROOM_DEPLOYMENT_PRESET", "persistent-service")
+        stub = types.SimpleNamespace(profile="default", supervisor_kind="service")
+        monkeypatch.setattr(rt, "load_manifest", lambda profile: stub)
+        recorded: dict = {}
+
+        def fake_popen(command, **kwargs):
+            recorded["command"] = command
+            recorded["kwargs"] = kwargs
+            return object()
+
+        monkeypatch.setattr(rt.subprocess, "Popen", fake_popen)
+
+        _manifest, mode = rt.detect_current_deployment()
+        assert mode == "service"
+
+        result = rt.restart_current_deployment()
+        assert result["restarted"] is True
+        assert result["mode"] == "service"
+        assert recorded["command"][-4:] == ["install", "restart", "--profile", "default"]

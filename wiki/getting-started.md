@@ -4,20 +4,30 @@ This guide will help you get up and running with Headroom in under 5 minutes.
 
 ## Installation
 
-**Python:**
+**CLI on macOS Apple Silicon/Linux with uv:**
+
+```bash
+uv tool install --python 3.13 "headroom-ai[all]"
+headroom --version
+```
+
+Use `uv tool update-shell` if the install succeeds but `headroom` is not on
+`PATH`.
+
+**Python project / virtualenv:**
 
 ```bash
 # Core package (minimal dependencies)
 pip install headroom-ai
 
 # With proxy server
-pip install headroom-ai[proxy]
+pip install "headroom-ai[proxy]"
 
 # With semantic relevance (for smarter compression)
-pip install headroom-ai[relevance]
+pip install "headroom-ai[relevance]"
 
 # Everything
-pip install headroom-ai[all]
+pip install "headroom-ai[all]"
 ```
 
 **TypeScript / Node.js:**
@@ -29,13 +39,13 @@ npm install headroom-ai
 **Docker-native:**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/chopratejas/headroom/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/headroomlabs-ai/headroom/main/scripts/install.sh | bash
 ```
 
 PowerShell:
 
 ```powershell
-irm https://raw.githubusercontent.com/chopratejas/headroom/main/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/headroomlabs-ai/headroom/main/scripts/install.ps1 | iex
 ```
 
 See [Docker-native install](docker-install.md) for wrapper behavior, compose usage, and host-integrated `wrap` flows.
@@ -130,7 +140,7 @@ plan = client.chat.completions.simulate(
     messages=[...],
 )
 print(f"Would save {plan.tokens_saved} tokens")
-print(f"Transforms: {plan.transforms_applied}")
+print(f"Transforms: {plan.transforms}")
 ```
 
 ## Next Steps

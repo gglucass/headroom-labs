@@ -24,6 +24,12 @@ from starlette.datastructures import Headers  # noqa: E402
 from headroom.proxy.handlers.openai import OpenAIHandlerMixin  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _allow_reserved_test_upstream(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Permit the reserved, intentionally unresolvable test origin."""
+    monkeypatch.setenv("HEADROOM_ALLOWED_BASE_URLS", "gateway.example")
+
+
 class _FakeRequest:
     """Minimal stand-in exposing ``headers`` like a real Starlette request.
 
@@ -78,3 +84,16 @@ def test_header_lookup_is_case_insensitive() -> None:
     request = _FakeRequest({"X-Headroom-Base-Url": "https://gateway.example"})
 
     assert proxy._resolve_openai_upstream(request) == "https://gateway.example"
+
+
+def test_header_with_subpath_preserves_path() -> None:
+    """A custom upstream served from a sub-path (e.g. /api/v1) must keep the path,
+    not be collapsed to the bare origin (#2047)."""
+    proxy = _stub_proxy("https://api.openai.test")
+    request = _FakeRequest({"x-headroom-base-url": "https://gateway.example/api/v1"})
+
+    assert proxy._resolve_openai_upstream(request) == "https://gateway.example/api/v1"
+
+    # Trailing slash is normalized away, not doubled.
+    trailing = _FakeRequest({"x-headroom-base-url": "https://gateway.example/api/v1/"})
+    assert proxy._resolve_openai_upstream(trailing) == "https://gateway.example/api/v1"

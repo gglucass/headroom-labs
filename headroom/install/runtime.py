@@ -16,8 +16,9 @@ from typing import Any, cast
 from headroom._subprocess import pid_alive, run
 
 from .health import probe_ready
-from .models import DeploymentManifest, InstallPreset, RuntimeKind
+from .models import DeploymentManifest, InstallPreset, RuntimeKind, SupervisorKind
 from .paths import log_path, pid_path, profile_root
+from .state import load_manifest
 
 # Inside the container the proxy must listen on every interface so the
 # host-side published port (127.0.0.1:<port>) can reach it.
@@ -53,6 +54,32 @@ PASSTHROUGH_ENV_PREFIXES = (
 
 def _is_windows() -> bool:
     return sys.platform.startswith("win")
+
+
+def _container_runtime_is_podman() -> bool:
+    """Best-effort: is the ``docker`` command actually Podman?
+
+    Rootless Podman maps the host user to container UID 0, so the
+    ``--user <host-uid>:<host-gid>`` flag that is correct for Docker instead
+    selects a subordinate UID that owns none of the bind-mounted host
+    directories, and every write into ``~/.headroom`` fails (#2804). Detect the
+    common ``docker -> podman`` shim (e.g. NixOS
+    ``/run/current-system/sw/bin/docker -> podman``) by resolving the binary and
+    checking its real name. ``HEADROOM_CONTAINER_RUNTIME`` (``podman`` / ``docker``)
+    is an explicit override for setups the symlink heuristic cannot see, such as a
+    wrapper script. No subprocess is spawned.
+    """
+    override = os.environ.get("HEADROOM_CONTAINER_RUNTIME", "").strip().lower()
+    if override:
+        return override == "podman"
+    resolved = shutil.which("docker")
+    if not resolved:
+        return False
+    try:
+        real = os.path.realpath(resolved)
+    except OSError:
+        real = resolved
+    return "podman" in os.path.basename(real).lower()
 
 
 def _deployment_env(manifest: DeploymentManifest) -> dict[str, str]:
@@ -131,16 +158,33 @@ def build_runtime_command(manifest: DeploymentManifest) -> list[str]:
         "--volume",
         f"{_mount_source(home, '.config/opencode')}:{container_home}/.config/opencode",
     ]
+    docker_gpus = manifest.base_env.get("HEADROOM_DOCKER_GPUS", "").strip()
+    if docker_gpus:
+        command.extend(["--gpus", docker_gpus])
     if not _is_windows():
-        getuid = getattr(os, "getuid", None)
-        getgid = getattr(os, "getgid", None)
-        if callable(getuid) and callable(getgid):
-            command.extend(["--user", f"{getuid()}:{getgid()}"])
+        if _container_runtime_is_podman():
+            # Rootless Podman maps the host user to container UID 0, so --user
+            # would map to a subordinate UID that owns none of the bind mounts and
+            # every write into ~/.headroom fails (#2804). keep-id maps the host
+            # user to the same UID inside the container, keeping the mounts
+            # writable. Docker maps UIDs 1:1, so --user stays correct there.
+            command.append("--userns=keep-id")
+        else:
+            getuid = getattr(os, "getuid", None)
+            getgid = getattr(os, "getgid", None)
+            if callable(getuid) and callable(getgid):
+                command.extend(["--user", f"{getuid()}:{getgid()}"])
     runtime_env = {**manifest.base_env, **_deployment_env(manifest)}
     for name, value in runtime_env.items():
         command.extend(["--env", f"{name}={value}"])
     for name in sorted(os.environ):
-        if name.startswith(PASSTHROUGH_ENV_PREFIXES):
+        # Skip any name the manifest already pinned above: Docker resolves
+        # duplicate `--env` last-wins, so a bare `--env HEADROOM_BACKEND`
+        # passthrough (which reads the host process env at
+        # `start_persistent_docker` time) would silently override the manifest's
+        # `--env HEADROOM_BACKEND=<value>`, diverging the container from its
+        # deployment config.
+        if name.startswith(PASSTHROUGH_ENV_PREFIXES) and name not in runtime_env:
             command.extend(["--env", name])
     # The image ENTRYPOINT already runs `headroom proxy` (see Dockerfile), so
     # the args appended after the image name are only the proxy flags — never
@@ -270,7 +314,10 @@ def start_detached_agent(profile: str) -> subprocess.Popen[str]:
 
     kwargs: dict[str, Any] = {"stdout": log_file, "stderr": log_file}
     if _is_windows():
-        kwargs["creationflags"] = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
+        # DETACHED_PROCESS makes CREATE_NO_WINDOW a no-op (per Win32 docs), so a
+        # detached console child pops up a visible window. Use CREATE_NO_WINDOW
+        # instead; it still detaches from the parent's console.
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000) | getattr(
             subprocess, "CREATE_NEW_PROCESS_GROUP", 0
         )
     else:
@@ -364,3 +411,87 @@ def runtime_status(manifest: DeploymentManifest) -> str:
     # as a SystemError against the detached agent, crashing status and taking the
     # live proxy down with it (#1544).
     return "running" if pid_alive(pid) else "stopped"
+
+
+def detect_current_deployment() -> tuple[DeploymentManifest | None, str]:
+    """Detect how THIS running proxy was launched.
+
+    Returns ``(manifest_or_none, mode)`` where ``mode`` is one of:
+
+    * ``"docker"``     — persistent-docker deployment. Cannot self-restart:
+      there is no docker socket/CLI inside the container.
+    * ``"service"``    — any other persistent (supervised) deployment; can
+      self-restart via ``headroom install restart``.
+    * ``"foreground"`` — a plain ``headroom proxy`` (or unknown); not
+      self-restartable.
+
+    Keys off the ``HEADROOM_DEPLOYMENT_*`` env vars the supervisor injects at
+    launch (see :func:`_deployment_env`); a foreground proxy has none set.
+    """
+    profile = os.environ.get("HEADROOM_DEPLOYMENT_PROFILE")
+    preset = os.environ.get("HEADROOM_DEPLOYMENT_PRESET")
+    if not profile:
+        return None, "foreground"
+    manifest = load_manifest(profile)
+    if preset == InstallPreset.PERSISTENT_DOCKER.value:
+        return manifest, "docker"
+    if manifest is None:
+        return None, "foreground"
+    if manifest.supervisor_kind == SupervisorKind.TASK.value:
+        return manifest, "task"
+    return manifest, "service"
+
+
+def _spawn_detached_restart(profile: str) -> None:
+    """Spawn a detached ``headroom install restart --profile <p>`` process.
+
+    Detached (``start_new_session`` on POSIX) so it outlives this process being
+    torn down by the very restart it triggers.
+    """
+    command = [*resolve_headroom_command(), "install", "restart", "--profile", profile]
+    popen_kwargs: dict[str, Any] = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+    if _is_windows():
+        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    else:
+        popen_kwargs["start_new_session"] = True
+    subprocess.Popen(command, **popen_kwargs)
+
+
+def restart_current_deployment() -> dict[str, Any]:
+    """Restart the current deployment so new settings take effect.
+
+    * service -> spawn a detached restart, return ``{restarted: True, ...}``.
+    * docker  -> not restartable in-container; return the host command to run.
+    * task    -> not restartable via the CLI (``headroom install`` rejects
+      lifecycle ops for task-scheduled deployments); return an instruction.
+    * foreground/unknown -> return a manual-restart instruction.
+    """
+    manifest, mode = detect_current_deployment()
+    profile = os.environ.get("HEADROOM_DEPLOYMENT_PROFILE") or (
+        manifest.profile if manifest else "default"
+    )
+    if mode == "service":
+        _spawn_detached_restart(profile)
+        return {"restarted": True, "mode": "service", "profile": profile}
+    if mode == "docker":
+        return {
+            "restarted": False,
+            "mode": "docker",
+            "command": f"headroom install restart --profile {profile}",
+        }
+    if mode == "task":
+        return {
+            "restarted": False,
+            "mode": "task",
+            "instruction": (
+                "This deployment is managed by an OS task scheduler, not "
+                "`headroom install`; stop the running process so it is "
+                "relaunched (with the new settings) on its next scheduled "
+                "trigger, or restart it via your OS task scheduler."
+            ),
+        }
+    return {
+        "restarted": False,
+        "mode": "foreground",
+        "instruction": "Restart the proxy to apply the new settings.",
+    }

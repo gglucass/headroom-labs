@@ -13,7 +13,6 @@ import click
 
 from headroom import fsutil
 from headroom.install.paths import opencode_config_path
-from headroom.mcp_registry.install import DEFAULT_PROXY_URL
 
 # Headroom-managed JSON marker comments for idempotent block injection.
 _PROVIDER_MARKER_START = "// --- Headroom proxy provider ---"
@@ -32,24 +31,18 @@ _MCP_BLOCK_RE = re.compile(
 )
 HEADROOM_OPENCODE_PLUGIN = "headroom-opencode"
 
-# Models exposed by the injected `headroom` provider. OpenCode only resolves
-# `headroom/<id>` for ids listed in the provider's `models` map, so an empty
-# map means every documented `headroom/*` model fails with "Model not found".
-# Keep in sync with DEFAULT_MODELS in plugins/opencode/src/provider.ts and the
-# table in plugins/opencode/README.md.
+# Models exposed by the injected `headroom` provider. This provider uses
+# ``@ai-sdk/openai-compatible`` and the proxy's ``/v1/chat/completions`` path,
+# which is routed to the configured OpenAI upstream. Do not advertise Claude
+# models here: OpenCode would send them through the OpenAI endpoint and report
+# an ``invalid_api_key`` error instead of reaching Anthropic. Claude models are
+# available through OpenCode's native ``anthropic`` provider, whose base URL is
+# also redirected to Headroom by ``build_opencode_config_content``.
+#
+# OpenCode only resolves ``headroom/<id>`` for ids listed in this map, so an
+# empty map means every documented ``headroom/*`` model fails with "Model not
+# found".
 HEADROOM_OPENCODE_MODELS: dict[str, Any] = {
-    "claude-sonnet-4-6": {
-        "name": "Claude Sonnet 4.6",
-        "limit": {"context": 200000, "output": 16384},
-    },
-    "claude-opus-4-6": {
-        "name": "Claude Opus 4.6",
-        "limit": {"context": 200000, "output": 16384},
-    },
-    "claude-haiku-4-5-20251001": {
-        "name": "Claude Haiku 4.5",
-        "limit": {"context": 200000, "output": 8192},
-    },
     "gpt-4o": {
         "name": "GPT-4o",
         "limit": {"context": 128000, "output": 16384},
@@ -82,7 +75,7 @@ def _opencode_home_dir() -> Path:
 def opencode_config_paths() -> tuple[Path, Path]:
     """Return ``(config_file, backup_file)`` for OpenCode."""
     config_file = opencode_config_path()
-    backup_file = config_file.with_suffix(".json.headroom-backup")
+    backup_file = config_file.with_name(config_file.name + ".headroom-backup")
     return config_file, backup_file
 
 
@@ -126,27 +119,6 @@ def _render_provider_block(port: int) -> str:
         _PROVIDER_MARKER_START,
         f'"provider": {json.dumps(provider, indent=2)},',
         _PROVIDER_MARKER_END,
-    ]
-    return "\n".join(lines)
-
-
-def _render_mcp_block(port: int) -> str:
-    """Render a Headroom MCP block as a JSON comment-wrapped snippet."""
-    proxy_url = f"http://127.0.0.1:{port}"
-    mcp_entry: dict[str, Any] = {
-        "type": "local",
-        "command": ["headroom", "mcp", "serve"],
-        "enabled": True,
-    }
-    if proxy_url != DEFAULT_PROXY_URL:
-        mcp_entry["environment"] = {"HEADROOM_PROXY_URL": proxy_url}
-    mcp = {
-        "headroom": mcp_entry,
-    }
-    lines = [
-        _MCP_MARKER_START,
-        f'"mcp": {json.dumps(mcp, indent=2)},',
-        _MCP_MARKER_END,
     ]
     return "\n".join(lines)
 

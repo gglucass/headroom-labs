@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from ..models import Memory, ScopeLevel
+from ..models import Memory, ScopeLevel, normalize_entity_refs
 from ..ports import VectorFilter, VectorSearchResult
 
 # hnswlib is optional - may not compile on all platforms
@@ -139,7 +139,9 @@ class IndexedMemoryMetadata:
             valid_until=(
                 datetime.fromisoformat(data["valid_until"]) if data.get("valid_until") else None
             ),
-            entity_refs=data.get("entity_refs", []),
+            # Normalized on load so rows written before #2947 was fixed heal
+            # themselves instead of crashing search.
+            entity_refs=normalize_entity_refs(data.get("entity_refs")),
             content=data["content"],
             created_at=datetime.fromisoformat(data["created_at"]),
             importance=data.get("importance", 0.5),
@@ -458,8 +460,16 @@ class HNSWVectorIndex:
                     new_memories.append((memory, embedding, hnsw_id))
                     self._next_hnsw_id += 1
 
-            # Resize if needed
-            required_capacity = len(self._memory_to_hnsw) + len(new_memories)
+            # Resize if needed. hnswlib never frees a slot on mark_deleted
+            # (remove/evict), so its capacity is bounded by the high-water mark
+            # of assigned ids (_next_hnsw_id, already incremented for the new
+            # memories above), NOT the live entry count. After deletions or
+            # evictions the live count is well below _next_hnsw_id, so keying the
+            # resize off `len(self._memory_to_hnsw)` under-provisions and the
+            # add_items below raises "number of elements exceeds the specified
+            # limit". This mirrors the single-item index() guard, which resizes
+            # off _next_hnsw_id.
+            required_capacity = self._next_hnsw_id
             if required_capacity > self._max_elements:
                 new_max = max(self._max_elements * 2, required_capacity + 1000)
                 self._resize_index(new_max)

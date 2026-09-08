@@ -14,12 +14,14 @@ from unittest.mock import patch
 
 import pytest
 
+import headroom.transforms.code_compressor as cc
 from headroom.transforms.code_compressor import (
     CodeAwareCompressor,
     CodeCompressionResult,
     CodeCompressorConfig,
     CodeLanguage,
     DocstringMode,
+    coerce_language,
     detect_language,
     is_tree_sitter_available,
     is_tree_sitter_loaded,
@@ -753,7 +755,7 @@ class TestTreeSitterIntegration:
         assert result.language == CodeLanguage.JAVASCRIPT
 
     def test_actual_go_compression(self):
-        """Test Go code is processed (compression may fall back due to nested structures)."""
+        """Test actual compression of Go code."""
         config = CodeCompressorConfig(
             min_tokens_for_compression=10,
             enable_ccr=False,
@@ -763,12 +765,9 @@ class TestTreeSitterIntegration:
 
         result = compressor.compress(code, language="go")
 
-        # Go code is processed and returns valid output
-        # Note: compression_ratio may be 1.0 if compression produces invalid syntax
-        # and falls back to original (Go has complex nested brace handling)
+        assert result.compression_ratio < 1.0
         assert result.syntax_valid is True
         assert result.language == CodeLanguage.GO
-        assert result.compressed  # Some output is produced
 
     @pytest.mark.parametrize(
         (
@@ -870,6 +869,30 @@ class TestTreeSitterIntegration:
                 "pub fn compute(&self, x: i32) -> i32 {",
                 5,
                 "        e\n",
+                "}\n}",
+            ),
+            (
+                "csharp",
+                (
+                    "namespace Acme\n"
+                    "{\n"
+                    "    public class Calc\n"
+                    "    {\n"
+                    "        public int Compute(int x)\n"
+                    "        {\n"
+                    "            int a = x + 1;\n"
+                    "            int b = a * 2;\n"
+                    "            int c = b - 3;\n"
+                    "            int d = c / 4;\n"
+                    "            int e = d + 5;\n"
+                    "            return e;\n"
+                    "        }\n"
+                    "    }\n"
+                    "}\n"
+                ),
+                "public int Compute(int x)",
+                5,
+                "return e;",
                 "}\n}",
             ),
         ],
@@ -1514,6 +1537,38 @@ class TestRealASTRuns:
             )
         )
 
+    def _recovery_compressor(self, **overrides):
+        defaults = {
+            "min_tokens_for_compression": 1,
+            "max_body_lines": 2,
+            "enable_ccr": False,
+            "semantic_analysis": False,
+        }
+        defaults.update(overrides)
+        return CodeAwareCompressor(CodeCompressorConfig(**defaults))
+
+    def _python_recovery_fixture(self) -> str:
+        return textwrap.dedent(
+            """\
+            from pathlib import Path
+
+            def expand_search_roots(user_root: str) -> list[Path]:
+                root = Path(user_root)
+                candidates = [root]
+                for child in root.iterdir():
+                    candidates.append(child.resolve())
+                return candidates
+
+            def load_user_overrides(config_path: str) -> dict[str, str]:
+                config: dict[str, str] = {}
+                for line in Path(config_path).read_text().splitlines():
+                    if "=" in line:
+                        key, value = line.split("=", 1)
+                        config[key.strip()] = value.strip()
+                return config
+            """
+        )
+
     def test_get_parser_returns_stock_node_api(self):
         """The parser must yield nodes with the stock tree_sitter property API
         that the tree-walking code relies on (``.type``/``.children``/...)."""
@@ -1591,6 +1646,101 @@ class TestRealASTRuns:
         # Output is still valid Python.
         compile(result.compressed, "<test>", "exec")
 
+    def test_python_invalid_node_falls_back_locally(self):
+        """One invalid Python rewrite must preserve only that definition."""
+        compressor = self._recovery_compressor()
+        code = self._python_recovery_fixture()
+        original_compress_function_ast = compressor._compress_function_ast
+
+        def _patched(node, code_text, language, lang_config, body_limits, analysis):
+            name = cc._get_definition_name(node)
+            if name == "expand_search_roots":
+                return "def expand_search_roots(user_root: str) -> list[Path]:\n    if True\n"
+            if name == "load_user_overrides":
+                return (
+                    "def load_user_overrides(config_path: str) -> dict[str, str]:\n"
+                    "    config: dict[str, str] = {}\n"
+                    "    # [4 lines omitted]\n"
+                    "    return config"
+                )
+            return original_compress_function_ast(
+                node,
+                code_text,
+                language,
+                lang_config,
+                body_limits,
+                analysis,
+            )
+
+        with patch.object(compressor, "_compress_function_ast", side_effect=_patched):
+            result = compressor.compress(code, language="python")
+
+        assert result.syntax_valid is True
+        assert result.compression_ratio < 1.0
+        assert result.compressed != code
+        assert "if True" not in result.compressed
+        assert "for child in root.iterdir():" in result.compressed
+        assert "# [4 lines omitted]" in result.compressed
+        compile(result.compressed, "<test>", "exec")
+
+    def test_python_recovery_does_not_block_valid_modern_syntax(self):
+        """Valid decorators, nested defs, and match syntax still compress."""
+        compressor = self._recovery_compressor(max_body_lines=4)
+        code = textwrap.dedent(
+            """\
+            from dataclasses import dataclass
+
+            def traced(fn):
+                return fn
+
+            @dataclass
+            class Command:
+                name: str
+                payload: dict[str, int]
+
+            @traced
+            def route_command(command: Command) -> str:
+                def normalize(value: str) -> str:
+                    return value.strip().lower()
+
+                match normalize(command.name):
+                    case "ping":
+                        return "pong"
+                    case "echo":
+                        return str(command.payload)
+                    case _:
+                        return "unknown"
+            """
+        )
+
+        result = compressor.compress(code, language="python")
+
+        assert result.syntax_valid is True
+        assert result.compression_ratio < 1.0
+        assert "@traced" in result.compressed
+        assert "class Command:" in result.compressed
+        assert "def route_command(command: Command) -> str:" in result.compressed
+        compile(result.compressed, "<test>", "exec")
+
+    def test_python_recovery_still_returns_original_when_all_candidates_invalid(self):
+        """Recovery keeps the terminal whole-file fail-safe."""
+        compressor = self._recovery_compressor()
+        code = self._python_recovery_fixture()
+
+        def _patched(node, _code_text, _language, _lang_config, _body_limits, _analysis):
+            name = cc._get_definition_name(node) or "broken"
+            return f"def {name}(:\n    pass"
+
+        with patch.object(compressor, "_compress_function_ast", side_effect=_patched):
+            result = compressor.compress(code, language="python")
+
+        assert result.syntax_valid is True
+        assert result.compression_ratio == 1.0
+        assert "(:\n" not in result.compressed
+        assert "for child in root.iterdir():" in result.compressed
+        assert 'key, value = line.split("=", 1)' in result.compressed
+        compile(result.compressed, "<test>", "exec")
+
     def test_get_node_text_uses_utf8_byte_offsets(self):
         """tree-sitter byte offsets must not be sliced as Python str indexes."""
         from headroom.transforms.code_compressor import _get_node_text, _get_parser
@@ -1651,3 +1801,412 @@ class TestRealASTRuns:
         assert result.syntax_valid is True
         # Signature is preserved verbatim.
         assert "pub fn add(a: i64, b: i64) -> i64" in result.compressed
+
+
+@pytest.mark.skipif(not TREE_SITTER_INSTALLED, reason="tree-sitter grammar pack not installed")
+class TestCSharpSupport:
+    """C# (``csharp`` grammar) parity with Java/C++/Rust: signatures preserved
+    verbatim, method/constructor bodies compressed, block-scoped namespaces
+    routed through container compression (no verbatim re-dump), file-scoped
+    namespace headers kept ahead of types, malformed input passed through.
+    """
+
+    def _compressor(self):
+        return CodeAwareCompressor(
+            CodeCompressorConfig(
+                min_tokens_for_compression=1,
+                max_body_lines=1,
+                enable_ccr=False,
+            )
+        )
+
+    def test_block_scoped_namespace_compresses_without_redumping(self):
+        """Block-scoped ``namespace { }`` wraps types in a declaration_list; the
+        container must compress its members and NOT be re-emitted verbatim
+        (which would duplicate the class and defeat compression — the C#
+        analogue of the #1318 class-member trap, one nesting level deeper)."""
+        code = (
+            "using System;\n"
+            "\n"
+            "namespace Acme.Widgets\n"
+            "{\n"
+            "    public class WidgetService\n"
+            "    {\n"
+            "        public int Process(int x)\n"
+            "        {\n"
+            "            var a = x + 1;\n"
+            "            var b = a + 2;\n"
+            "            var c = b + 3;\n"
+            "            Console.WriteLine(c);\n"
+            "            return c;\n"
+            "        }\n"
+            "    }\n"
+            "}\n"
+        )
+        result = self._compressor().compress(code, language="csharp")
+
+        assert result.language == CodeLanguage.CSHARP
+        assert result.syntax_valid is True
+        assert result.compression_ratio < 1.0
+        # namespace + type headers preserved verbatim
+        assert "namespace Acme.Widgets" in result.compressed
+        assert "public class WidgetService" in result.compressed
+        assert "public int Process(int x)" in result.compressed
+        # method body actually compressed
+        assert "lines omitted" in result.compressed
+        assert "return c;" not in result.compressed
+        # the class is emitted exactly once (no re-dump / duplication)
+        assert result.compressed.count("class WidgetService") == 1
+        # block-namespace wrapper still closes
+        assert result.compressed.rstrip().endswith("}")
+
+    def test_file_scoped_namespace_directive_precedes_types(self):
+        """A file-scoped ``namespace X;`` must stay ahead of the type
+        declarations; emitting it after a type would not be valid C#."""
+        code = (
+            "using System;\n"
+            "\n"
+            "namespace Acme.Tools;\n"
+            "\n"
+            "public class Helper\n"
+            "{\n"
+            "    public int Add(int a, int b)\n"
+            "    {\n"
+            "        var s = a + b;\n"
+            "        var t = s + 1;\n"
+            "        var u = t + 2;\n"
+            "        return u;\n"
+            "    }\n"
+            "}\n"
+        )
+        result = self._compressor().compress(code, language="csharp")
+
+        assert result.language == CodeLanguage.CSHARP
+        assert result.syntax_valid is True
+        assert result.compression_ratio < 1.0
+        assert "namespace Acme.Tools;" in result.compressed
+        assert "public class Helper" in result.compressed
+        assert result.compressed.index("namespace Acme.Tools;") < result.compressed.index(
+            "class Helper"
+        )
+
+    def test_record_preserves_positional_parameters(self):
+        """Record primary-constructor parameters are part of the signature and
+        must be preserved verbatim while the method body compresses."""
+        code = (
+            "namespace Acme.Models;\n"
+            "\n"
+            "public record Point(int X, int Y)\n"
+            "{\n"
+            "    public double Dist()\n"
+            "    {\n"
+            "        var sq = X * X + Y * Y;\n"
+            "        var r = System.Math.Sqrt(sq);\n"
+            "        System.Console.WriteLine(r);\n"
+            "        return r;\n"
+            "    }\n"
+            "}\n"
+        )
+        result = self._compressor().compress(code, language="csharp")
+
+        assert result.language == CodeLanguage.CSHARP
+        assert result.syntax_valid is True
+        assert result.compression_ratio < 1.0
+        assert "public record Point(int X, int Y)" in result.compressed
+        assert "public double Dist()" in result.compressed
+        assert "lines omitted" in result.compressed
+
+    def test_preprocessor_wrapped_file_is_not_duplicated(self):
+        """A file wrapped in ``#if``/``#endif`` (idiomatic in multi-targeted
+        .NET code) must not have its content emitted twice. The visitor
+        recurses into ``preproc_if`` and captures the declarations, but the
+        top-level pass used to re-emit the uncaptured wrapper verbatim,
+        duplicating the whole file (observed on real repos: output up to
+        ~1.9x the input). Opaque handling keeps it verbatim exactly once."""
+        code = (
+            "#if !HAVE_TRACE_WRITER\n"
+            "using System;\n"
+            "\n"
+            "namespace Acme\n"
+            "{\n"
+            "    public enum TraceLevel\n"
+            "    {\n"
+            "        Off = 0,\n"
+            "        Error = 1,\n"
+            "    }\n"
+            "}\n"
+            "#endif\n"
+        )
+        result = self._compressor().compress(code, language="csharp")
+
+        assert result.syntax_valid is True
+        # Content appears exactly once — no wrapper re-dump.
+        assert result.compressed.count("enum TraceLevel") == 1
+        assert result.compressed.count("using System;") == 1
+        # Never larger than the input (verbatim pass-through is acceptable).
+        assert result.compression_ratio <= 1.0
+        # Conditional directives stay balanced.
+        assert result.compressed.count("#if") == result.compressed.count("#endif")
+
+    def test_preprocessor_wrapped_usings_stay_ahead_of_types(self):
+        """``#if``-wrapped using directives (idiomatic for multi-targeting)
+        must be emitted with the imports. Appending them as trailing top-level
+        code puts usings after type declarations — invalid C#, which trips the
+        output syntax check and falls back to no compression at all (observed
+        on real repos: hundreds of files silently uncompressed)."""
+        code = (
+            "using System;\n"
+            "#if HAVE_BIG_INTEGER\n"
+            "using System.Numerics;\n"
+            "#endif\n"
+            "\n"
+            "namespace Acme\n"
+            "{\n"
+            "    public class Calc\n"
+            "    {\n"
+            "        public int Compute(int x)\n"
+            "        {\n"
+            "            var a = x + 1;\n"
+            "            var b = a * 2;\n"
+            "            var c = b - 3;\n"
+            "            var d = c / 4;\n"
+            "            return d;\n"
+            "        }\n"
+            "    }\n"
+            "}\n"
+        )
+        result = self._compressor().compress(code, language="csharp")
+
+        assert result.syntax_valid is True
+        # Compression must actually happen (no silent fallback).
+        assert result.compression_ratio < 1.0
+        assert "lines omitted" in result.compressed
+        # The conditional import block survives verbatim, ahead of the types.
+        assert "#if HAVE_BIG_INTEGER" in result.compressed
+        assert "using System.Numerics;" in result.compressed
+        assert result.compressed.index("#endif") < result.compressed.index("class Calc")
+
+    def test_region_markers_inside_class_compress_cleanly(self):
+        """``#region``/``#endregion`` markers span their trailing newline, so
+        their end_point sits at column 0 of the NEXT line. Line-based child
+        extraction used to swallow that line — duplicating the following
+        method's signature and the class's closing brace (invalid output →
+        silent fallback to no compression on real repos)."""
+        code = (
+            "namespace Acme\n"
+            "{\n"
+            "    public class Svc\n"
+            "    {\n"
+            "        #region Api\n"
+            "        public int F(int x)\n"
+            "        {\n"
+            "            var a = x + 1;\n"
+            "            var b = a * 2;\n"
+            "            var c = b - 3;\n"
+            "            return c;\n"
+            "        }\n"
+            "        #endregion\n"
+            "    }\n"
+            "}\n"
+        )
+        result = self._compressor().compress(code, language="csharp")
+
+        assert result.syntax_valid is True
+        assert result.compression_ratio < 1.0
+        assert "lines omitted" in result.compressed
+        # Signature emitted exactly once (regions used to duplicate it).
+        assert result.compressed.count("public int F(int x)") == 1
+        # Region markers survive, braces stay balanced.
+        assert "#region Api" in result.compressed
+        assert "#endregion" in result.compressed
+        assert result.compressed.count("{") == result.compressed.count("}")
+
+    def test_license_region_header_stays_on_top(self):
+        """A ``#region License`` banner above the usings (near-universal in
+        real .NET code) must stay at the top of the file. Relocating it after
+        the type declarations — the old behavior for uncaptured top-level
+        nodes — is rejected by tree-sitter-c-sharp, failing output validation
+        and silently forfeiting compression for the whole file."""
+        code = (
+            "#region License\n"
+            "// Copyright (c) 2007 Example Corp.\n"
+            "// Licensed under the MIT license.\n"
+            "#endregion\n"
+            "\n"
+            "using System;\n"
+            "\n"
+            "namespace Acme\n"
+            "{\n"
+            "    public class Svc\n"
+            "    {\n"
+            "        public int F(int x)\n"
+            "        {\n"
+            "            var a = x + 1;\n"
+            "            var b = a * 2;\n"
+            "            var c = b - 3;\n"
+            "            return c;\n"
+            "        }\n"
+            "    }\n"
+            "}\n"
+        )
+        result = self._compressor().compress(code, language="csharp")
+
+        assert result.syntax_valid is True
+        assert result.compression_ratio < 1.0
+        assert "lines omitted" in result.compressed
+        # Header block survives, in order, ahead of everything else.
+        assert result.compressed.index("#region License") < result.compressed.index("using System;")
+        assert result.compressed.index("// Copyright") < result.compressed.index("#endregion")
+        assert result.compressed.index("#endregion") < result.compressed.index("class Svc")
+
+    def test_malformed_csharp_passes_through_unchanged(self):
+        """Malformed C# must pass through unchanged (no data loss; prefer false
+        negatives over serving broken or altered code)."""
+        code = (
+            "namespace Broken\n"
+            "{\n"
+            "    public class Oops\n"
+            "    {\n"
+            "        public int F(int x)\n"
+            "        {\n"
+            "            var a = x + 1\n"  # missing ';' and unclosed braces
+            "            return a\n"
+        )
+        result = self._compressor().compress(code, language="csharp")
+
+        assert result.compressed == code
+        assert result.compression_ratio == 1.0
+
+    def test_detect_language_identifies_csharp(self):
+        """Auto-detection (no explicit language hint) recognizes C#."""
+        code = (
+            "using System;\n"
+            "\n"
+            "namespace Acme\n"
+            "{\n"
+            "    public class Svc\n"
+            "    {\n"
+            "        public int Total { get; set; }\n"
+            "        public int Add(int a, int b)\n"
+            "        {\n"
+            "            return a + b;\n"
+            "        }\n"
+            "    }\n"
+            "}\n"
+        )
+        lang, confidence = detect_language(code)
+        assert lang == CodeLanguage.CSHARP
+        assert confidence > 0.0
+
+
+@pytest.mark.skipif(not TREE_SITTER_INSTALLED, reason="tree-sitter grammar pack not installed")
+class TestPhpSupport:
+    """PHP (``php`` grammar) parity with C#: signatures preserved verbatim,
+    function/method bodies compressed, ``<?php`` tag and ``namespace``/``use``
+    header order preserved, Perl sigil-overlap disambiguated in detection,
+    malformed input passed through.
+    """
+
+    def _compressor(self):
+        return CodeAwareCompressor(
+            CodeCompressorConfig(
+                min_tokens_for_compression=1,
+                max_body_lines=1,
+                enable_ccr=False,
+            )
+        )
+
+    def test_class_methods_compress_signatures_preserved(self):
+        code = (
+            "<?php\n"
+            "namespace App\\Service;\n"
+            "\n"
+            "use App\\Model\\User;\n"
+            "\n"
+            "final class UserService {\n"
+            "    private $logger;\n"
+            "\n"
+            "    public function process(User $u): bool {\n"
+            "        $name = strtolower(trim($u->getName()));\n"
+            "        $tags = [];\n"
+            "        foreach ($u->getTags() as $tag) {\n"
+            "            $tags[] = $tag->normalize();\n"
+            "        }\n"
+            "        $this->logger->info($name);\n"
+            "        return true;\n"
+            "    }\n"
+            "}\n"
+        )
+        result = self._compressor().compress(code, language="php")
+
+        assert result.language == CodeLanguage.PHP
+        assert result.syntax_valid is True
+        assert result.compression_ratio < 1.0
+        # signature + class header preserved verbatim
+        assert "final class UserService" in result.compressed
+        assert "public function process(User $u): bool" in result.compressed
+        # method body actually compressed
+        assert "lines omitted" in result.compressed
+        assert "$tag->normalize()" not in result.compressed
+        # the class is emitted exactly once
+        assert result.compressed.count("class UserService") == 1
+
+    def test_php_tag_and_namespace_precede_uses_and_types(self):
+        """``<?php`` must stay first and ``namespace X;`` must precede the
+        ``use`` imports and type declarations — any other order is not valid
+        PHP."""
+        code = (
+            "<?php\n"
+            "namespace App\\Tools;\n"
+            "\n"
+            "use App\\Model\\Item;\n"
+            "\n"
+            "function helper(int $x): int {\n"
+            "    $acc = 0;\n"
+            "    for ($i = 0; $i < $x; $i++) {\n"
+            "        $acc += $i;\n"
+            "        $acc -= 1;\n"
+            "    }\n"
+            "    return $acc;\n"
+            "}\n"
+        )
+        result = self._compressor().compress(code, language="php")
+
+        assert result.language == CodeLanguage.PHP
+        assert result.syntax_valid is True
+        assert result.compression_ratio < 1.0
+        compressed = result.compressed
+        assert compressed.lstrip().startswith("<?php")
+        assert compressed.index("<?php") < compressed.index("namespace App\\Tools;")
+        assert compressed.index("namespace App\\Tools;") < compressed.index("use App\\Model\\Item;")
+        assert compressed.index("use App\\Model\\Item;") < compressed.index("function helper")
+        assert "lines omitted" in compressed
+
+    def test_detect_language_identifies_php(self):
+        """Auto-detection recognizes PHP despite the Perl sigil overlap
+        (``$var`` matches Perl's prefilter; the ``<?php`` tag disambiguates)."""
+        code = (
+            "<?php\n"
+            "namespace Acme;\n"
+            "\n"
+            "use Acme\\Widget;\n"
+            "\n"
+            "class Svc {\n"
+            "    public function add(int $a, int $b): int {\n"
+            "        $sum = $a + $b;\n"
+            "        return $sum;\n"
+            "    }\n"
+            "}\n"
+        )
+        lang, confidence = detect_language(code)
+        assert lang == CodeLanguage.PHP
+        assert confidence > 0.0
+
+    def test_phtml_alias_coerces_to_php(self):
+        assert coerce_language("phtml") == CodeLanguage.PHP
+        assert coerce_language("php8") == CodeLanguage.PHP
+
+    def test_malformed_php_passes_through_unchanged(self):
+        code = "<?php\nclass Broken {\n    public function oops( {\n"
+        result = self._compressor().compress(code, language="php")
+        assert result.compressed == code

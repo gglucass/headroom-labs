@@ -40,7 +40,16 @@ def test_detect_editable(monkeypatch):
 
 
 def test_detect_docker(monkeypatch):
+    # A bare /.dockerenv container whose system interpreter owns the install
+    # (no venv / pipx / uv / user-site) still refuses. When an install method
+    # owns it, ownership wins over the container environment (#2816) -- see
+    # test_update_helpers.test_venv_inside_bare_dockerenv_still_self_updates.
+    monkeypatch.delenv("HEADROOM_IN_DOCKER", raising=False)
     monkeypatch.setattr(up, "_in_docker", lambda: True)
+    monkeypatch.setattr(up, "_in_virtualenv", lambda: False)
+    monkeypatch.setattr(up, "_is_user_site_install", lambda loc: False)
+    monkeypatch.setattr(up.sys, "prefix", "/usr")
+    monkeypatch.setattr(up.sys, "executable", "/usr/bin/python3")
     m = up.detect_install_method()
     assert m.kind == "docker" and m.can_self_update is False
 
@@ -126,6 +135,8 @@ def test_update_runs_upgrade_with_yes(monkeypatch):
     monkeypatch.setattr(up, "installed_version", lambda: "0.26.0")
     monkeypatch.setattr(up, "fetch_latest_version", lambda **k: "0.27.0")
     monkeypatch.setattr(up, "_in_virtualenv", lambda: True)
+    monkeypatch.setattr(up.sys, "platform", "linux")
+    monkeypatch.setattr(up, "_find_core_pyd", lambda: None)  # Skip integrity checks
 
     class _Result:
         returncode = 0
@@ -139,6 +150,80 @@ def test_update_runs_upgrade_with_yes(monkeypatch):
     assert res.exit_code == 0
     assert calls["argv"][:4] == [sys.executable, "-m", "pip", "install"]
     assert "upgraded to 0.27.0" in res.output
+
+
+def test_update_windows_pip_handoff_uses_popen(monkeypatch):
+    calls = {}
+
+    monkeypatch.setattr(up, "installed_version", lambda: "0.26.0")
+    monkeypatch.setattr(up, "fetch_latest_version", lambda **k: "0.27.0")
+    monkeypatch.setattr(up.sys, "platform", "win32")
+
+    def _detect(extras=None):
+        calls["extras"] = extras
+        return up.InstallMethod(
+            kind="pip",
+            can_self_update=True,
+            argv=[
+                r"C:\Python313\python.exe",
+                "-m",
+                "pip",
+                "install",
+                "-U",
+                "headroom-ai[foo&calc]",
+            ],
+        )
+
+    monkeypatch.setattr(up, "detect_install_method", _detect)
+
+    def _run(*a, **k):
+        raise AssertionError("Windows pip handoff must not call subprocess.run")
+
+    def _popen(argv, *a, **k):
+        calls["argv"] = argv
+        return object()
+
+    monkeypatch.setattr(up.subprocess, "run", _run)
+    monkeypatch.setattr(up.subprocess, "Popen", _popen)
+    res = CliRunner().invoke(main, ["update", "--yes", "--extras", "foo&calc"])
+    assert res.exit_code == 0
+    assert calls["extras"] == "foo&calc"
+    assert calls["argv"][:2] == [sys.executable, "-c"]
+    assert "subprocess.run" in calls["argv"][2]
+    assert calls["argv"][3:] == [
+        "-m",
+        "pip",
+        "install",
+        "-U",
+        "headroom-ai[foo&calc]",
+    ]
+    assert "headroom.exe" in res.output
+
+
+def test_update_windows_non_pip_path_stays_synchronous(monkeypatch):
+    calls = {}
+
+    monkeypatch.setattr(up, "installed_version", lambda: "0.26.0")
+    monkeypatch.setattr(up, "fetch_latest_version", lambda **k: "0.27.0")
+    monkeypatch.setattr(up.sys, "platform", "win32")
+    monkeypatch.setattr(
+        up,
+        "detect_install_method",
+        lambda extras=None: up.InstallMethod(
+            kind="pipx",
+            can_self_update=True,
+            argv=["pipx", "upgrade", "headroom-ai"],
+        ),
+    )
+
+    def _popen(*a, **k):
+        raise AssertionError("pipx must stay on the synchronous path")
+
+    monkeypatch.setattr(up, "safe_update", lambda argv: calls.setdefault("safe_update", argv) and 0)
+    monkeypatch.setattr(up.subprocess, "Popen", _popen)
+    res = CliRunner().invoke(main, ["update", "--yes"])
+    assert res.exit_code == 0
+    assert calls["safe_update"] == ["pipx", "upgrade", "headroom-ai"]
 
 
 def test_update_refuses_in_checkout(monkeypatch):
@@ -167,6 +252,8 @@ def test_update_upgrade_failure_surfaces_command(monkeypatch):
     monkeypatch.setattr(up, "installed_version", lambda: "0.26.0")
     monkeypatch.setattr(up, "fetch_latest_version", lambda **k: "0.27.0")
     monkeypatch.setattr(up, "_in_virtualenv", lambda: True)
+    monkeypatch.setattr(up.sys, "platform", "linux")
+    monkeypatch.setattr(up, "_find_core_pyd", lambda: None)  # Skip file operations in test
 
     class _Result:
         returncode = 1
@@ -175,3 +262,92 @@ def test_update_upgrade_failure_surfaces_command(monkeypatch):
     res = CliRunner().invoke(main, ["update", "--yes"])
     assert res.exit_code != 0
     assert "Upgrade failed" in res.output
+
+
+# --------------------------------------------------------------------------- #
+# safe_update (Windows-specific backup/restore protection)
+# --------------------------------------------------------------------------- #
+def test_safe_update_success(monkeypatch):
+    """Test safe_update returns 0 when the command succeeds."""
+
+    class _Result:
+        returncode = 0
+
+    monkeypatch.setattr(up, "_find_core_pyd", lambda: None)
+    monkeypatch.setattr(up.subprocess, "run", lambda *a, **k: _Result())
+
+    result = up.safe_update([sys.executable, "-m", "pip", "install", "-U", "headroom-ai"])
+    assert result == 0
+
+
+def test_safe_update_handles_missing_pyd(monkeypatch):
+    """Test safe_update when _core.pyd doesn't exist."""
+
+    class _Result:
+        returncode = 0
+
+    monkeypatch.setattr(up, "_find_core_pyd", lambda: None)
+    monkeypatch.setattr(up.subprocess, "run", lambda *a, **k: _Result())
+
+    result = up.safe_update([sys.executable, "-m", "pip", "install", "-U", "headroom-ai"])
+    assert result == 0
+
+
+def test_safe_update_passes_through_failure(monkeypatch):
+    """Test safe_update returns error code when pip fails."""
+
+    class _Result:
+        returncode = 1
+
+    monkeypatch.setattr(up, "_find_core_pyd", lambda: None)
+    monkeypatch.setattr(up.subprocess, "run", lambda *a, **k: _Result())
+
+    result = up.safe_update([sys.executable, "-m", "pip", "install", "-U", "headroom-ai"])
+    assert result == 1
+
+
+def test_safe_update_warns_but_no_backup_when_locked(monkeypatch, tmp_path):
+    """When the .pyd is locked, safe_update warns but does not make a backup."""
+    fake_pyd = tmp_path / "_core.pyd"
+    fake_pyd.write_bytes(b"fake pyd content")
+
+    monkeypatch.setattr(up.sys, "platform", "win32")
+    monkeypatch.setattr(up, "_find_core_pyd", lambda: fake_pyd)
+    monkeypatch.setattr(up, "_is_pyd_locked", lambda p: True)  # locked!
+
+    class _Result:
+        returncode = 1  # pip fails (expected — file was locked)
+
+    monkeypatch.setattr(up.subprocess, "run", lambda *a, **k: _Result())
+
+    result = up.safe_update([sys.executable, "-m", "pip", "install", "-U", "headroom-ai"])
+
+    assert result == 1
+    # Backup should never be created — file is locked, pip fails without corruption
+    assert not (tmp_path / "_core.pyd.bak").exists()
+
+
+def test_safe_update_backup_and_restore_on_integrity_failure(monkeypatch, tmp_path):
+    """Test safe_update backs up and restores _core.pyd if integrity check fails."""
+    # Create a fake .pyd file
+    fake_pyd = tmp_path / "_core.pyd"
+    fake_pyd.write_bytes(b"fake pyd content")
+
+    # Mock Windows and _core.pyd detection
+    monkeypatch.setattr(up.sys, "platform", "win32")
+    monkeypatch.setattr(up, "_find_core_pyd", lambda: fake_pyd)
+    monkeypatch.setattr(up, "_is_pyd_locked", lambda p: False)
+
+    class _Result:
+        returncode = 0
+
+    # Simulate pip success but integrity test failure
+    monkeypatch.setattr(up.subprocess, "run", lambda *a, **k: _Result())
+    monkeypatch.setattr(up, "_test_core_integrity", lambda: False)
+
+    result = up.safe_update([sys.executable, "-m", "pip", "install", "-U", "headroom-ai"])
+
+    # Should return error due to integrity failure
+    assert result == 1
+    # Backup should be cleaned up
+    assert not (tmp_path / "_core.pyd.bak").exists()

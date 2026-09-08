@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 
 import pytest
 
+from headroom.cache import compression_store as compression_store_module
 from headroom.cache.compression_store import (
     get_compression_store,
     reset_compression_store,
@@ -91,6 +93,91 @@ def test_compress_savings_percent_tracks_token_counts(fresh_store) -> None:
         assert result["savings_percent"] > 0.0
 
 
+def test_mcp_compress_surfaces_unreachable_proxy(fresh_store) -> None:
+    server = mcp_server.HeadroomMCPServer(
+        proxy_url="http://127.0.0.1:9",
+        check_proxy=True,
+    )
+
+    response = asyncio.run(server._handle_compress({"content": "dead proxy check"}))
+    payload = json.loads(response[0].kwargs["text"])
+
+    assert payload["proxy"]["status"] == "unreachable"
+    assert payload["proxy"]["url"] == "http://127.0.0.1:9"
+    assert "unreachable" in payload["warning"].lower()
+
+
+def test_mcp_stats_surfaces_unreachable_proxy() -> None:
+    server = mcp_server.HeadroomMCPServer(
+        proxy_url="http://127.0.0.1:9",
+        check_proxy=True,
+    )
+
+    response = asyncio.run(server._handle_stats())
+    payload = json.loads(response[0].kwargs["text"])
+
+    assert payload["proxy"]["status"] == "unreachable"
+    assert payload["proxy"]["url"] == "http://127.0.0.1:9"
+    assert "unreachable" in payload["warning"].lower()
+
+
+def test_mcp_proxy_probe_preserves_shared_proxy_client(monkeypatch: pytest.MonkeyPatch) -> None:
+    class ProbeResponse:
+        status_code = 200
+        text = ""
+
+        @staticmethod
+        def json() -> dict[str, object]:
+            return {"status": "healthy", "alive": True}
+
+    class ProbeClient:
+        def __init__(self, *, timeout: float) -> None:
+            seen["timeout"] = timeout
+
+        async def __aenter__(self) -> ProbeClient:
+            return self
+
+        async def __aexit__(self, *_args: object) -> None:
+            seen["closed"] = True
+
+        async def get(self, url: str) -> ProbeResponse:
+            seen["url"] = url
+            return ProbeResponse()
+
+    seen: dict[str, object] = {}
+    shared_client = object()
+    monkeypatch.setattr(mcp_server.httpx, "AsyncClient", ProbeClient)
+
+    server = mcp_server.HeadroomMCPServer(
+        proxy_url="http://127.0.0.1:8765",
+        check_proxy=True,
+    )
+    server._http_client = shared_client  # type: ignore[assignment]
+
+    result = asyncio.run(server._probe_proxy_unreachable())
+
+    assert result is None
+    assert seen == {
+        "timeout": 5.0,
+        "url": "http://127.0.0.1:8765/livez",
+        "closed": True,
+    }
+    assert server._http_client is shared_client
+
+
+def test_mcp_local_mode_still_works_without_proxy_checking(fresh_store) -> None:
+    server = mcp_server.HeadroomMCPServer(
+        proxy_url="http://127.0.0.1:9",
+        check_proxy=False,
+    )
+
+    response = asyncio.run(server._handle_compress({"content": "local mode stays available"}))
+    payload = json.loads(response[0].kwargs["text"])
+
+    assert "proxy" not in payload
+    assert "warning" not in payload or "unreachable" not in payload["warning"].lower()
+
+
 def test_mcp_retrieve_returns_full_content(fresh_store) -> None:
     """Retrieval is by hash: a stored, unexpired entry always returns its full
     original content (never empty, never a spurious "not found")."""
@@ -105,11 +192,132 @@ def test_mcp_retrieve_returns_full_content(fresh_store) -> None:
     assert result["original_content"] == original
 
 
+def test_mcp_retrieve_expired_hash_returns_terminal_guidance(
+    monkeypatch,
+    fresh_store,
+) -> None:
+    """An expired local hash should say it expired and tell the agent to stop retrying."""
+    current_time = [1000.0]
+
+    def fake_time() -> float:
+        return current_time[0]
+
+    monkeypatch.setattr(mcp_server.time, "time", fake_time)
+    monkeypatch.setattr(compression_store_module.time, "time", fake_time)
+
+    store = get_compression_store()
+    hash_key = store.store("expired content", "<<small>>", ttl=1)
+    current_time[0] = 1002.0
+
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+    result = asyncio.run(server._retrieve_content(hash_key))
+
+    assert result["status"] == "expired"
+    assert result["ttl_seconds"] == 1
+    assert result["age_seconds"] == pytest.approx(2.0)
+    assert "Entry expired" in result["error"]
+    assert "do not retry the same hash" in result["error"].lower()
+    assert "re-run the command" in result["hint"].lower()
+
+
+def test_mcp_retrieve_hash_expiring_during_lookup_returns_terminal_guidance(
+    monkeypatch,
+    fresh_store,
+) -> None:
+    phase = "store"
+    status_seen = False
+
+    def fake_time() -> float:
+        if phase == "store":
+            return 1000.0
+        return 1001.1 if status_seen else 1000.5
+
+    monkeypatch.setattr(mcp_server.time, "time", fake_time)
+    monkeypatch.setattr(compression_store_module.time, "time", fake_time)
+
+    store = get_compression_store()
+    hash_key = store.store("expired during retrieve", "<<small>>", ttl=1)
+    phase = "retrieve"
+
+    original_get_entry_status = store.get_entry_status
+    original_retrieve = store.retrieve
+
+    def get_entry_status_then_expire(*args, **kwargs):
+        nonlocal status_seen
+        result = original_get_entry_status(*args, **kwargs)
+        status_seen = True
+        return result
+
+    monkeypatch.setattr(store, "get_entry_status", get_entry_status_then_expire)
+    monkeypatch.setattr(store, "retrieve", original_retrieve)
+
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+    result = asyncio.run(server._retrieve_content(hash_key))
+
+    assert result["status"] == "expired"
+    assert result["ttl_seconds"] == 1
+    assert result["age_seconds"] == pytest.approx(1.1)
+    assert "Entry expired" in result["error"]
+    assert "do not retry the same hash" in result["error"].lower()
+
+
+def test_mcp_retrieve_missing_local_hash_can_still_hit_proxy(
+    monkeypatch,
+    fresh_store,
+) -> None:
+    monkeypatch.setattr(mcp_server, "HTTPX_AVAILABLE", True)
+    server = mcp_server.HeadroomMCPServer(check_proxy=True)
+
+    async def retrieve_via_proxy(hash_key: str) -> dict[str, object]:
+        return {"hash": hash_key, "original_content": "from proxy"}
+
+    server._retrieve_via_proxy = retrieve_via_proxy
+
+    result = asyncio.run(server._retrieve_content("proxy_hash"))
+
+    assert result["source"] == "proxy"
+    assert result["hash"] == "proxy_hash"
+    assert result["original_content"] == "from proxy"
+
+
+def test_mcp_retrieve_expired_local_hash_can_still_hit_proxy(
+    monkeypatch,
+    fresh_store,
+) -> None:
+    current_time = [1000.0]
+
+    def fake_time() -> float:
+        return current_time[0]
+
+    monkeypatch.setattr(mcp_server, "HTTPX_AVAILABLE", True)
+    monkeypatch.setattr(mcp_server.time, "time", fake_time)
+    monkeypatch.setattr(compression_store_module.time, "time", fake_time)
+
+    store = get_compression_store()
+    hash_key = store.store("expired local content", "<<small>>", ttl=1)
+    current_time[0] = 1002.0
+
+    server = mcp_server.HeadroomMCPServer(check_proxy=True)
+
+    async def retrieve_via_proxy(proxy_hash_key: str) -> dict[str, object]:
+        return {"hash": proxy_hash_key, "original_content": "from proxy"}
+
+    server._retrieve_via_proxy = retrieve_via_proxy
+
+    result = asyncio.run(server._retrieve_content(hash_key))
+
+    assert result["source"] == "proxy"
+    assert result["hash"] == hash_key
+    assert result["original_content"] == "from proxy"
+
+
 def test_mcp_retrieve_missing_hash_still_errors(fresh_store) -> None:
-    """A genuinely missing hash must still report "Content not found"."""
+    """A never-stored hash must stay on the generic missing path, not expired guidance."""
     server = mcp_server.HeadroomMCPServer(check_proxy=False)
     result = asyncio.run(server._retrieve_content("nonexistent_hash"))
-    assert "Content not found" in result.get("error", "")
+    assert result.get("status") is None
+    assert result["error"] == "Content not found. It may have expired or the hash may be incorrect."
+    assert "do not retry the same hash" not in result.get("hint", "").lower()
 
 
 def test_handle_stats_session_output_is_window_scoped() -> None:
@@ -201,3 +409,86 @@ def test_handle_stats_shows_zero_lifetime_totals_when_present() -> None:
     assert "Lifetime Savings:" in text
     assert "Tokens saved: 0" in text
     assert "Compression savings: $0.00" in text
+
+
+# --- Parent-death watchdog: reap orphaned `mcp serve` on client death --------
+# When the launching MCP client is SIGKILLed, stdin EOF may never arrive and the
+# SDK's blocking stdin reader wedges server.run() forever, orphaning this process
+# under init/launchd. run_stdio() runs a watchdog that detects the reparent and
+# forces shutdown. Refs headroomlabs-ai/headroom#2185 (secondary), #1761.
+
+
+def test_parent_death_watchdog_fires_when_reparented(monkeypatch) -> None:
+    """When ppid changes (client died), the watchdog resolves promptly."""
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+    calls = {"n": 0}
+
+    def fake_getppid() -> int:
+        calls["n"] += 1
+        return 500 if calls["n"] == 1 else 1  # captured live, then reparented
+
+    monkeypatch.setattr(mcp_server.os, "getppid", fake_getppid)
+
+    async def run() -> None:
+        await asyncio.wait_for(server._await_parent_death(0.001), timeout=1.0)
+
+    asyncio.run(run())  # returns => detected reparent; TimeoutError would fail
+
+
+def test_parent_death_watchdog_stays_quiet_with_live_parent(monkeypatch) -> None:
+    """A stable ppid must never trip the watchdog."""
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+    monkeypatch.setattr(mcp_server.os, "getppid", lambda: 500)
+
+    async def run() -> None:
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(server._await_parent_death(0.001), timeout=0.05)
+
+    asyncio.run(run())
+
+
+def test_run_stdio_reaps_process_on_parent_death(monkeypatch) -> None:
+    """On reparent, run_stdio cleans up and calls os._exit(0) even though the
+    (stubbed) server.run never returns — the orphan-reaper path."""
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+
+    @contextlib.asynccontextmanager
+    async def fake_stdio_server():
+        yield (object(), object())
+
+    monkeypatch.setattr(mcp_server, "stdio_server", fake_stdio_server)
+
+    async def never_returns(*_args, **_kwargs) -> None:
+        await asyncio.sleep(3600)  # emulate the wedged SDK reader
+
+    # DummyServer (MCP SDK stub) has no `.run`; raising=False lets us add it.
+    monkeypatch.setattr(server.server, "run", never_returns, raising=False)
+
+    calls = {"n": 0}
+
+    def fake_getppid() -> int:
+        calls["n"] += 1
+        return 500 if calls["n"] == 1 else 1
+
+    monkeypatch.setattr(mcp_server.os, "getppid", fake_getppid)
+
+    cleaned = {"done": False}
+
+    async def fake_cleanup() -> None:
+        cleaned["done"] = True
+
+    monkeypatch.setattr(server, "cleanup", fake_cleanup)
+
+    class _Exited(Exception):
+        pass
+
+    def fake_exit(code: int) -> None:
+        raise _Exited(code)  # intercept so pytest survives
+
+    monkeypatch.setattr(mcp_server.os, "_exit", fake_exit)
+
+    with pytest.raises(_Exited) as excinfo:
+        asyncio.run(server.run_stdio(parent_death_poll_interval=0.001))
+
+    assert excinfo.value.args[0] == 0
+    assert cleaned["done"] is True

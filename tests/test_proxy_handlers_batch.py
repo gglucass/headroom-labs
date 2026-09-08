@@ -6,7 +6,15 @@ from types import SimpleNamespace
 
 import pytest
 
+from headroom.cache.compression_store import (
+    CompressionEntry,
+    get_compression_store,
+    reset_compression_store,
+)
+from headroom.ccr import response_handler as response_handler_module
 from headroom.proxy.handlers import batch as batch_module
+from headroom.proxy.handlers import gemini as gemini_module
+from headroom.proxy.handlers.gemini import GeminiHandlerMixin
 
 
 class FakeResponse:
@@ -72,7 +80,10 @@ class FakeMetrics:
         self.failed_calls.append(kwargs)
 
 
-class DummyBatchHandler(batch_module.BatchHandlerMixin):
+class DummyBatchHandler(batch_module.BatchHandlerMixin, GeminiHandlerMixin):
+    # GeminiHandlerMixin supplies the real _rebuild_gemini_contents (and the
+    # other content helpers); the two converter methods below intentionally
+    # override the mixin's for the stub-based tests.
     OPENAI_API_URL = "https://openai.example"
     GEMINI_API_URL = "https://gemini.example"
 
@@ -113,6 +124,12 @@ class DummyBatchHandler(batch_module.BatchHandlerMixin):
     async def handle_passthrough(self, request, base_url):  # noqa: ANN001, ANN201
         return {"request": request, "base_url": base_url}
 
+    async def _run_compression_in_executor(self, fn, *, timeout):  # noqa: ANN001, ANN201
+        # Mirror of HeadroomProxy._run_compression_in_executor: batch handlers
+        # offload pipeline.apply() off the event loop (#1701). Inline is fine
+        # for tests — only the call contract matters here.
+        return fn()
+
     async def _retry_request(self, method, url, headers, body, **kwargs):  # noqa: ANN001, ANN201
         return self._retry_response
 
@@ -138,9 +155,454 @@ class FakeRequest:
         self.headers = headers or {}
         self.method = method
         self.url = SimpleNamespace(path=path, query=query)
+        self.query_params = {}
+        # Every real Starlette Request has one, and handlers now share a
+        # per-request attribution ledger through it (savings_attribution).
+        self.scope: dict = {"type": "http", "method": method}
 
     async def body(self) -> bytes:
         return self._body
+
+
+class NativeGeminiHandler(DummyBatchHandler):
+    def __init__(self, responses: list[FakeResponse]) -> None:
+        super().__init__()
+        self.config.optimize = True
+        self.config.ccr_inject_tool = True
+        self.config.ccr_inject_system_instructions = False
+        self.memory_handler = None
+        self.rate_limiter = None
+        self.usage_reporter = None
+        self.responses = iter(responses)
+        self.sent_bodies: list[dict] = []
+        from headroom.ccr.response_handler import CCRResponseHandler
+
+        self.ccr_response_handler = CCRResponseHandler()
+        self.openai_pipeline = SimpleNamespace(
+            apply=lambda **kwargs: SimpleNamespace(
+                messages=[
+                    {
+                        "role": "user",
+                        "content": "compressed [100 items compressed to 1. Retrieve more: hash=aaaaaaaaaaaaaaaaaaaaaaaa]",
+                    }
+                ],
+                timing={},
+                tokens_before=10,
+                tokens_after=5,
+                transforms_applied=[],
+                waste_signals=SimpleNamespace(to_dict=lambda: {}),
+            )
+        )
+
+    def _gemini_contents_to_messages(
+        self, contents, system_instruction=None, *, include_function_responses=False
+    ):  # noqa: ANN001, ANN201
+        return GeminiHandlerMixin._gemini_contents_to_messages(
+            self,
+            contents,
+            system_instruction,
+            include_function_responses=include_function_responses,
+        )
+
+    def _messages_to_gemini_contents(self, messages):  # noqa: ANN001, ANN201
+        return GeminiHandlerMixin._messages_to_gemini_contents(self, messages)
+
+    async def _retry_request(self, method, url, headers, body, **kwargs):  # noqa: ANN001, ANN201
+        self.sent_bodies.append(body)
+        return next(self.responses)
+
+    async def _run_compression_in_executor(self, fn, *, timeout):  # noqa: ANN001, ANN201
+        return fn()
+
+
+def install_native_gemini_compression(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Decision:
+        should_compress = True
+        passthrough_reason = ""
+
+        def apply_to_tags(self, tags) -> None:  # noqa: ANN001
+            return None
+
+    monkeypatch.setattr(gemini_module.CompressionDecision, "decide", lambda **kwargs: Decision())
+
+
+def native_gemini_request(tools=None) -> dict:  # noqa: ANN001
+    return {
+        "contents": [{"role": "user", "parts": [{"text": "compressed input"}]}],
+        "generationConfig": {"temperature": 0.2},
+        **({"tools": tools} if tools is not None else {}),
+    }
+
+
+def native_ccr_response() -> FakeResponse:
+    return FakeResponse(
+        json_data={
+            "candidates": [
+                {
+                    "content": {
+                        "role": "model",
+                        "parts": [
+                            {
+                                "functionCall": {
+                                    "name": "headroom_retrieve",
+                                    "id": "call-1",
+                                    "args": {"hash": "aaaaaaaaaaaaaaaaaaaaaaaa"},
+                                }
+                            }
+                        ],
+                    }
+                }
+            ],
+            "usageMetadata": {"promptTokenCount": 5},
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_gemini_native_ccr_continuation(monkeypatch: pytest.MonkeyPatch) -> None:
+    install_native_gemini_compression(monkeypatch)
+    from headroom.ccr.response_handler import CCRToolResult
+
+    final = FakeResponse(
+        json_data={
+            "candidates": [{"content": {"role": "model", "parts": [{"text": "final answer"}]}}]
+        }
+    )
+    handler = NativeGeminiHandler([native_ccr_response(), final])
+    handler.ccr_response_handler._execute_retrieval = lambda call: CCRToolResult(
+        call.tool_call_id,
+        json.dumps({"hash": call.hash_key, "original_content": [{"type": "code"}]}),
+        True,
+        1,
+        "headroom_retrieve",
+    )
+
+    response = await handler.handle_gemini_generate_content(
+        FakeRequest(
+            json.dumps(native_gemini_request()),
+            headers={"content-type": "application/json", "x-goog-api-key": "secret"},
+            path="/v1beta/models/gemini-2.5-flash:generateContent",
+        ),
+        "gemini-2.5-flash",
+    )
+
+    assert response.status_code == 200
+    assert (
+        json.loads(response.body)["candidates"][0]["content"]["parts"][0]["text"] == "final answer"
+    ), response.body
+    assert len(handler.sent_bodies) == 2
+    continuation = handler.sent_bodies[1]["contents"]
+    assert continuation[-2]["role"] == "model"
+    assert continuation[-2]["parts"][0]["functionCall"]["name"] == "headroom_retrieve"
+    assert continuation[-1]["role"] == "user"
+    assert continuation[-1]["parts"][0]["functionResponse"]["name"] == "headroom_retrieve"
+    assert continuation[-1]["parts"][0]["functionResponse"]["id"] == "call-1"
+
+
+@pytest.mark.asyncio
+async def test_gemini_native_ccr_tools(monkeypatch: pytest.MonkeyPatch) -> None:
+    install_native_gemini_compression(monkeypatch)
+    # verify_ownership() (issue #2836) requires the marker's hash to be a
+    # real store entry; NativeGeminiHandler's mocked pipeline hand-types
+    # "hash=aaaa...aaaa" rather than compressing through the real store.
+    reset_compression_store()
+    get_compression_store().store(
+        original="original content",
+        compressed="compressed [100 items compressed to 1]",
+        explicit_hash="aaaaaaaaaaaaaaaaaaaaaaaa",
+    )
+    handler = NativeGeminiHandler(
+        [FakeResponse(json_data={"candidates": [{"content": {"parts": [{"text": "answer"}]}}]})]
+    )
+    tools = [
+        {"functionDeclarations": [{"name": "client_tool"}]},
+        {"functionDeclarations": [{"name": "second_tool"}]},
+        {"googleSearch": {}},
+        {"codeExecution": {}},
+    ]
+
+    await handler.handle_gemini_generate_content(
+        FakeRequest(
+            json.dumps(native_gemini_request(tools)),
+            headers={"content-type": "application/json"},
+            path="/v1beta/models/gemini-2.5-flash:generateContent",
+        ),
+        "gemini-2.5-flash",
+    )
+
+    forwarded_tools = handler.sent_bodies[0]["tools"]
+    assert forwarded_tools[2:] == tools[2:]
+    declarations = forwarded_tools[0]["functionDeclarations"]
+    assert {item["name"] for item in declarations} == {"client_tool", "headroom_retrieve"}
+    assert forwarded_tools[1]["functionDeclarations"] == [{"name": "second_tool"}]
+    reset_compression_store()
+
+
+@pytest.mark.asyncio
+async def test_gemini_native_ccr_does_not_duplicate_existing_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_native_gemini_compression(monkeypatch)
+    tools = [
+        {"functionDeclarations": [{"name": "client_tool"}]},
+        {"functionDeclarations": [{"name": "headroom_retrieve"}]},
+    ]
+    handler = NativeGeminiHandler(
+        [FakeResponse(json_data={"candidates": [{"content": {"parts": [{"text": "answer"}]}}]})]
+    )
+
+    await handler.handle_gemini_generate_content(
+        FakeRequest(
+            json.dumps(native_gemini_request(tools)),
+            headers={"content-type": "application/json"},
+            path="/v1beta/models/gemini-2.5-flash:generateContent",
+        ),
+        "gemini-2.5-flash",
+    )
+
+    names = [
+        declaration["name"]
+        for tool in handler.sent_bodies[0]["tools"]
+        for declaration in tool.get("functionDeclarations", [])
+    ]
+    assert names.count("headroom_retrieve") == 1
+
+
+@pytest.mark.asyncio
+async def test_gemini_native_ccr_does_not_inject_into_streaming_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_native_gemini_compression(monkeypatch)
+    handler = NativeGeminiHandler([FakeResponse()])
+    captured: dict[str, object] = {}
+
+    async def fake_stream(*args, **kwargs):  # noqa: ANN002, ANN003, ANN202
+        captured["body"] = args[2]
+        return FakeResponse()
+
+    monkeypatch.setattr(handler, "_stream_response", fake_stream, raising=False)
+    tools = [{"functionDeclarations": [{"name": "client_tool"}]}]
+    await handler.handle_gemini_generate_content(
+        FakeRequest(
+            json.dumps(native_gemini_request(tools)),
+            headers={"content-type": "application/json"},
+            path="/v1beta/models/gemini-2.5-flash:streamGenerateContent",
+        ),
+        "gemini-2.5-flash",
+    )
+
+    streamed_tools = captured["body"]["tools"]  # type: ignore[index]
+    names = [
+        declaration["name"]
+        for tool in streamed_tools
+        for declaration in tool.get("functionDeclarations", [])
+    ]
+    assert names == ["client_tool"]
+
+
+@pytest.mark.asyncio
+async def test_gemini_native_ccr_mixed(monkeypatch: pytest.MonkeyPatch) -> None:
+    install_native_gemini_compression(monkeypatch)
+    response_json = {
+        "candidates": [
+            {
+                "content": {
+                    "parts": [
+                        {
+                            "functionCall": {
+                                "name": "headroom_retrieve",
+                                "args": {"hash": "aaaaaaaaaaaaaaaaaaaaaaaa"},
+                            }
+                        },
+                        {"functionCall": {"name": "client_tool", "args": {}}},
+                    ]
+                }
+            }
+        ]
+    }
+    handler = NativeGeminiHandler([FakeResponse(json_data=response_json)])
+
+    response = await handler.handle_gemini_generate_content(
+        FakeRequest(
+            json.dumps(native_gemini_request()),
+            headers={"content-type": "application/json"},
+            path="/v1beta/models/gemini-2.5-flash:generateContent",
+        ),
+        "gemini-2.5-flash",
+    )
+
+    assert response.status_code == 200
+    assert len(handler.sent_bodies) == 1
+    assert json.loads(response.body) == response_json
+
+
+@pytest.mark.asyncio
+async def test_gemini_native_ccr_non_ccr_function_call_is_not_intercepted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_native_gemini_compression(monkeypatch)
+    response_json = {
+        "candidates": [
+            {"content": {"parts": [{"functionCall": {"name": "client_tool", "args": {}}}]}}
+        ]
+    }
+    handler = NativeGeminiHandler([FakeResponse(json_data=response_json)])
+
+    response = await handler.handle_gemini_generate_content(
+        FakeRequest(
+            json.dumps(native_gemini_request()),
+            headers={"content-type": "application/json"},
+            path="/v1beta/models/gemini-2.5-flash:generateContent",
+        ),
+        "gemini-2.5-flash",
+    )
+
+    assert response.status_code == 200
+    assert len(handler.sent_bodies) == 1
+    assert response.body == b"{}"
+
+
+@pytest.mark.asyncio
+async def test_gemini_native_ccr_continuation_error_preserves_upstream_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_native_gemini_compression(monkeypatch)
+    handler = NativeGeminiHandler(
+        [
+            native_ccr_response(),
+            FakeResponse(status_code=503, content=b"busy", headers={"retry-after": "2"}),
+        ]
+    )
+
+    response = await handler.handle_gemini_generate_content(
+        FakeRequest(
+            json.dumps(native_gemini_request()),
+            headers={"content-type": "application/json"},
+            path="/v1beta/models/gemini-2.5-flash:generateContent",
+        ),
+        "gemini-2.5-flash",
+    )
+
+    assert response.status_code == 503
+    assert response.body == b"busy"
+    assert response.headers["retry-after"] == "2"
+
+
+@pytest.mark.asyncio
+async def test_gemini_native_ccr_continuation_non_json_preserves_upstream_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_native_gemini_compression(monkeypatch)
+    handler = NativeGeminiHandler(
+        [native_ccr_response(), FakeResponse(status_code=200, content=b"upstream")]
+    )
+
+    response = await handler.handle_gemini_generate_content(
+        FakeRequest(
+            json.dumps(native_gemini_request()),
+            headers={"content-type": "application/json"},
+            path="/v1beta/models/gemini-2.5-flash:generateContent",
+        ),
+        "gemini-2.5-flash",
+    )
+
+    assert response.status_code == 200
+    assert response.body == b"upstream"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "original_content",
+    [[{"type": "code", "text": "print('x')"}], "plain text", {"key": "value"}, 42],
+    ids=["code-aware-array", "kompress-text", "mcp-object", "mcp-scalar"],
+)
+async def test_gemini_native_ccr_uses_real_retrieval_result_shape(
+    monkeypatch: pytest.MonkeyPatch, original_content
+) -> None:  # noqa: ANN001
+    install_native_gemini_compression(monkeypatch)
+    entry = CompressionEntry(
+        hash="a" * 24,
+        original_content=json.dumps(original_content),
+        compressed_content="compressed",
+        original_tokens=10,
+        compressed_tokens=2,
+        original_item_count=1,
+        compressed_item_count=1,
+        tool_name="headroom_retrieve",
+        tool_call_id="headroom_retrieve",
+        query_context=None,
+        created_at=0,
+    )
+
+    class Store:
+        def get_entry_status(self, hash_key, clean_expired=True):  # noqa: ANN001, ARG002
+            return {"status": "available", "default_ttl_seconds": 1800}
+
+        def retrieve(self, hash_key):  # noqa: ANN001, ARG002
+            return entry
+
+    monkeypatch.setattr(response_handler_module, "get_compression_store", lambda: Store())
+    handler = NativeGeminiHandler(
+        [
+            native_ccr_response(),
+            FakeResponse(json_data={"candidates": [{"content": {"parts": [{"text": "done"}]}}]}),
+        ]
+    )
+
+    response = await handler.handle_gemini_generate_content(
+        FakeRequest(
+            json.dumps(native_gemini_request()),
+            headers={"content-type": "application/json"},
+            path="/v1beta/models/gemini-2.5-flash:generateContent",
+        ),
+        "gemini-2.5-flash",
+    )
+
+    assert response.status_code == 200
+    function_response = handler.sent_bodies[1]["contents"][-1]["parts"][0]["functionResponse"]
+    assert function_response["response"]["original_content"] == json.dumps(original_content)
+
+
+@pytest.mark.asyncio
+async def test_gemini_native_ccr_preserves_non_ccr_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_native_gemini_compression(monkeypatch)
+    handler = NativeGeminiHandler([FakeResponse(status_code=503, content=b"busy")])
+
+    response = await handler.handle_gemini_generate_content(
+        FakeRequest(
+            json.dumps(native_gemini_request()),
+            headers={"content-type": "application/json"},
+            path="/v1beta/models/gemini-2.5-flash:generateContent",
+        ),
+        "gemini-2.5-flash",
+    )
+
+    assert response.status_code == 503
+    assert response.body == b"busy"
+
+
+@pytest.mark.asyncio
+async def test_gemini_native_ccr_residual(monkeypatch: pytest.MonkeyPatch) -> None:
+    install_native_gemini_compression(monkeypatch)
+    from headroom.ccr.response_handler import CCRToolResult
+
+    handler = NativeGeminiHandler([native_ccr_response()] * 4)
+    handler.ccr_response_handler._execute_retrieval = lambda call: CCRToolResult(
+        "headroom_retrieve", "still unresolved", True, 0
+    )
+
+    response = await handler.handle_gemini_generate_content(
+        FakeRequest(
+            json.dumps(native_gemini_request()),
+            headers={"content-type": "application/json"},
+            path="/v1beta/models/gemini-2.5-flash:generateContent",
+        ),
+        "gemini-2.5-flash",
+    )
+
+    assert response.status_code == 502
 
 
 def install_batch_support_modules(
@@ -204,6 +666,40 @@ async def test_compress_batch_jsonl_without_optimization_handles_invalid_lines(
         "savings_percent": 0.0,
         "errors": 1,
     }
+
+
+@pytest.mark.asyncio
+async def test_compress_batch_jsonl_handles_non_object_lines(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A JSONL line that is valid JSON but not a request object (array/string/
+    # null), or a request whose `body` isn't a dict, must pass through instead
+    # of crashing the whole batch (`.get` on a non-dict raises AttributeError,
+    # which the JSONDecodeError guard does not catch).
+    install_batch_support_modules(monkeypatch, tokenizer_count=12)
+    handler = DummyBatchHandler()
+    content = "\n".join(
+        [
+            json.dumps(
+                {"body": {"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}}
+            ),
+            json.dumps([1, 2, 3]),
+            json.dumps("hello"),
+            "null",
+            json.dumps({"body": "not-a-dict"}),
+        ]
+    )
+
+    lines, stats = await handler._compress_batch_jsonl(content, "req-1")
+
+    assert len(lines) == 5
+    assert json.loads(lines[1]) == [1, 2, 3]
+    assert json.loads(lines[2]) == "hello"
+    assert json.loads(lines[3]) is None
+    assert json.loads(lines[4]) == {"body": "not-a-dict"}
+    assert stats["total_requests"] == 5
+    # None of these are JSON decode errors, so the error counter stays at 0.
+    assert stats["errors"] == 0
 
 
 @pytest.mark.asyncio
@@ -931,6 +1427,184 @@ async def test_handle_google_batch_create_covers_passthrough_revert_and_store_fa
     optimized = seen_bodies[0]["batch"]["input_config"]["requests"]["requests"][2]["request"]
     assert optimized["contents"][0] == {"parts": [{"text": "new"}]}
     assert optimized["systemInstruction"] == {"parts": [{"text": "sys"}]}
+
+
+@pytest.mark.asyncio
+async def test_handle_google_batch_create_preserves_functioncall_response_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A batch request that interleaves text turns with text-less
+    functionCall/functionResponse entries must reach Google with all entries
+    intact and in order. The old raw-index restore loop overwrote the model's
+    answer with the functionCall and dropped the functionResponse."""
+
+    class RealConvHandler(batch_module.BatchHandlerMixin, GeminiHandlerMixin):
+        # Real Gemini converters + _rebuild_gemini_contents (no stubs), so the
+        # actual index interleaving runs.
+        GEMINI_API_URL = "https://gemini.example"
+
+        def __init__(self) -> None:
+            self.http_client = FakeHttpClient()
+            self.metrics = FakeMetrics()
+            self.config = SimpleNamespace(
+                optimize=True, ccr_inject_tool=False, ccr_inject_system_instructions=False
+            )
+            self.openai_provider = SimpleNamespace(get_context_limit=lambda m: 8192)
+            # No-op pipeline: return the messages unchanged, no token inflation.
+            self.openai_pipeline = SimpleNamespace(
+                apply=lambda **kw: SimpleNamespace(
+                    messages=kw["messages"], timing={}, tokens_before=100, tokens_after=100
+                )
+            )
+            self.captured_body: dict | None = None
+
+        async def _next_request_id(self) -> str:
+            return "req-1"
+
+        async def _record_request_outcome(self, outcome) -> None:  # noqa: ANN001
+            pass
+
+        def _extract_tags(self, headers: dict) -> dict[str, str]:
+            return {}
+
+        async def _run_compression_in_executor(self, fn, *, timeout):  # noqa: ANN001, ANN201
+            return fn()
+
+        async def _store_google_batch_context(self, *a, **k) -> None:  # noqa: ANN002, ANN003
+            pass
+
+        async def _retry_request(self, method, url, headers, body, **kwargs):  # noqa: ANN001, ANN201
+            # Capture the (in-place mutated) forwarded batch body for assertions.
+            self.captured_body = body
+            return FakeResponse(status_code=200, content=b"{}", json_data={"name": "batches/1"})
+
+    handler = RealConvHandler()
+
+    contents = [
+        {"role": "user", "parts": [{"text": "What's the weather in Paris?"}]},
+        {
+            "role": "model",
+            "parts": [{"functionCall": {"name": "get_weather", "args": {"city": "Paris"}}}],
+        },
+        {
+            "role": "user",
+            "parts": [{"functionResponse": {"name": "get_weather", "response": {"temp_c": 18}}}],
+        },
+        {"role": "model", "parts": [{"text": "It's 18C and cloudy in Paris."}]},
+    ]
+    batch_body = {
+        "batch": {
+            "input_config": {
+                "requests": {"requests": [{"request": {"contents": contents}, "metadata": {}}]}
+            }
+        }
+    }
+
+    async def payload(request):  # noqa: ANN001, ANN201
+        return batch_body
+
+    monkeypatch.setattr("headroom.proxy.helpers._read_request_json", payload)
+
+    resp = await handler.handle_google_batch_create(FakeRequest("{}"), "gemini-pro")
+    assert resp.status_code == 200
+
+    out = handler.captured_body["batch"]["input_config"]["requests"]["requests"][0]["request"][
+        "contents"
+    ]
+    # All four entries survive in order. The old loop produced only two, dropping
+    # the functionResponse and overwriting the model answer with the functionCall.
+    assert len(out) == 4
+    assert "text" in out[0]["parts"][0]
+    assert out[1]["parts"][0].get("functionCall", {}).get("name") == "get_weather"
+    assert out[2]["parts"][0].get("functionResponse", {}).get("name") == "get_weather"
+    assert "Paris" in out[3]["parts"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_handle_google_batch_create_preserves_sibling_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A batch request whose tools array carries googleSearch / codeExecution
+    alongside functionDeclarations must reach Google with those siblings intact.
+    The old code collapsed the whole array to a single functionDeclarations
+    entry, silently disabling Google Search and code execution."""
+
+    class RealConvHandler(batch_module.BatchHandlerMixin, GeminiHandlerMixin):
+        GEMINI_API_URL = "https://gemini.example"
+
+        def __init__(self) -> None:
+            self.http_client = FakeHttpClient()
+            self.metrics = FakeMetrics()
+            self.config = SimpleNamespace(
+                optimize=True, ccr_inject_tool=False, ccr_inject_system_instructions=False
+            )
+            self.openai_provider = SimpleNamespace(get_context_limit=lambda m: 8192)
+            self.openai_pipeline = SimpleNamespace(
+                apply=lambda **kw: SimpleNamespace(
+                    messages=kw["messages"], timing={}, tokens_before=100, tokens_after=100
+                )
+            )
+            self.captured_body: dict | None = None
+
+        async def _next_request_id(self) -> str:
+            return "req-1"
+
+        async def _record_request_outcome(self, outcome) -> None:  # noqa: ANN001
+            pass
+
+        def _extract_tags(self, headers: dict) -> dict[str, str]:
+            return {}
+
+        async def _run_compression_in_executor(self, fn, *, timeout):  # noqa: ANN001, ANN201
+            return fn()
+
+        async def _store_google_batch_context(self, *a, **k) -> None:  # noqa: ANN002, ANN003
+            pass
+
+        async def _retry_request(self, method, url, headers, body, **kwargs):  # noqa: ANN001, ANN201
+            self.captured_body = body
+            return FakeResponse(status_code=200, content=b"{}", json_data={"name": "batches/1"})
+
+    handler = RealConvHandler()
+
+    tools = [
+        {"functionDeclarations": [{"name": "get_weather"}]},
+        {"googleSearch": {}},
+        {"codeExecution": {}},
+    ]
+    batch_body = {
+        "batch": {
+            "input_config": {
+                "requests": {
+                    "requests": [
+                        {
+                            "request": {
+                                "contents": [{"role": "user", "parts": [{"text": "hello there"}]}],
+                                "tools": tools,
+                            },
+                            "metadata": {},
+                        }
+                    ]
+                }
+            }
+        }
+    }
+
+    async def payload(request):  # noqa: ANN001, ANN201
+        return batch_body
+
+    monkeypatch.setattr("headroom.proxy.helpers._read_request_json", payload)
+
+    resp = await handler.handle_google_batch_create(FakeRequest("{}"), "gemini-pro")
+    assert resp.status_code == 200
+
+    out_tools = handler.captured_body["batch"]["input_config"]["requests"]["requests"][0][
+        "request"
+    ]["tools"]
+    keys = [next(iter(entry)) for entry in out_tools]
+    assert "googleSearch" in keys
+    assert "codeExecution" in keys
+    assert "functionDeclarations" in keys
 
 
 @pytest.mark.asyncio

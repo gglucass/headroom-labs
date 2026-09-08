@@ -1,8 +1,7 @@
 """Codex transcript audit — read-pattern analysis for shell-based clients.
 
 Codex has no structured Read tool: it reads files through shell commands
-(``cat``, ``sed -n 'a,bp'``, ``head``/``tail``, ``nl``) — frequently
-wrapped by rtk (``rtk read <file>``, ``rtk proxy <cmd>``). This module
+(``cat``, ``sed -n 'a,bp'``, ``head``/``tail``, ``nl``). This module
 classifies ``exec_command`` calls in Codex session transcripts
 (``~/.codex/sessions/**/*.jsonl``) and measures the read pattern so the
 read-maturation mechanism can be sized for Codex workloads.
@@ -23,11 +22,13 @@ from collections import Counter
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-# Programs whose output is file content. "read" is rtk's read command.
-_READ_PROGS = frozenset({"cat", "sed", "head", "tail", "nl", "bat", "more", "read"})
+# Programs whose output is file content.
+_READ_PROGS = frozenset({"cat", "sed", "head", "tail", "nl", "bat", "more"})
 _SEARCH_PROGS = frozenset({"rg", "grep", "ugrep", "ag", "fd", "find"})
 _BUILD_PROGS = frozenset({"python", "python3", "pytest", "cargo", "npm", "make", "uv", "ruff"})
 _RANGE_RE = re.compile(r"^\d+([,:-]\d+)?p?$")
+_PATCH_FILE_RE = re.compile(r"^\*\*\* (?:Add|Update|Delete) File: (.+)$", re.MULTILINE)
+_REDIRECT_RE = re.compile(r"(?:^|\s)(?:>|>>)\s*([^\s;&|]+)")
 
 MATURE_FLOOR = 2048  # ReadMaturationConfig.min_size_bytes
 
@@ -55,47 +56,82 @@ class CodexAuditReport:
         return asdict(self)
 
 
-def strip_wrappers(cmd: str) -> str:
-    """Peel rtk wrappers: ``rtk <cmd>`` and ``rtk proxy <cmd>``."""
-    c = cmd.strip()
-    while True:
-        if c.startswith("rtk "):
-            c = c[4:].strip()
+def _resolve_path(path: str | None, workdir: str = "") -> str | None:
+    if not path:
+        return None
+    p = path.strip().strip("'\"")
+    if not p or p in {"-", "&1", "&2"}:
+        return None
+    if workdir and not p.startswith("/"):
+        return f"{workdir.rstrip('/')}/{p}"
+    return p
+
+
+def _path_candidates(tokens: list[str]) -> list[str]:
+    return [
+        t
+        for t in tokens
+        if not t.startswith("-")
+        and not _RANGE_RE.match(t.strip("'\""))
+        and ("/" in t or "." in t.rsplit("/", 1)[-1])
+    ]
+
+
+def _extract_edit_path(cmd: str, tokens: list[str], workdir: str = "") -> str | None:
+    patch_match = _PATCH_FILE_RE.search(cmd)
+    if patch_match:
+        return _resolve_path(patch_match.group(1), workdir)
+
+    redirect_match = _REDIRECT_RE.search(cmd)
+    if redirect_match:
+        return _resolve_path(redirect_match.group(1), workdir)
+
+    parts = re.split(r"&&|\|", cmd)
+    for part in parts:
+        try:
+            ptoks = shlex.split(part.strip())
+        except ValueError:
+            ptoks = part.strip().split()
+        if not ptoks:
             continue
-        if c.startswith("proxy "):
-            c = c[6:].strip()
-            continue
-        return c
+        prog = ptoks[0].rsplit("/", 1)[-1]
+        if prog == "tee":
+            paths = _path_candidates(ptoks[1:])
+            if paths:
+                return _resolve_path(paths[0], workdir)
+
+    if tokens:
+        prog = tokens[0].rsplit("/", 1)[-1]
+        if prog == "sed" and any(t == "-i" or t.startswith("-i") for t in tokens[1:]):
+            paths = _path_candidates(tokens[1:])
+            if paths:
+                return _resolve_path(paths[-1], workdir)
+    return None
 
 
 def classify_command(cmd: str, workdir: str = "") -> tuple[str, str | None, bool]:
     """Classify a shell command: (category, file_path|None, is_partial).
 
     Categories: read, search, git, edit, build/test, compound, other.
-    For reads, the path is resolved against ``workdir`` when relative.
+    For reads and edits, the path is resolved against ``workdir`` when relative.
     """
-    c = strip_wrappers(cmd)
-    if "apply_patch" in c:
-        return "edit", None, False
+    c = cmd.strip()
     try:
         toks = shlex.split(c)
     except ValueError:
         toks = c.split()
     if not toks:
         return "other", None, False
+
+    edit_path = _extract_edit_path(c, toks, workdir)
+    if edit_path or "apply_patch" in c:
+        return "edit", edit_path, False
+
     prog = toks[0].rsplit("/", 1)[-1]
 
     if prog in _READ_PROGS:
-        candidates = [
-            t
-            for t in toks[1:]
-            if not t.startswith("-") and ("/" in t or "." in t.rsplit("/", 1)[-1])
-        ]
-        # Range tokens like 1,200p (sed) are not paths.
-        candidates = [t for t in candidates if not _RANGE_RE.match(t.strip("'\""))]
-        fpath = candidates[0] if candidates else None
-        if fpath and workdir and not fpath.startswith("/"):
-            fpath = f"{workdir.rstrip('/')}/{fpath}"
+        candidates = _path_candidates(toks[1:])
+        fpath = _resolve_path(candidates[0], workdir) if candidates else None
         partial = (
             prog in ("sed", "head", "tail")
             or any(_RANGE_RE.match(t.strip("'\"")) for t in toks[1:])

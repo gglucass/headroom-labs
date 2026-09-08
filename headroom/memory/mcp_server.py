@@ -76,7 +76,9 @@ _TOOLS = [
         description=(
             "Save information to persistent memory for future sessions. "
             "Use this for decisions, conventions, architecture context, "
-            "user preferences, project facts, or anything worth remembering.\n\n"
+            "user preferences, project facts, or anything worth remembering. "
+            "Saving a similar fact does not replace an existing memory; corrections "
+            "must use an explicit update path with the existing memory ID.\n\n"
             "IMPORTANT: Break information into atomic facts — one fact per "
             "entry in the 'facts' array. Each fact should be a single, "
             "self-contained statement that answers one question. "
@@ -159,34 +161,96 @@ def create_memory_server(db_path: str, user_id: str = "default") -> Server:
 
     server = Server("headroom-memory")
     _backend: LocalBackend | None = None
-    _init_task: asyncio.Task | None = None
+    _init_task: asyncio.Task[LocalBackend] | None = None
+    _close_lock = asyncio.Lock()
 
     async def _init_backend() -> LocalBackend:
         """Initialize backend with ONNX embedder (fast, no PyTorch)."""
-        nonlocal _backend
+        nonlocal _backend, _init_task
         config = LocalBackendConfig(db_path=db_path, embedder_backend="onnx")
-        _backend = LocalBackend(config)
-        await _warm_up_backend(_backend, user_id)
+        backend = LocalBackend(config)
+        init_task = asyncio.current_task()
+        try:
+            await _warm_up_backend(backend, user_id)
+        except (Exception, asyncio.CancelledError):
+            try:
+                await backend.close()
+            except Exception as cleanup_error:
+                logger.warning("Memory MCP: failed backend cleanup: %s", cleanup_error)
+            finally:
+                if _init_task is init_task:
+                    _init_task = None
+            raise
+
+        _backend = backend
+        if _init_task is init_task:
+            _init_task = None
         logger.info(f"Memory MCP: ready (db={db_path}, user={user_id})")
-        return _backend
+        return backend
+
+    def _handle_backend_init_done(init_task: asyncio.Task[LocalBackend]) -> None:
+        """Clear and log failed background initialization tasks."""
+        nonlocal _init_task
+        if init_task.cancelled():
+            if _init_task is init_task:
+                _init_task = None
+            return
+        error = init_task.exception()
+        if error is not None:
+            if _init_task is init_task:
+                _init_task = None
+            logger.warning("Memory MCP: backend initialization failed: %s", error)
+
+    def _start_backend_init() -> asyncio.Task[LocalBackend]:
+        """Start backend initialization once for all concurrent callers."""
+        nonlocal _init_task
+        if _init_task is None:
+            _init_task = asyncio.create_task(_init_backend())
+            _init_task.add_done_callback(_handle_backend_init_done)
+        return _init_task
 
     async def _get_backend() -> LocalBackend:
         nonlocal _backend, _init_task
         if _backend is not None:
             return _backend
-        # Wait for background init if it's running
-        if _init_task is not None:
-            await _init_task
-            return _backend  # type: ignore[return-value]
-        # Fallback: init inline (shouldn't normally happen)
-        return await _init_backend()
+
+        init_task = _start_backend_init()
+        try:
+            return await asyncio.shield(init_task)
+        except asyncio.CancelledError:
+            if init_task.done() and _init_task is init_task:
+                _init_task = None
+            raise
+        except Exception:
+            if _init_task is init_task:
+                _init_task = None
+            raise
+
+    async def _close_backend() -> None:
+        """Cancel backend initialization and close any initialized backend."""
+        nonlocal _backend, _init_task
+        async with _close_lock:
+            init_task = _init_task
+            if init_task is not None:
+                if not init_task.done():
+                    init_task.cancel()
+                await asyncio.gather(init_task, return_exceptions=True)
+                if _init_task is init_task:
+                    _init_task = None
+
+            backend = _backend
+            _backend = None
+            if backend is not None:
+                try:
+                    await backend.close()
+                except Exception as cleanup_error:
+                    logger.warning("Memory MCP: failed backend cleanup: %s", cleanup_error)
 
     @server.list_tools()
     async def list_tools() -> list[Tool]:
         # Kick off background init on first list_tools (called at MCP handshake)
-        nonlocal _init_task
-        if _backend is None and _init_task is None:
-            _init_task = asyncio.create_task(_init_backend())
+        if _backend is None:
+            _start_backend_init()
         return _TOOLS
 
     @server.call_tool()
@@ -200,6 +264,7 @@ def create_memory_server(db_path: str, user_id: str = "default") -> Server:
 
         return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
+    server._headroom_close = _close_backend  # type: ignore[attr-defined]
     return server
 
 
@@ -245,6 +310,12 @@ async def _handle_search(
         # Trim to requested top_k
         active_results = active_results[:top_k]
 
+        try:
+            await backend.record_access([r.memory.id for r in active_results])
+        except Exception as e:
+            # Usage metadata must never make a successful retrieval fail.
+            logger.warning(f"Memory MCP: failed to record access: {e}")
+
         lines = []
         for i, r in enumerate(active_results, 1):
             score = f"{r.score:.2f}" if hasattr(r, "score") else "?"
@@ -256,11 +327,6 @@ async def _handle_search(
     except Exception as e:
         logger.error(f"memory_search failed: {e}")
         return [TextContent(type="text", text=f"Search error: {e}")]
-
-
-# Similarity threshold for auto-supersession: if a new memory is this
-# similar to an existing one, it replaces (supersedes) the old one.
-_SUPERSEDE_SIMILARITY = 0.70
 
 
 async def _handle_save(
@@ -288,44 +354,16 @@ async def _handle_save(
             if not fact:
                 continue
 
-            # Check for semantically similar existing memory to auto-supersede
-            superseded_id: str | None = None
-            try:
-                existing = await backend.search_memories(
-                    query=fact,
-                    user_id=user_id,
-                    top_k=3,
-                )
-                for r in existing:
-                    if getattr(r.memory, "superseded_by", None):
-                        continue
-                    if r.score >= _SUPERSEDE_SIMILARITY:
-                        superseded_id = r.memory.id
-                        logger.info(
-                            f"Memory MCP: auto-superseding [{r.memory.id[:8]}] "
-                            f"(similarity={r.score:.2f}): {r.memory.content[:60]}"
-                        )
-                        break
-            except Exception:
-                pass
-
-            if superseded_id:
-                memory = await backend.update_memory(
-                    memory_id=superseded_id,
-                    new_content=fact,
-                )
-                results_lines.append(
-                    f"  updated [{superseded_id[:8]}→{memory.id[:8]}]: {fact[:60]}"
-                )
-                superseded += 1
-            else:
-                memory = await backend.save_memory(
-                    content=fact,
-                    user_id=user_id,
-                    importance=importance,
-                )
-                results_lines.append(f"  saved [{memory.id[:8]}]: {fact[:60]}")
-                saved += 1
+            # Similarity is a retrieval signal, not proof that two memories
+            # represent versions of the same fact. Only explicit update paths
+            # with a caller-supplied memory ID may create a supersession chain.
+            memory = await backend.save_memory(
+                content=fact,
+                user_id=user_id,
+                importance=importance,
+            )
+            results_lines.append(f"  saved [{memory.id[:8]}]: {fact[:60]}")
+            saved += 1
 
         summary = f"Saved {saved} new, updated {superseded} existing ({saved + superseded} total)"
         return [TextContent(type="text", text=summary + "\n" + "\n".join(results_lines))]
@@ -341,8 +379,13 @@ async def _handle_save(
 
 async def _run(db_path: str, user_id: str) -> None:
     server = create_memory_server(db_path, user_id)
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(read_stream, write_stream, server.create_initialization_options())
+    try:
+        async with stdio_server() as (read_stream, write_stream):
+            await server.run(read_stream, write_stream, server.create_initialization_options())
+    finally:
+        close_backend = getattr(server, "_headroom_close", None)
+        if close_backend is not None:
+            await close_backend()
 
 
 def _memory_mcp_startup_context(

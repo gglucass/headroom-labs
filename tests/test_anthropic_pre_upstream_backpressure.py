@@ -21,11 +21,14 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import os
 import time
+from datetime import datetime
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock
 
 import anyio
@@ -36,7 +39,7 @@ from fastapi.testclient import TestClient
 
 from headroom.cli.proxy import proxy as proxy_cli
 from headroom.proxy.handlers.anthropic import AnthropicHandlerMixin
-from headroom.proxy.models import ProxyConfig
+from headroom.proxy.models import CacheEntry, ProxyConfig
 from headroom.proxy.server import HeadroomProxy, create_app
 
 # --------------------------------------------------------------------------- #
@@ -72,10 +75,13 @@ class _DummyMetrics:
     async def record_failed(self, **kwargs) -> None:
         return None
 
+    def record_compression_failed(self, reason: str) -> None:
+        return None
+
 
 class _ResponseStub:
-    def __init__(self) -> None:
-        self.status_code = 200
+    def __init__(self, status_code: int = 200) -> None:
+        self.status_code = status_code
         self.headers = {"content-type": "application/json"}
         self._text = json.dumps(
             {
@@ -115,6 +121,8 @@ class _DummyAnthropicHandler(AnthropicHandlerMixin):
         anthropic_pre_upstream_sem: asyncio.Semaphore | None = None,
         upstream_delay_s: float = 0.0,
         raise_during_critical: bool = False,
+        security: Any = None,
+        upstream_status: int = 200,
     ) -> None:
         self.rate_limiter = None
         self.metrics = _DummyMetrics()
@@ -140,7 +148,8 @@ class _DummyAnthropicHandler(AnthropicHandlerMixin):
         self.cost_tracker = None
         self.memory_handler = None
         self.cache = None
-        self.security = None
+        self.security = security
+        self._upstream_status = upstream_status
         self.ccr_context_tracker = None
         self.ccr_injector = None
         self.ccr_response_handler = None
@@ -157,6 +166,14 @@ class _DummyAnthropicHandler(AnthropicHandlerMixin):
         self.session_tracker_store = SimpleNamespace(
             compute_session_id=lambda *a, **k: "sess-1",
             get_or_create=lambda *a, **k: SimpleNamespace(
+                _cached_token_count=0,
+                get_frozen_message_count=lambda: 0,
+                get_last_original_messages=lambda: [],
+                get_last_forwarded_messages=lambda: [],
+                update_from_response=lambda *a, **k: None,
+                record_request=lambda *a, **k: None,
+            ),
+            resolve_tracker=lambda *a, **k: SimpleNamespace(
                 _cached_token_count=0,
                 get_frozen_message_count=lambda: 0,
                 get_last_original_messages=lambda: [],
@@ -258,7 +275,7 @@ class _DummyAnthropicHandler(AnthropicHandlerMixin):
         if self._upstream_delay_s > 0:
             await asyncio.sleep(self._upstream_delay_s)
         self.upstream_exit_times.append(time.perf_counter())
-        return _ResponseStub()
+        return _ResponseStub(status_code=self._upstream_status)
 
     def _get_compression_cache(self, session_id):
         return SimpleNamespace(
@@ -836,6 +853,9 @@ class _CostTrackerBlock:
     def check_budget(self):
         return False, 0
 
+    def budget_denial_detail(self):
+        return "Budget exceeded for daily period"
+
     def record_tokens(self, *a, **k):
         return None
 
@@ -851,12 +871,20 @@ class _SecurityBlock:
 
 
 class _CacheHit:
-    class _Entry:
-        response_headers: dict = {}
-        response_body: bytes = b'{"id":"cached","type":"message","role":"assistant","content":[{"type":"text","text":"hit"}]}'
-
     def __init__(self) -> None:
-        self._entry = self._Entry()
+        # A real ``CacheEntry`` rather than a hand-rolled stand-in: the
+        # cache-hit path reads more of the entry than just the body (it logs
+        # the entry's age and hit count), and a partial fake drifts out of
+        # sync with it silently.
+        self._entry = CacheEntry(
+            response_body=(
+                b'{"id":"cached","type":"message","role":"assistant",'
+                b'"content":[{"type":"text","text":"hit"}]}'
+            ),
+            response_headers={},
+            created_at=datetime.now(),
+            ttl_seconds=3600,
+        )
 
     async def get(self, _messages, _model, **_kwargs):
         return self._entry
@@ -928,6 +956,212 @@ def test_early_exit_paths_release_semaphore_under_contention(scenario):
             assert sem._value == original_value, (
                 f"{scenario}: semaphore leak got={sem._value}, want={original_value}"
             )
+
+    with _tokenizer_patch():
+        anyio.run(_run)
+
+
+# --------------------------------------------------------------------------- #
+# Enterprise security response scan must not launder a non-2xx upstream        #
+# --------------------------------------------------------------------------- #
+
+
+class _PassthroughSecurity:
+    """Minimal enterprise-security stub: scan_request returns a truthy context
+    (so the response-scan branch is armed) and scan_response leaves the body
+    unchanged."""
+
+    def scan_request(self, messages, ctx):
+        return messages, {"anonymization": {}}
+
+    def scan_response(self, resp_json, ctx):
+        return resp_json
+
+
+@pytest.mark.parametrize("upstream_status", [429, 529, 400])
+def test_security_scan_preserves_non_200_upstream_status(upstream_status):
+    """A non-2xx upstream must reach the client with its real status even when
+    enterprise security is scanning responses.
+
+    The response-scan branch rebuilt the reply as httpx.Response(status_code=200)
+    and returned it without checking the upstream status, so a rate-limit (429),
+    overloaded (529), or 4xx error was laundered into an HTTP 200 and the
+    client's retry/backoff never fired. The branch is now gated on a 200 upstream
+    like the sibling CCR/cache blocks.
+    """
+    sem = asyncio.Semaphore(2)
+    handler = _DummyAnthropicHandler(
+        anthropic_pre_upstream_sem=sem,
+        security=_PassthroughSecurity(),
+        upstream_status=upstream_status,
+    )
+    request = _build_request(
+        {
+            "model": "claude-3-5-sonnet-latest",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+        {"authorization": "Bearer sk-ant-api-test"},
+    )
+
+    with _tokenizer_patch():
+        response = anyio.run(handler.handle_anthropic_messages, request)
+
+    assert response.status_code == upstream_status
+
+
+def test_security_scan_still_returns_200_for_ok_upstream():
+    """Guard the positive case: a 200 upstream is still scanned and returned 200."""
+    sem = asyncio.Semaphore(2)
+    handler = _DummyAnthropicHandler(
+        anthropic_pre_upstream_sem=sem,
+        security=_PassthroughSecurity(),
+        upstream_status=200,
+    )
+    request = _build_request(
+        {
+            "model": "claude-3-5-sonnet-latest",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+        {"authorization": "Bearer sk-ant-api-test"},
+    )
+
+    with _tokenizer_patch():
+        response = anyio.run(handler.handle_anthropic_messages, request)
+
+    assert response.status_code == 200
+
+
+# --------------------------------------------------------------------------- #
+# Response cache must key on the looked-up messages, not the mutated ones      #
+# --------------------------------------------------------------------------- #
+
+
+class _RecordingCache:
+    """Records the messages passed to get() and set() so the test can assert the
+    response is cached under the same key it was looked up by."""
+
+    def __init__(self) -> None:
+        self.get_messages = None
+        self.set_messages = None
+
+    async def get(self, messages, model, **fields):
+        self.get_messages = copy.deepcopy(messages)
+        return None  # force a miss so the upstream response gets cached
+
+    async def set(self, messages, model, content, headers, **kwargs):
+        self.set_messages = copy.deepcopy(messages)
+
+
+class _MutatingSecurity:
+    """Stands in for an enterprise-security scanner that rewrites (anonymizes)
+    the request messages, reproducing the get -> mutate -> set hazard."""
+
+    def scan_request(self, messages, ctx):
+        mutated = [dict(m, content="MUTATED") for m in messages]
+        return mutated, {"anonymization": {}}
+
+    def scan_response(self, resp_json, ctx):
+        return resp_json
+
+
+def test_response_cache_keys_on_lookup_messages_not_mutated():
+    """The response must be cached under the same messages it was looked up by.
+
+    `messages` is reassigned after the cache.get (here by the security scan), so
+    caching under the live `messages` stores the entry under a different key than
+    it was read by -- the cache never hits and fills with unreachable entries.
+    """
+    sem = asyncio.Semaphore(2)
+    handler = _DummyAnthropicHandler(anthropic_pre_upstream_sem=sem)
+    cache = _RecordingCache()
+    handler.cache = cache
+    handler.security = _MutatingSecurity()
+
+    request = _build_request(
+        {
+            "model": "claude-3-5-sonnet-latest",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+        {"authorization": "Bearer sk-ant-api-test"},
+    )
+
+    with _tokenizer_patch():
+        anyio.run(handler.handle_anthropic_messages, request)
+
+    assert cache.get_messages is not None, "cache.get was not called"
+    assert cache.set_messages is not None, "cache.set was not called"
+    # Same messages at get and set -> same key -> the cache can actually hit.
+    assert cache.set_messages == cache.get_messages
+    # And specifically the raw lookup messages, not the scanner's rewrite.
+    assert cache.set_messages == [{"role": "user", "content": "hello"}]
+
+
+# --------------------------------------------------------------------------- #
+# Backpressure must not bust the provider prompt cache: the compression        #
+# pipeline is skipped under saturation, but the previously-forwarded          #
+# (compressed) prefix must still be replayed byte-identical. Forwarding raw   #
+# originals would mismatch the bytes the provider cached — busting every      #
+# gated session's prefix exactly when the proxy is busiest.                   #
+# --------------------------------------------------------------------------- #
+
+
+def test_backpressure_passthrough_replays_cached_prefix(stage_log_capture):
+    prev_original = [{"role": "user", "content": "ORIGINAL " * 6000}]
+    prev_forwarded = [{"role": "user", "content": "[compressed-form]"}]
+
+    async def _run() -> None:
+        sem = asyncio.Semaphore(1)
+        await sem.acquire()  # saturate: the request's acquire will time out
+        handler = _DummyAnthropicHandler(anthropic_pre_upstream_sem=sem)
+        handler.config.optimize = True
+        handler.config.anthropic_pre_upstream_acquire_timeout_seconds = 0.01
+        handler.anthropic_pipeline = SimpleNamespace(apply=MagicMock())
+
+        tracker = SimpleNamespace(
+            _cached_token_count=0,
+            get_frozen_message_count=lambda: 0,
+            get_last_original_messages=lambda: copy.deepcopy(prev_original),
+            get_last_forwarded_messages=lambda: copy.deepcopy(prev_forwarded),
+            update_from_response=lambda *a, **k: None,
+            record_request=lambda *a, **k: None,
+        )
+        handler.session_tracker_store = SimpleNamespace(
+            compute_session_id=lambda *a, **k: "sess-1",
+            get_or_create=lambda *a, **k: tracker,
+            resolve_tracker=lambda *a, **k: tracker,
+        )
+
+        forwarded_bodies: list[dict] = []
+        orig_retry = handler._retry_request
+
+        async def _capturing_retry(method, url, headers, body, **kw):
+            forwarded_bodies.append(copy.deepcopy(body))
+            return await orig_retry(method, url, headers, body, **kw)
+
+        handler._retry_request = _capturing_retry
+
+        req = _build_request(
+            {
+                "model": "claude-3-5-sonnet-latest",
+                "messages": copy.deepcopy(prev_original)
+                + [{"role": "user", "content": "next turn"}],
+            },
+            {"authorization": "Bearer sk-ant-api-test"},
+        )
+        try:
+            response = await handler.handle_anthropic_messages(req)
+            assert response.status_code == 200
+            # Saturation must still skip the CPU-bound pipeline...
+            assert not handler.anthropic_pipeline.apply.called
+        finally:
+            sem.release()
+
+        assert forwarded_bodies, "request never reached upstream"
+        sent = forwarded_bodies[-1]["messages"]
+        # ...but the forwarded prefix must be last turn's exact bytes, not the
+        # raw original (which the provider never cached).
+        assert sent[0]["content"] == "[compressed-form]"
+        assert sent[-1]["content"] == "next turn"
 
     with _tokenizer_patch():
         anyio.run(_run)

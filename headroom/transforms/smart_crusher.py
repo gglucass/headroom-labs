@@ -46,14 +46,17 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any
 
 from ..ccr.tool_injection import CCR_TOOL_NAME
-from ..config import CCRConfig, TransformResult
+from ..config import CCRConfig, TransformResult, is_tool_excluded
 from ..tokenizer import Tokenizer
 from ..utils import compute_short_hash, create_tool_digest_marker, deep_copy_messages
 from .base import Transform
+from .content_detector import normalize_concatenated_json
 
 logger = logging.getLogger(__name__)
 
@@ -209,6 +212,29 @@ class SmartCrusherConfig:
     compaction_min_buckets: int = 2
     compaction_max_buckets: int = 8
 
+    # ─── Audit-safe mode (#1705) ───────────────────────────────────────
+    # Opt-in. `crush_array_json`'s row selection (Rust-side statistical
+    # sampling) has no concept of "this row must not disappear from the
+    # prompt" — a rare compliance/audit-trail row can be sampled out or
+    # replaced by a `<<ccr:...>>` retrieval marker like any other row.
+    # When `audit_safe=True` and `protected_patterns` is non-empty,
+    # `crush_array_json` scans rows for pattern matches before
+    # compression, then guarantees matched rows survive in the
+    # compressed output verbatim — not dropped, not marker-only. This
+    # field never reaches the Rust config (`_rust_cfg_kwargs` excludes
+    # it); it's pure Python post-processing around the Rust call.
+    audit_safe: bool = False
+    # Strings or regexes. A row is "protected" if any pattern matches
+    # its canonical JSON text (`json.dumps(row, sort_keys=True)`).
+    protected_patterns: list[str] | None = None
+    # If protected rows still can't be fully preserved after the
+    # splice-back pass (defensive — should only trip on internal
+    # bugs), fail closed by returning the original, uncompressed array
+    # instead of a result with fewer protected-row matches than the
+    # input had. When False, ship the best-effort result with a
+    # logged warning instead of refusing to compress.
+    fail_closed_on_protected_loss: bool = True
+
 
 # ─── Rust-backed SmartCrusher ─────────────────────────────────────────────
 
@@ -251,6 +277,18 @@ class SmartCrusher(Transform):
         cfg = config or SmartCrusherConfig()
         self.config = cfg
         self._with_compaction = with_compaction
+
+        # Audit-safe mode (#1705). getattr fallbacks: callers may pass
+        # the SDK-side `headroom.config.SmartCrusherConfig`, which
+        # doesn't carry these fields — defaults to disabled, the safe
+        # choice (no behavior change for callers who don't opt in).
+        self._audit_safe = bool(getattr(cfg, "audit_safe", False))
+        self._fail_closed_on_protected_loss = bool(
+            getattr(cfg, "fail_closed_on_protected_loss", True)
+        )
+        self._protected_patterns = self._compile_protected_patterns(
+            getattr(cfg, "protected_patterns", None)
+        )
         # Strict lossless mode. An explicit `lossless_only=` kwarg wins
         # over the config field, so callers can flip it without rebuilding
         # a whole config. `crush(..., lossless_only=...)` overrides again
@@ -446,6 +484,13 @@ class SmartCrusher(Transform):
         opaque-blob offload) leaves the content uncompacted instead.
         `None` (default) uses the instance's configured value.
         """
+        # Web search tools often return space-separated JSON objects
+        # (``{...} {...} {...}``) rather than a real array. The Rust crusher
+        # only compresses JSON arrays, so normalize that shape first —
+        # otherwise it passes through at 0% compression (#1741).
+        normalized = normalize_concatenated_json(content)
+        if normalized is not None:
+            content = normalized
         rust = (
             self._rust
             if lossless_only is None or bool(lossless_only) == self._lossless_only
@@ -488,6 +533,209 @@ class SmartCrusher(Transform):
             strategy=r.strategy,
         )
 
+    # ─── Audit-safe protection (#1705) ─────────────────────────────────
+    #
+    # `crush_array_json`'s Rust-side row selection is purely statistical
+    # (variance, anomaly, position) — it has no notion of "this row is
+    # legally/compliance-significant and must stay visible in the
+    # prompt." Audit-safe mode bolts that on in Python: scan for
+    # pattern matches before compression, then guarantee matched rows
+    # survive the compressed output (never dropped, never marker-only).
+
+    @staticmethod
+    def _compile_protected_patterns(patterns: list[str] | None) -> list[re.Pattern[str]]:
+        """Compile `protected_patterns` once at construction time.
+
+        A pattern that fails to compile is a caller bug, not something
+        to swallow — silently treating an invalid regex as "no rows
+        protected" would defeat the entire point of audit-safe mode
+        (rows the caller believes are protected wouldn't be).
+        """
+        if not patterns:
+            return []
+        compiled = []
+        for p in patterns:
+            try:
+                compiled.append(re.compile(p))
+            except re.error as e:
+                raise ValueError(
+                    f"SmartCrusher: invalid protected_patterns regex {p!r}: {e}"
+                ) from e
+        return compiled
+
+    @staticmethod
+    def _canon(item: Any) -> str:
+        """Canonical JSON text for a row.
+
+        Used both for protected-pattern matching and for identity
+        comparison across the crush boundary — kept rows are
+        re-serialized by Rust, so rows are matched by content, not by
+        Python object identity.
+        """
+        return json.dumps(item, sort_keys=True, default=str)
+
+    def _row_matches_protected(self, item: Any) -> bool:
+        text = self._canon(item)
+        return any(p.search(text) for p in self._protected_patterns)
+
+    def _scan_protected_rows(self, items_json_or_content: str) -> list[Any]:
+        """Rows matching any `protected_patterns` entry, or `[]` when
+        audit-safe mode is off, no patterns are configured, or the
+        input doesn't parse as a JSON array (nothing row-shaped to
+        protect — e.g. raw CSV/log text, out of scope for this mode)."""
+        if not (self._audit_safe and self._protected_patterns):
+            return []
+        try:
+            parsed = json.loads(items_json_or_content)
+        except (json.JSONDecodeError, ValueError):
+            return []
+        if not isinstance(parsed, list):
+            return []
+        return [item for item in parsed if self._row_matches_protected(item)]
+
+    def _splice_missing_protected(
+        self, protected: list[Any], kept: list[Any]
+    ) -> tuple[list[Any], int]:
+        """Append any `protected` row missing from `kept` (identity by
+        canonical JSON, multiplicity-aware via `Counter` so duplicate
+        protected rows are each accounted for individually).
+
+        Returns `(kept_with_splice, lost_count)`. `lost_count` is
+        almost always 0 after splicing — it stays non-zero only when
+        something structural prevents the appended row from being
+        recognized as a survivor (defensive; see call sites).
+        """
+        available = Counter(self._canon(item) for item in kept)
+        missing = []
+        for item in protected:
+            key = self._canon(item)
+            if available[key] > 0:
+                available[key] -= 1
+            else:
+                missing.append(item)
+
+        if missing:
+            kept = kept + missing
+
+        surviving = Counter(self._canon(item) for item in kept)
+        needed = Counter(self._canon(item) for item in protected)
+        lost = sum(max(0, count - surviving[key]) for key, count in needed.items())
+        return kept, lost
+
+    def _apply_audit_safe_protection(
+        self,
+        protected: list[Any],
+        original_items_json: str,
+        result: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Guarantee every row in `protected` survives in `result["items"]`.
+
+        Two phases:
+        1. Splice — any protected row missing from the compressed
+           output (statistically sampled out, or moved behind an
+           opaque `<<ccr:...>>` retrieval marker) is appended back
+           into `items` verbatim.
+        2. Verify — re-count protected-row survivors after splicing.
+           If the count is still short (defensive: should only trip
+           on an internal bug, e.g. the lossless table path rendering
+           rows into a non-addressable CSV blob), fail closed by
+           returning the original uncompressed array, or ship the
+           spliced result with a logged warning, per
+           `fail_closed_on_protected_loss`.
+        """
+        kept_json = result.get("items")
+        try:
+            kept = json.loads(kept_json) if isinstance(kept_json, str) else list(kept_json or [])
+        except (json.JSONDecodeError, ValueError):
+            kept = []
+
+        before_count = len(kept)
+        kept, lost = self._splice_missing_protected(protected, kept)
+        if len(kept) != before_count:
+            # Only reserialize when something was actually spliced in —
+            # an unmodified `kept` stays byte-identical to Rust's output.
+            # ensure_ascii=False matches serde_json (which never escapes
+            # non-ASCII), so a splice doesn't turn readable unicode into
+            # model-visible \uXXXX soup.
+            result = dict(result)
+            result["items"] = json.dumps(kept, ensure_ascii=False)
+        if not lost:
+            return result
+
+        msg = (
+            f"SmartCrusher audit_safe: {lost} protected row(s) could not be "
+            f"preserved through compression (pattern match count decreased "
+            f"even after splicing back missing rows)."
+        )
+        if self._fail_closed_on_protected_loss:
+            logger.warning("%s Failing closed: returning original uncompressed.", msg)
+            return {
+                "items": original_items_json,
+                "ccr_hash": None,
+                "dropped_summary": "",
+                "strategy_info": "audit_safe:fail_closed",
+                "compacted": None,
+                "compaction_kind": None,
+            }
+        logger.warning(
+            "%s fail_closed_on_protected_loss=False — shipping best-effort result.",
+            msg,
+        )
+        return result
+
+    def _apply_audit_safe_protection_to_content(
+        self,
+        protected: list[Any],
+        original_content: str,
+        crushed: str,
+        was_modified: bool,
+        info: str,
+    ) -> tuple[str, bool, str]:
+        """Guarantee protected rows survive `_smart_crush_content`'s
+        output — the tuple-shaped API `apply()` uses for real
+        tool-output compression (`crush_array_json` is the dict-shaped
+        API used by direct/test callers and the CCR retrieval flow;
+        `apply()` never calls it).
+
+        `crushed` may be a JSON array string (the common shape for the
+        lossy row-drop and passthrough paths) — spliced exactly like
+        `crush_array_json`. Anything else (lossless CSV/table
+        rendering, an opaque marker string) has no row structure left
+        to splice into, so verification falls back to counting
+        protected-pattern matches in the raw text before vs. after.
+        """
+        try:
+            parsed = json.loads(crushed)
+        except (json.JSONDecodeError, ValueError):
+            parsed = None
+
+        if isinstance(parsed, list):
+            kept, lost = self._splice_missing_protected(protected, parsed)
+            # Only reserialize when something was actually spliced in —
+            # see the matching comment in `_apply_audit_safe_protection`.
+            candidate = (
+                json.dumps(kept, ensure_ascii=False) if len(kept) != len(parsed) else crushed
+            )
+        else:
+            lost = sum(
+                max(0, len(p.findall(original_content)) - len(p.findall(crushed)))
+                for p in self._protected_patterns
+            )
+            candidate = crushed
+
+        if not lost:
+            return candidate, was_modified, info
+
+        msg = f"SmartCrusher audit_safe: {lost} protected pattern match(es) lost in compression."
+        if self._fail_closed_on_protected_loss:
+            logger.warning("%s Failing closed: returning original content uncompressed.", msg)
+            return original_content, False, "audit_safe:fail_closed"
+        logger.warning(
+            "%s fail_closed_on_protected_loss=False — shipping best-effort result.",
+            msg,
+        )
+        return candidate, was_modified, info
+
     def crush_array_json(
         self,
         items_json: str,
@@ -503,8 +751,18 @@ class SmartCrusher(Transform):
 
         Used by tests and by the proxy's CCR retrieval flow when it needs
         the hash directly rather than parsing it out of a prompt marker.
+
+        When this instance is configured with `audit_safe=True` and a
+        non-empty `protected_patterns`, rows matching any pattern are
+        scanned *before* compression and guaranteed to survive in the
+        returned `items` — see `_apply_audit_safe_protection`.
         """
+        protected = self._scan_protected_rows(items_json)
+
         result: dict[str, Any] = self._rust.crush_array_json(items_json, query, bias)
+
+        if protected:
+            result = self._apply_audit_safe_protection(protected, items_json, result)
         # Row-drop case: Rust returns the structured `ccr_hash` and has
         # already stashed the canonical in its own store. Mirror that
         # entry into the Python compression_store keyed by the same
@@ -592,8 +850,19 @@ class SmartCrusher(Transform):
         threaded through to TOIN's per-tool learning records; if no
         tool name is available (e.g. the legacy pipeline doesn't have
         one in scope) the recording uses content-based signature only.
+
+        This is the path `apply()` actually calls for every compressed
+        tool/tool_result message — so it's also where audit-safe mode
+        (`audit_safe=True` + `protected_patterns`, #1705) has to hook
+        in to matter in production, not just via the `crush_array_json`
+        convenience API. See `_apply_audit_safe_protection_to_content`.
         """
+        protected = self._scan_protected_rows(content)
         crushed, was_modified, info = self._rust.smart_crush_content(content, query_context, bias)
+        if protected:
+            crushed, was_modified, info = self._apply_audit_safe_protection_to_content(
+                protected, content, crushed, was_modified, info
+            )
         # Same passthrough filter as `crush()` — re-canonicalization of
         # JSON whitespace can flip `was_modified=True` even when the
         # `info` field reports `passthrough` and no compression happened.
@@ -878,7 +1147,7 @@ class SmartCrusher(Transform):
         except Exception as e:  # pragma: no cover - defensive
             logger.debug("CCR mirror: cannot get compression_store (%s)", e)
             return
-        # The TTL on the Python store defaults to 5 minutes — same as
+        # The TTL on the Python store defaults to 30 minutes — same as
         # the Rust store's `DEFAULT_TTL` (see crates/headroom-core/src/
         # ccr/mod.rs). No need to override.
         try:
@@ -936,7 +1205,12 @@ class SmartCrusher(Transform):
             if msg.get("role") == "assistant" and msg.get("tool_calls"):
                 for tc in msg.get("tool_calls", []):
                     if isinstance(tc, dict):
-                        func = tc.get("function", {})
+                        # `tc.get("function", {})` returns None for an explicit
+                        # {"function": null} (the default only applies to a
+                        # missing key), and `.get` on None raises AttributeError,
+                        # crashing apply(). Use the null-safe form the sibling
+                        # `_build_tool_name_index` already uses (line ~118).
+                        func = tc.get("function") or {}
                         args = func.get("arguments", "")
                         if isinstance(args, str) and args:
                             context_parts.append(args)
@@ -1014,7 +1288,10 @@ class SmartCrusher(Transform):
                 # unresolvable retrieval loop.
                 # ponytail: ceiling is tool_call_id lookup; if the id is missing we
                 # compress (conservative: unknown tool names don't get a free pass).
-                if tool_names_by_id.get(msg.get("tool_call_id") or "") == CCR_TOOL_NAME:
+                if is_tool_excluded(
+                    tool_names_by_id.get(msg.get("tool_call_id") or "") or "",
+                    (CCR_TOOL_NAME,),
+                ):
                     continue
                 content = msg.get("content", "")
                 if isinstance(content, str):
@@ -1044,7 +1321,10 @@ class SmartCrusher(Transform):
                     # would produce a new <<ccr:hash>> marker the agent cannot
                     # redeem (infinite retrieval loop).
                     # ponytail: ceiling is tool_use_id lookup; unknown ids pass through.
-                    if tool_names_by_id.get(block.get("tool_use_id") or "") == CCR_TOOL_NAME:
+                    if is_tool_excluded(
+                        tool_names_by_id.get(block.get("tool_use_id") or "") or "",
+                        (CCR_TOOL_NAME,),
+                    ):
                         continue
                     tool_content = block.get("content", "")
                     if not isinstance(tool_content, str):

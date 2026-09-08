@@ -12,7 +12,7 @@ Compress everything your AI agent reads. Same answers, fraction of the tokens.
 
 [![PyPI](https://img.shields.io/pypi/v/headroom-ai.svg)](https://pypi.org/project/headroom-ai/)
 [![Python](https://img.shields.io/pypi/pyversions/headroom-ai.svg)](https://pypi.org/project/headroom-ai/)
-[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/chopratejas/headroom/blob/main/LICENSE)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/headroomlabs-ai/headroom/blob/main/LICENSE)
 [![Discord](https://img.shields.io/badge/Discord-Join%20us-5865F2?logo=discord&logoColor=white)](https://discord.gg/yRmaUNpsPJ)
 
 </div>
@@ -64,7 +64,7 @@ Headroom works as a **transparent proxy** (zero code changes), a **Python functi
 === "Proxy (Zero Code Changes)"
 
     ```bash
-    pip install "headroom-ai[all]"
+    uv tool install --python 3.13 "headroom-ai[all]"
     headroom proxy
     ```
 
@@ -224,7 +224,7 @@ ContextEngine plugin for OpenClaw agents. Auto-compresses context in `assemble()
 headroom wrap openclaw
 ```
 
-[OpenClaw Plugin &rarr;](https://github.com/chopratejas/headroom/tree/main/plugins/openclaw)
+[OpenClaw Plugin &rarr;](https://github.com/headroomlabs-ai/headroom/tree/main/plugins/openclaw)
 
 </div>
 
@@ -391,6 +391,7 @@ Or via LiteLLM for 100+ providers (Together, Groq, Fireworks, Ollama, vLLM, etc.
 ## Installation
 
 ```bash
+uv tool install --python 3.13 "headroom-ai[all]"  # CLI on macOS Apple Silicon/Linux
 pip install headroom-ai                # Core library (Python)
 pip install "headroom-ai[all]"         # Everything (recommended)
 npm install headroom-ai                # TypeScript / Node.js
@@ -401,7 +402,8 @@ pip install "headroom-ai[agno]"        # Agno integration
 pip install "headroom-ai[evals]"       # Evaluation framework
 ```
 
-Requires Python 3.10+.
+Requires Python 3.10+. On macOS, use Python 3.13 for the uv/pipx CLI path if
+your default `python3` is newer than the current wheel set.
 
 ---
 
@@ -416,4 +418,4 @@ Requires Python 3.10+.
 
 ---
 
-Apache 2.0 — Free for commercial use. [GitHub](https://github.com/chopratejas/headroom) | [PyPI](https://pypi.org/project/headroom-ai/) | [Discord](https://discord.gg/yRmaUNpsPJ)
+Apache 2.0 — Free for commercial use. [GitHub](https://github.com/headroomlabs-ai/headroom) | [PyPI](https://pypi.org/project/headroom-ai/) | [Discord](https://discord.gg/yRmaUNpsPJ)

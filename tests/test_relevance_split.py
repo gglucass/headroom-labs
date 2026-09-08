@@ -150,13 +150,19 @@ def _router(split_on: bool, *, lossless: bool = True) -> ContentRouter:
     return r
 
 
-def test_router_relevance_split_fires_for_search():
+def test_router_lossless_mode_folds_only_no_drop():
+    # Lossless-only mode NEVER layers a lossy drop on top of the byte-exact fold:
+    # the fold is the whole answer (marker-free, fully recoverable). The relevance
+    # split — which lossy-drops the low-value tail — only rides on top in lossy/CCR
+    # mode (see test_router_relevance_split_fires_in_ccr_mode). So here the
+    # irrelevant "widget" records must be PRESERVED, not silently dropped, and the
+    # Kompress tail stub must never run.
     r = _router(split_on=True)  # lossless mode
     out, _, chain = r._apply_strategy_to_content(_SEARCH, CompressionStrategy.SEARCH, "oauth token")
-    assert chain == ["lossless_search", "relevance_split"]
-    assert "oauth token" in out  # relevant records kept verbatim
-    assert "widget" not in out  # irrelevant tail replaced by Kompress stub
-    assert "[TAIL]" in out
+    assert chain == ["lossless_search"]
+    assert "oauth token" in out  # relevant records kept
+    assert "widget" in out  # irrelevant tail ALSO kept — no silent drop in lossless mode
+    assert "[TAIL]" not in out  # the lossy Kompress stub never fired
 
 
 def test_router_relevance_split_fires_in_ccr_mode():

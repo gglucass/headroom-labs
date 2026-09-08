@@ -48,8 +48,23 @@ def test_resolver_tier1_explicit_project_id_wins() -> None:
     )
     assert out is not None
     key, display = out
-    assert key == "billing-svc"
+    # The sanitized id stays as a human-readable prefix; a sha256 digest is
+    # appended so distinct ids that sanitize alike cannot collide.
+    assert key.startswith("billing-svc-")
+    assert len(key.split("-")[-1]) == 16
     assert display == "billing-svc"
+
+
+def test_resolver_tier1_distinct_ids_that_sanitize_alike_dont_collide() -> None:
+    r = ProjectResolver()
+    # "acme/api" and "acme api" both sanitize to "acme-api"; without the digest
+    # they would share one project store (cross-project memory leak).
+    k1, _ = r.resolve(_ctx(headers={"x-headroom-project-id": "acme/api"}))  # type: ignore[misc]
+    k2, _ = r.resolve(_ctx(headers={"x-headroom-project-id": "acme api"}))  # type: ignore[misc]
+    assert k1 != k2
+    # Same id resolves to a stable key across calls.
+    k1b, _ = r.resolve(_ctx(headers={"x-headroom-project-id": "acme/api"}))  # type: ignore[misc]
+    assert k1 == k1b
 
 
 def test_resolver_tier2_explicit_cwd_header() -> None:
@@ -153,6 +168,67 @@ def test_extract_system_prompt_openai_messages() -> None:
 
 def test_extract_system_prompt_missing_returns_empty() -> None:
     assert extract_system_prompt({"messages": []}) == ""
+
+
+def test_extract_system_prompt_user_reminder_with_cwd_reaches_resolver() -> None:
+    body = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "<system-reminder>\n\n"
+                            "The maximum number of terminals is 5.\n\n"
+                            "<available_terminal>\n"
+                            "- terminal_id: 9\n"
+                            "- cwd: S:\\workspace-zhuangxiu\\decorate-offer-api\n"
+                            "</available_terminal>\n\n"
+                            "</system-reminder>"
+                        ),
+                    }
+                ],
+            }
+        ]
+    }
+
+    prompt = extract_system_prompt(body)
+    assert "cwd:" in prompt
+    resolved = ProjectResolver().resolve(_ctx(system_prompt=prompt))
+
+    assert resolved is not None
+    _, display = resolved
+    assert "decorate-offer-api" in display
+
+
+def test_extract_system_prompt_ordinary_user_text_returns_empty() -> None:
+    body = {"messages": [{"role": "user", "content": "Hello, can you help me refactor this?"}]}
+
+    assert extract_system_prompt(body) == ""
+
+
+def test_extract_system_prompt_system_message_beats_user_cwd_fallback() -> None:
+    body = {
+        "messages": [
+            {"role": "system", "content": "Working directory: /system/project"},
+            {"role": "user", "content": "cwd: /user/project\nDo the thing."},
+        ]
+    }
+
+    prompt = extract_system_prompt(body)
+    resolved = ProjectResolver().resolve(_ctx(system_prompt=prompt))
+
+    assert prompt == "Working directory: /system/project"
+    assert resolved is not None
+    _, display = resolved
+    assert display == "project"
+
+
+def test_extract_system_prompt_cwd_in_non_user_message_returns_empty() -> None:
+    body = {"messages": [{"role": "assistant", "content": "cwd: /spoof/project"}]}
+
+    assert extract_system_prompt(body) == ""
 
 
 # ---------------------------------------------------------------------------
@@ -290,6 +366,20 @@ def test_router_user_mode_partitions_by_user(
     assert scope_a.db_path != scope_b.db_path
     assert scope_a.display_name == "alice"
     assert scope_b.display_name == "bob"
+
+
+def test_router_user_mode_distinct_ids_that_sanitize_alike_dont_collide(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # "alice/qa" and "alice qa" both sanitize to "alice-qa"; without the digest
+    # they would share one users/alice-qa/memory.db — a cross-user leak, the one
+    # thing USER mode exists to prevent.
+    router = _make_router(tmp_path, MemoryStorageMode.USER, monkeypatch)
+
+    _, scope_a = router.backend_for(_ctx(base_user_id="alice/qa"))
+    _, scope_b = router.backend_for(_ctx(base_user_id="alice qa"))
+
+    assert scope_a.db_path != scope_b.db_path
 
 
 def test_router_global_mode_reuses_legacy_path(

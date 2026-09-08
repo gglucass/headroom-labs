@@ -50,6 +50,7 @@ HEADROOM_SAVINGS_PATH_ENV = "HEADROOM_SAVINGS_PATH"
 HEADROOM_SAVINGS_EVENTS_PATH_ENV = "HEADROOM_SAVINGS_EVENTS_PATH"
 HEADROOM_TOIN_PATH_ENV = "HEADROOM_TOIN_PATH"
 HEADROOM_SUBSCRIPTION_STATE_PATH_ENV = "HEADROOM_SUBSCRIPTION_STATE_PATH"
+HEADROOM_SETTINGS_PATH_ENV = "HEADROOM_SETTINGS_PATH"
 
 # ---------------------------------------------------------------------------
 # Default sub-path fragments
@@ -60,6 +61,7 @@ _CONFIG_DIR_DEFAULT_SUFFIX = "config"
 
 # Resource file/sub-dir names (kept here so nothing else has to hardcode them)
 _SAVINGS_FILE = "proxy_savings.json"
+_SETTINGS_FILE = "settings.json"
 _TOIN_FILE = "toin.json"
 _MODELS_FILE = "models.json"
 _SUBSCRIPTION_FILE = "subscription_state.json"
@@ -76,10 +78,6 @@ _DEBUG_400_DIR = "debug_400"
 _CODEX_WIRE_DEBUG_DIR = "codex_wire"
 _BIN_DIR = "bin"
 _PROXY_CLIENTS_DIR = "clients"
-_RTK_UNIX = "rtk"
-_RTK_WIN = "rtk.exe"
-_LEAN_CTX_UNIX = "lean-ctx"
-_LEAN_CTX_WIN = "lean-ctx.exe"
 _DEPLOY_DIR = "deploy"
 _PLUGINS_DIR = "plugins"
 
@@ -210,6 +208,16 @@ def savings_path(explicit: str | os.PathLike[str] | None = None) -> Path:
     )
 
 
+def settings_path(explicit: str | os.PathLike[str] | None = None) -> Path:
+    """Return the path for the dashboard-managed settings JSON file."""
+
+    return _resolve(
+        explicit,
+        HEADROOM_SETTINGS_PATH_ENV,
+        workspace_dir() / _SETTINGS_FILE,
+    )
+
+
 def toin_path(explicit: str | os.PathLike[str] | None = None) -> Path:
     """Return the path for the TOIN telemetry JSON file.
 
@@ -322,20 +330,6 @@ def proxy_clients_dir(port: int) -> Path:
     return workspace_dir() / _PROXY_CLIENTS_DIR / str(port)
 
 
-def rtk_path() -> Path:
-    """Return the path to the vendored ``rtk`` binary."""
-
-    name = _RTK_WIN if os.name == "nt" else _RTK_UNIX
-    return bin_dir() / name
-
-
-def lean_ctx_path() -> Path:
-    """Return the path to the vendored ``lean-ctx`` binary."""
-
-    name = _LEAN_CTX_WIN if os.name == "nt" else _LEAN_CTX_UNIX
-    return bin_dir() / name
-
-
 def deploy_root() -> Path:
     """Return the root directory for persistent deployment profiles."""
 
@@ -346,6 +340,12 @@ def beacon_lock_path(port: int) -> Path:
     """Return the per-port proxy beacon lock file path."""
 
     return workspace_dir() / f".beacon_lock_{int(port)}"
+
+
+def proxy_start_lock_path(port: int) -> Path:
+    """Return the per-port lock used to serialize wrap proxy startup."""
+
+    return workspace_dir() / f".proxy_start_{int(port)}.lock"
 
 
 # ---------------------------------------------------------------------------
@@ -370,19 +370,38 @@ def models_config_path() -> Path:
 # ---------------------------------------------------------------------------
 
 
+def _validate_plugin_name(plugin_name: str) -> None:
+    """Reject plugin names that would escape the ``plugins/`` sandbox.
+
+    Path separators (``/``, ``\\``) are rejected so a name cannot address a
+    subdirectory. ``.`` and ``..`` are rejected because ``plugins / ".."``
+    resolves to the plugins-parent (i.e. the whole config/workspace root),
+    handing a plugin read/write access to every other plugin's state and the
+    workspace's savings ledger, memory DB, license cache, and logs. NUL is
+    rejected because it terminates paths on POSIX APIs.
+    """
+
+    if (
+        not plugin_name
+        or plugin_name in {".", ".."}
+        or "/" in plugin_name
+        or "\\" in plugin_name
+        or "\x00" in plugin_name
+    ):
+        raise ValueError(f"invalid plugin name: {plugin_name!r}")
+
+
 def plugin_config_dir(plugin_name: str) -> Path:
     """Return the config directory for a named plugin."""
 
-    if not plugin_name or "/" in plugin_name or "\\" in plugin_name:
-        raise ValueError(f"invalid plugin name: {plugin_name!r}")
+    _validate_plugin_name(plugin_name)
     return config_dir() / _PLUGINS_DIR / plugin_name
 
 
 def plugin_workspace_dir(plugin_name: str) -> Path:
     """Return the workspace directory for a named plugin."""
 
-    if not plugin_name or "/" in plugin_name or "\\" in plugin_name:
-        raise ValueError(f"invalid plugin name: {plugin_name!r}")
+    _validate_plugin_name(plugin_name)
     return workspace_dir() / _PLUGINS_DIR / plugin_name
 
 
@@ -393,6 +412,7 @@ __all__ = [
     "HEADROOM_SAVINGS_EVENTS_PATH_ENV",
     "HEADROOM_TOIN_PATH_ENV",
     "HEADROOM_SUBSCRIPTION_STATE_PATH_ENV",
+    "HEADROOM_SETTINGS_PATH_ENV",
     "set_process_stateless",
     "process_is_stateless",
     "config_dir",
@@ -407,6 +427,7 @@ __all__ = [
     "license_cache_path",
     "session_stats_path",
     "savings_events_path",
+    "settings_path",
     "sync_state_path",
     "bridge_state_path",
     "log_dir",
@@ -415,10 +436,9 @@ __all__ = [
     "codex_wire_debug_dir",
     "bin_dir",
     "proxy_clients_dir",
-    "rtk_path",
-    "lean_ctx_path",
     "deploy_root",
     "beacon_lock_path",
+    "proxy_start_lock_path",
     "models_config_path",
     "plugin_config_dir",
     "plugin_workspace_dir",

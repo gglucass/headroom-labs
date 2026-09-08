@@ -10,6 +10,7 @@ Supported content types:
 - SEARCH_RESULTS: grep/ripgrep output (file:line:content)
 - BUILD_OUTPUT: Compiler, test, lint logs
 - GIT_DIFF: Unified diff format
+- STRUCTURED_CONFIG: YAML/TOML/INI config files
 - PLAIN_TEXT: Generic text (fallback)
 """
 
@@ -31,6 +32,7 @@ class ContentType(Enum):
     GIT_DIFF = "diff"  # Unified diff format
     HTML = "html"  # Web pages (needs content extraction, not compression)
     TABULAR = "tabular"  # CSV/TSV, markdown tables, fixed-width tables
+    STRUCTURED_CONFIG = "structured_config"  # YAML/TOML/INI config files
     PLAIN_TEXT = "text"  # Fallback
 
 
@@ -100,7 +102,35 @@ _CODE_PATTERNS = {
         re.compile(r"^\s*@\w+"),  # annotations
         re.compile(r"^\s*package\s+[\w.]+;"),
     ],
+    "csharp": [
+        re.compile(r"^\s*using\s+[\w.]+\s*;"),  # using directive (not C++ `using namespace x;`)
+        re.compile(r"^\s*namespace\s+[\w.]+"),
+        re.compile(
+            r"^\s*(public|private|protected|internal|sealed|static|abstract|partial)\s+"
+            r"(class|struct|record|interface|enum)\b"
+        ),
+        re.compile(r"^.*\b(get|set|init);"),  # auto-property accessors
+    ],
+    "php": [
+        re.compile(r"<\?php\b"),
+        re.compile(r"^\s*namespace\s+[\w\\]+\s*;"),
+        re.compile(r"^\s*use\s+[\w\\]+(\s+as\s+\w+)?\s*;"),
+        re.compile(r"^\s*(public|private|protected|static|abstract|final)?\s*function\s+\w+\s*\("),
+        re.compile(r"\$this->"),
+    ],
 }
+
+# Structured-config (YAML/TOML/INI) patterns. TOML and INI share the
+# `[section]` header shape; the stdlib parsers disambiguate. YAML is
+# heuristic-only (PyYAML is not a dependency): key/list/document-marker
+# line share plus structure signals, with prose and front-matter guards.
+_CONFIG_SECTION_RE = re.compile(r"^\s*\[\[?[\w.\-\"' ]+\]\]?\s*$")
+_TOML_ASSIGN_RE = re.compile(r"""^\s*(?:[\w.\-]+|"[^"]+"|'[^']+')\s*=\s*\S""")
+_INI_ASSIGN_RE = re.compile(r"^\s*[\w.\-@ ]+?\s*[=:]\s*")
+_YAML_KEY_RE = re.compile(r"""^\s*(?:-\s+)?(?:[\w.\-/]+|"[^"]+"|'[^']+')\s*:(?:\s|$)""")
+_YAML_LIST_RE = re.compile(r"^\s*-\s+\S")
+_YAML_DOC_RE = re.compile(r"^---\s*$|^\.\.\.\s*$")
+_CONFIG_COMMENT_RE = re.compile(r"^\s*[#;]")
 
 # Log/build output patterns
 _LOG_PATTERNS = [
@@ -114,7 +144,19 @@ _LOG_PATTERNS = [
     re.compile(r"^npm ERR!|^yarn error|^cargo error"),  # build tools
     re.compile(r"Traceback \(most recent call last\)"),  # Python traceback
     re.compile(r"^\w*(Error|Exception):"),  # Python exception final line
-    re.compile(r"^\s*at\s+[\w.$]+\("),  # JS/Java stack trace
+    re.compile(r"^\s*at\s+[\w.$/]+\("),  # JS/Java stack trace (JPMS module frames incl.)
+    re.compile(r"^\s*at async \S"),  # Node async stack frame (no paren form)
+    re.compile(r"^(panic|fatal error): "),  # Go panic opener
+    re.compile(r"^goroutine \d+ \["),  # Go goroutine dump header
+    re.compile(r"^\t\S+\.go:\d+ \+0x"),  # Go frame file line
+    re.compile(r"^thread '[^']*' panicked at"),  # Rust panic
+    re.compile(r"^stack backtrace:"),  # Rust backtrace header
+    re.compile(r"^\s+\d+: \S"),  # Rust numbered backtrace frame
+    re.compile(r"^\s+at \S+:\d+:\d+$"),  # Rust/JS bare path frame sub-line
+    re.compile(r"^Unhandled exception\."),  # .NET unhandled exception
+    re.compile(r"^\s*at .+\) in .+:line \d+"),  # .NET frame with PDB info
+    re.compile(r"^Caused by: "),  # Java exception chain head
+    re.compile(r"^\s*\.\.\. \d+ more$"),  # Java elided-frames summary
 ]
 
 
@@ -172,43 +214,142 @@ def detect_content_type(content: str) -> DetectionResult:
     if tabular_result and tabular_result.confidence >= 0.6:
         return tabular_result
 
-    # 7. Check for source code
+    # 7. Check for structured config (YAML/TOML/INI). Runs after tabular so
+    #    delimited data keeps its claim, and before code so config files with
+    #    code-ish lines route to the structure-aware config compressor.
+    config_result = _try_detect_structured_config(content)
+    if config_result and config_result.confidence >= 0.6:
+        return config_result
+
+    # 8. Check for source code
     code_result = _try_detect_code(content)
     if code_result and code_result.confidence >= 0.5:
         return code_result
 
-    # 8. Fallback to plain text
+    # 9. Fallback to plain text
     return DetectionResult(ContentType.PLAIN_TEXT, 0.5, {})
 
 
-def _try_detect_json(content: str) -> DetectionResult | None:
-    """Try to detect JSON array content."""
-    content = content.strip()
+_JSON_DECODER = json.JSONDecoder()
+# The decoded JSON value must be at least this fraction of the content for a
+# WRAPPED payload to still count as JSON: a small structural wrapper (a harness
+# observation shell, an ``Exit code:`` prefix) around a JSON body passes, but a
+# prose/code blob that merely contains a JSON fragment does not. Fraction-based
+# so it is size-correct — a large JSON with a proportionally small wrapper passes,
+# a short mostly-prose string does not. (Pure JSON never reaches this check.)
+_JSON_MIN_BULK_FRACTION = 0.6
 
-    # Quick check: must start with [ for array
-    if not content.startswith("["):
+
+def _decode_concatenated_json(content: str) -> list | None:
+    """Decode a run of whitespace-separated top-level JSON values.
+
+    Web search tools (SerpAPI, Tavily, custom backends) commonly emit
+    back-to-back JSON objects separated only by whitespace rather than a real
+    array: ``{"title": ...} {"title": ...} {"title": ...}``. Returns the list
+    of decoded values, or None if the text isn't a clean run of JSON values
+    separated only by whitespace.
+    """
+    decoder = json.JSONDecoder()
+    idx, length = 0, len(content)
+    items: list = []
+    while idx < length:
+        while idx < length and content[idx].isspace():
+            idx += 1
+        if idx >= length:
+            break
+        try:
+            value, idx = decoder.raw_decode(content, idx)
+        except ValueError:
+            return None
+        items.append(value)
+    return items or None
+
+
+def normalize_concatenated_json(content: str) -> str | None:
+    """Convert whitespace-separated JSON objects into a canonical JSON array.
+
+    SmartCrusher only compresses JSON arrays, so this rewrites the
+    space-separated web_search shape (``{...} {...} {...}``) into
+    ``[{...}, {...}, {...}]``. Returns None unless the content is two or more
+    whitespace-separated JSON objects.
+    """
+    stripped = content.strip()
+    if not stripped.startswith("{"):
+        return None
+    items = _decode_concatenated_json(stripped)
+    if items and len(items) >= 2 and all(isinstance(item, dict) for item in items):
+        return json.dumps(items)
+    return None
+
+
+def _try_detect_json(content: str) -> DetectionResult | None:
+    """Detect JSON by PARSING, not by surface patterns.
+
+    JSON is whatever parses as JSON — objects, arrays, and any nesting are all
+    equally JSON, so a leading-``[`` check misses every ``{…}`` config/data file.
+    Tool output is often a JSON value wrapped in a little surrounding text (a
+    harness observation shell, an ``Exit code:`` prefix); we decode one JSON value
+    out of the payload and accept it when it is the bulk of the content, which
+    tolerates ANY wrapper without hard-coding a harness's tags. The whitespace-
+    separated web_search shape (``{...} {...}``, #1741) is detected too and
+    normalized to a real array before crushing (see normalize_concatenated_json).
+    """
+    stripped = content.strip()
+    if not stripped:
         return None
 
     try:
-        parsed = json.loads(content)
-        if isinstance(parsed, list):
-            # Check if it's a list of dicts (SmartCrusher compatible)
-            if parsed and all(isinstance(item, dict) for item in parsed):
+        value = json.loads(stripped)
+    except RecursionError:
+        # Deeply nested JSON (e.g. ``[[[[...]]]]`` with 10k+ levels) can
+        # exceed Python's recursion limit. Treat as non-JSON so the router
+        # falls through to a safe strategy instead of crashing.
+        return None
+    except ValueError:
+        # Not pure JSON. First: a run of whitespace-separated top-level JSON
+        # objects (web_search output, #1741) -> JSON_ARRAY.
+        if stripped.startswith("{"):
+            try:
+                items = _decode_concatenated_json(stripped)
+            except RecursionError:
+                return None
+            if items and len(items) >= 2 and all(isinstance(item, dict) for item in items):
                 return DetectionResult(
                     ContentType.JSON_ARRAY,
                     1.0,
-                    {"item_count": len(parsed), "is_dict_array": True},
+                    {"item_count": len(items), "is_dict_array": True, "concatenated": True},
                 )
-            # It's a list but not of dicts
-            return DetectionResult(
-                ContentType.JSON_ARRAY,
-                0.8,
-                {"item_count": len(parsed), "is_dict_array": False},
-            )
-    except json.JSONDecodeError:
-        pass
 
-    return None
+        # Otherwise decode one JSON value out of a small wrapped payload.
+        start = min((i for i in (stripped.find("{"), stripped.find("[")) if i >= 0), default=-1)
+        if start < 0:
+            return None
+        try:
+            value, end = _JSON_DECODER.raw_decode(stripped, start)
+        except (ValueError, RecursionError):
+            return None
+        # Accept only when the decoded JSON is the BULK of the content (see
+        # _JSON_MIN_BULK_FRACTION) — a small structural wrapper around a JSON body,
+        # not a prose/code blob that merely contains a JSON fragment.
+        if (end - start) < len(stripped) * _JSON_MIN_BULK_FRACTION:
+            return None
+
+    # A bare scalar (42, "s", true) is not structured data worth routing as JSON.
+    if not isinstance(value, dict | list):
+        return None
+
+    if isinstance(value, list):
+        is_dict_array = bool(value) and all(isinstance(item, dict) for item in value)
+        return DetectionResult(
+            ContentType.JSON_ARRAY,
+            1.0 if is_dict_array else 0.8,
+            {"item_count": len(value), "is_dict_array": is_dict_array},
+        )
+    return DetectionResult(
+        ContentType.JSON_ARRAY,
+        0.9,
+        {"is_dict_array": False, "is_object": True},
+    )
 
 
 def _try_detect_diff(content: str) -> DetectionResult | None:
@@ -316,6 +457,23 @@ def _try_detect_html(content: str) -> DetectionResult | None:
     )
 
 
+def _is_search_result_line(line: str) -> bool:
+    """True when a line looks like ``path:line:content`` grep output.
+
+    The bare ``^[^\\s:]+:\\d+:`` shape also matches ISO-8601 timestamps
+    (``…T09:57:59…``) and XML-ish wrappers harnesses prepend to user turns
+    (Copilot CLI's ``<current_datetime>…`` line), which misroutes prose to
+    the SearchCompressor — and that compressor keeps only matching lines,
+    deleting the rest. So the pre-colon segment must additionally look like
+    a file path: no angle brackets and no ``=`` (rules out markup tags and
+    ``key=value:12:`` log lines).
+    """
+    if not _SEARCH_RESULT_PATTERN.match(line):
+        return False
+    prefix = line.split(":", 1)[0]
+    return "<" not in prefix and ">" not in prefix and "=" not in prefix
+
+
 def _try_detect_search(content: str) -> DetectionResult | None:
     """Try to detect grep/ripgrep search results."""
     lines = content.split("\n")[:100]  # Check first 100 lines
@@ -324,10 +482,16 @@ def _try_detect_search(content: str) -> DetectionResult | None:
 
     matching_lines = 0
     for line in lines:
-        if line.strip() and _SEARCH_RESULT_PATTERN.match(line):
+        if line.strip() and _is_search_result_line(line):
             matching_lines += 1
 
-    if matching_lines == 0:
+    # Absolute floor: a single coincidental `word:digits:` line (a timestamp,
+    # a URL, a time literal inside prose) must not classify a whole payload as
+    # search results — the SearchCompressor drops every non-matching line, so
+    # a false positive is data loss. A genuine one-line grep result loses
+    # nothing by staying uncompressed: all of its lines match, so the
+    # compressor would have kept it verbatim anyway.
+    if matching_lines < 2:
         return None
 
     # Calculate confidence based on proportion of matching lines
@@ -487,6 +651,128 @@ def _try_detect_tabular(content: str) -> DetectionResult | None:
         return md_result
 
     return _try_detect_delimited(lines)
+
+
+def _try_parse_toml(content: str) -> bool:
+    """True if `content` parses as TOML (stdlib tomllib, or the tomli backport)."""
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # pragma: no cover - Python < 3.11
+        try:
+            import tomli as tomllib  # type: ignore[no-redef]
+        except ModuleNotFoundError:
+            return False
+    try:
+        tomllib.loads(content)
+        return True
+    except Exception:
+        return False
+
+
+def _parse_config_flavor(content: str) -> str | None:
+    """Disambiguate `[section]`-shaped config: TOML first, then INI.
+
+    Both flavors share the section-header line shape; only the stdlib parsers
+    can tell them apart reliably. Returns "toml", "ini", or None when neither
+    parser accepts the content (then it is not claimed as config at all).
+    """
+    if len(content) > 1_000_000:
+        return None
+    if _try_parse_toml(content):
+        return "toml"
+    import configparser
+
+    parser = configparser.ConfigParser(interpolation=None, strict=False)
+    try:
+        parser.read_string(content)
+    except Exception:
+        return None
+    return "ini" if parser.sections() else None
+
+
+def _try_detect_structured_config(content: str) -> DetectionResult | None:
+    """Try to detect structured config content (YAML, TOML, INI).
+
+    TOML/INI claims are parser-confirmed (stdlib), so they carry high
+    confidence. YAML has no stdlib parser, so its claim is heuristic:
+    key/list/document-marker line share plus a structure signal, guarded
+    against prose and markdown front-matter.
+    """
+    head = content.lstrip()[:1]
+    if not head or head in "{<":
+        # JSON objects and markup are never config; JSON arrays and real
+        # TOML/INI `[section]` headers disambiguate below.
+        return None
+
+    lines = content.split("\n")[:200]
+    non_empty = [ln for ln in lines if ln.strip()]
+    if len(non_empty) < 3:
+        return None
+    # Comment lines are neutral: excluded from the line-share ratio so
+    # comment-heavy configs and #-heading markdown don't skew it either way.
+    body = [ln for ln in non_empty if not _CONFIG_COMMENT_RE.match(ln)]
+    if len(body) < 3:
+        return None
+
+    # TOML / INI: require a section header plus assignment-dominant body,
+    # then let the stdlib parsers confirm and disambiguate.
+    sections = sum(1 for ln in body if _CONFIG_SECTION_RE.match(ln))
+    if sections >= 1:
+        assigns = sum(1 for ln in body if _TOML_ASSIGN_RE.match(ln) or _INI_ASSIGN_RE.match(ln))
+        if assigns >= 2 and (sections + assigns) / len(body) >= 0.6:
+            flavor = _parse_config_flavor(content)
+            if flavor is not None:
+                share = (sections + assigns) / len(body)
+                return DetectionResult(
+                    ContentType.STRUCTURED_CONFIG,
+                    min(0.95, 0.7 + share * 0.25),
+                    {"flavor": flavor, "sections": sections, "assignments": assigns},
+                )
+
+    # Markdown front-matter guard: a `---` fence closed within 60 lines and
+    # followed by non-YAML content is a markdown document, not standalone YAML.
+    if lines and lines[0].strip() == "---":
+        for idx in range(1, min(len(lines), 60)):
+            if lines[idx].strip() in ("---", "..."):
+                tail = [ln for ln in lines[idx + 1 :] if ln.strip()]
+                tail_yaml = sum(
+                    1 for ln in tail if _YAML_KEY_RE.match(ln) or _YAML_LIST_RE.match(ln)
+                )
+                if tail and tail_yaml / len(tail) < 0.3:
+                    return None
+                break
+
+    # YAML heuristic.
+    yaml_keys = sum(1 for ln in body if _YAML_KEY_RE.match(ln))
+    yaml_lists = sum(1 for ln in body if _YAML_LIST_RE.match(ln) and not _YAML_KEY_RE.match(ln))
+    doc_marks = sum(1 for ln in body if _YAML_DOC_RE.match(ln.strip()))
+    if yaml_keys < 3:
+        return None
+    share = (yaml_keys + yaml_lists + doc_marks) / len(body)
+    if share < 0.6:
+        return None
+    # Prose guards: config lines are short field-ish tuples, prose reads like
+    # sentences (mirrors _looks_like_prose for delimited data).
+    enders = sum(1 for ln in body if ln.rstrip().endswith((".", "!", "?")))
+    if enders / len(body) >= 0.5:
+        return None
+    avg_words = sum(len(ln.split()) for ln in body) / len(body)
+    if avg_words > 8:
+        return None
+    # Structure signal: nested indentation, a document marker, or a real list.
+    indents = {
+        len(ln) - len(ln.lstrip(" "))
+        for ln in body
+        if _YAML_KEY_RE.match(ln) or _YAML_LIST_RE.match(ln)
+    }
+    if len(indents) < 2 and doc_marks == 0 and yaml_lists < 3:
+        return None
+
+    return DetectionResult(
+        ContentType.STRUCTURED_CONFIG,
+        min(0.9, 0.55 + share * 0.35),
+        {"flavor": "yaml", "keys": yaml_keys, "list_items": yaml_lists},
+    )
 
 
 def _try_detect_code(content: str) -> DetectionResult | None:
