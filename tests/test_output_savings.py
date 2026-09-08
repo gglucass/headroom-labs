@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from headroom.proxy.output_savings import (
@@ -421,6 +423,94 @@ class TestHoldoutClusterGate:
         ledger = SavingsLedger.load(tmp_path / "savings.json")
         assert ledger.treatment["opus|a|s|tools"].n == 1
         assert ledger.treatment["opus|a|s|tools"].n_clusters == 0
+
+    # -- provenance: clusters vouch for labelled observations, nothing else ---
+
+    @staticmethod
+    def _legacy_ledger_dict(requests=2_500, control_tokens=1000, treat_tokens=2000):
+        """An arm as an upgraded ledger holds it: totals, no conversations.
+
+        Those requests could all be one conversation -- the exact case the
+        cluster gate exists to exclude -- and nothing on disk can say.
+        """
+        return {
+            "baseline": {"strata": {}},
+            "treatment": {
+                "opus|a|s|tools": {
+                    "n": requests,
+                    "sum": float(requests * treat_tokens),
+                    "sumsq": float(requests * treat_tokens**2),
+                }
+            },
+            "control": {
+                "opus|a|s|tools": {
+                    "n": requests,
+                    "sum": float(requests * control_tokens),
+                    "sumsq": float(requests * control_tokens**2),
+                }
+            },
+        }
+
+    def test_upgraded_legacy_traffic_never_joins_the_measured_arm(self, tmp_path):
+        """Five fresh conversations qualify the STRATUM, not the back catalogue.
+
+        Before this split the reload kept n/sum/sumsq and the new labelled
+        observations only added clusters to the same accumulator, so the moment
+        the gate opened all 2,500 unattributable requests an arm were measured
+        too -- reporting -99.8% over 2,505 requests while the conversations
+        actually observed showed no difference at all.
+        """
+        path = tmp_path / "savings.json"
+        path.write_text(json.dumps(self._legacy_ledger_dict()))
+        ledger = SavingsLedger.load(path)
+        assert ledger.estimate_from_holdout() is None, "legacy traffic alone cannot qualify"
+
+        for i in range(MEASURED_MIN_CLUSTERS):
+            ledger.record("control", "opus|a|s|tools", 1000, f"c{i}")
+            ledger.record("treatment", "opus|a|s|tools", 1000, f"t{i}")
+
+        est = ledger.estimate_from_holdout()
+        assert est is not None, "the labelled conversations are a real sample"
+        # Only the labelled requests are measured, and they show no difference.
+        assert est.n_requests == MEASURED_MIN_CLUSTERS
+        assert est.tokens_saved == pytest.approx(0.0)
+        assert est.pct == pytest.approx(0.0)
+        # The totals survive for the estimated / modelled tiers and reporting.
+        assert ledger.treatment["opus|a|s|tools"].n == 2_500 + MEASURED_MIN_CLUSTERS
+
+    def test_the_qualified_subset_survives_a_save_load_cycle(self, tmp_path):
+        """The split has to persist, or the next restart re-merges the arms."""
+        path = tmp_path / "savings.json"
+        path.write_text(json.dumps(self._legacy_ledger_dict()))
+        ledger = SavingsLedger.load(path)
+        for i in range(MEASURED_MIN_CLUSTERS):
+            ledger.record("control", "opus|a|s|tools", 1000, f"c{i}")
+            ledger.record("treatment", "opus|a|s|tools", 1000, f"t{i}")
+        ledger.save(path)
+
+        reloaded = SavingsLedger.load(path)
+        est = reloaded.estimate_from_holdout()
+        assert est is not None
+        assert est.n_requests == MEASURED_MIN_CLUSTERS
+        assert est.tokens_saved == pytest.approx(0.0)
+        assert reloaded.treatment["opus|a|s|tools"].n == 2_500 + MEASURED_MIN_CLUSTERS
+
+    def test_later_unlabelled_requests_stay_out_of_a_qualified_stratum(self):
+        """Qualifying a stratum does not open it to unattributable traffic."""
+        ledger = SavingsLedger()
+        for i in range(MEASURED_MIN_CLUSTERS):
+            ledger.record("control", "opus|a|s|tools", 1000, f"c{i}")
+            ledger.record("treatment", "opus|a|s|tools", 1000, f"t{i}")
+        before = ledger.estimate_from_holdout()
+        assert before is not None
+
+        for _ in range(2_000):
+            ledger.record("treatment", "opus|a|s|tools", 5)
+
+        after = ledger.estimate_from_holdout()
+        assert after is not None
+        assert after.n_requests == before.n_requests
+        assert after.tokens_saved == pytest.approx(before.tokens_saved)
 
 
 # ---------------------------------------------------------------------------

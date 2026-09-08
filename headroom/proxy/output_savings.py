@@ -98,14 +98,32 @@ class _Accum:
     n: int = 0
     sum: float = 0.0
     sumsq: float = 0.0
-    #: Distinct conversation ids behind ``n``, capped at ``_CLUSTER_CAP``.
+    #: Distinct conversation ids behind ``qn``, capped at ``_CLUSTER_CAP``.
     clusters: set[str] = field(default_factory=set)
+    #: The conversation-QUALIFIED subset of n / sum / sumsq: observations that
+    #: arrived carrying a conversation label. Kept separate because the cluster
+    #: count alone cannot vouch for the totals. An accumulator upgraded from an
+    #: older ledger holds requests of unknown provenance -- possibly one
+    #: conversation, possibly thousands -- and five fresh labelled
+    #: conversations arriving afterwards would otherwise qualify all of that
+    #: legacy traffic for the measured estimate too, which is exactly the case
+    #: the cluster gate exists to exclude. Later unlabelled requests are
+    #: likewise kept out of an already-qualified stratum. The full totals stay
+    #: intact for the estimated / modelled tiers and historical reporting.
+    qn: int = 0
+    qsum: float = 0.0
+    qsumsq: float = 0.0
 
     def add(self, x: float, cluster: str | None = None) -> None:
         self.n += 1
         self.sum += x
         self.sumsq += x * x
-        if cluster is not None and len(self.clusters) < _CLUSTER_CAP:
+        if cluster is None:
+            return
+        self.qn += 1
+        self.qsum += x
+        self.qsumsq += x * x
+        if len(self.clusters) < _CLUSTER_CAP:
             self.clusters.add(cluster)
 
     @property
@@ -129,6 +147,18 @@ class _Accum:
             return 0.0
         return max(0.0, (self.sumsq - self.sum * self.sum / self.n) / (self.n - 1))
 
+    @property
+    def qmean(self) -> float:
+        """Mean over the conversation-qualified observations only."""
+        return self.qsum / self.qn if self.qn else 0.0
+
+    @property
+    def qvar(self) -> float:
+        """Sample variance over the conversation-qualified observations only."""
+        if self.qn < 2:
+            return 0.0
+        return max(0.0, (self.qsumsq - self.qsum * self.qsum / self.qn) / (self.qn - 1))
+
     def merge(self, other: _Accum) -> None:
         """Fold another accumulator's observations into this one.
 
@@ -138,6 +168,9 @@ class _Accum:
         self.n += other.n
         self.sum += other.sum
         self.sumsq += other.sumsq
+        self.qn += other.qn
+        self.qsum += other.qsum
+        self.qsumsq += other.qsumsq
         self.clusters |= set(list(other.clusters)[: _CLUSTER_CAP - len(self.clusters)])
 
     def to_dict(self) -> dict[str, Any]:
@@ -146,6 +179,10 @@ class _Accum:
         # track) serializes exactly as it did before.
         if self.clusters:
             d["clusters"] = sorted(self.clusters)
+        if self.qn:
+            d["qn"] = self.qn
+            d["qsum"] = self.qsum
+            d["qsumsq"] = self.qsumsq
         return d
 
     @classmethod
@@ -155,6 +192,11 @@ class _Accum:
         a.sum = float(d.get("sum", 0.0))
         a.sumsq = float(d.get("sumsq", 0.0))
         a.clusters = {str(c) for c in (d.get("clusters") or ())}
+        # Absent in a pre-upgrade ledger, which is the point: those requests
+        # carry no conversation provenance and stay out of the measured arm.
+        a.qn = int(d.get("qn", 0))
+        a.qsum = float(d.get("qsum", 0.0))
+        a.qsumsq = float(d.get("qsumsq", 0.0))
         return a
 
 
@@ -347,11 +389,17 @@ class SavingsLedger:
     def estimate_from_holdout(self) -> SavingsEstimate | None:
         """A/B measurement: per-stratum control mean minus treatment mean.
 
-        Only strata with data in BOTH arms contribute, and only once both
-        arms hold :data:`MEASURED_MIN_CLUSTERS` distinct conversations.
-        Returns ``None`` if no such stratum exists (no holdout traffic yet, or
-        none of it spread across enough conversations). Weighted by treatment
-        volume; this is the unbiased causal number.
+        Only strata with conversation-labelled data in BOTH arms contribute,
+        and only once both arms hold :data:`MEASURED_MIN_CLUSTERS` distinct
+        conversations. Returns ``None`` if no such stratum exists (no holdout
+        traffic yet, or none of it spread across enough conversations).
+        Weighted by treatment volume; this is the unbiased causal number.
+
+        The number is built from the QUALIFIED subset of each arm, never the
+        arm totals: an upgraded ledger's legacy requests have no conversation
+        provenance, so five fresh conversations arriving afterwards must not
+        drag thousands of unattributable requests into the measurement with
+        them. The totals remain available to the estimated and modelled tiers.
 
         The cluster gate is not a sample-size nicety. Assignment is
         conversation-stable, so the requests inside one conversation are one
@@ -368,18 +416,20 @@ class SavingsLedger:
         contributing = 0
         for key, t in self.treatment.items():
             c = self.control.get(key)
-            if c is None or c.n == 0 or t.n == 0:
+            if c is None or c.qn == 0 or t.qn == 0:
                 continue
             if c.n_clusters < MEASURED_MIN_CLUSTERS or t.n_clusters < MEASURED_MIN_CLUSTERS:
                 continue
             contributing += 1
-            n = t.n
+            # Everything below reads the qualified subset only. The clusters
+            # vouch for those observations and for nothing else.
+            n = t.qn
             n_requests += n
-            delta = c.mean - t.mean  # tokens saved per request in this stratum
+            delta = c.qmean - t.qmean  # tokens saved per request in this stratum
             total_saved += n * delta
-            total_baseline += n * c.mean
+            total_baseline += n * c.qmean
             # Var of (c.mean - t.mean) = σ²_c/n_c + σ²_t/n_t, scaled by n².
-            var += (n * n) * (c.var / c.n + t.var / t.n)
+            var += (n * n) * (c.qvar / c.qn + t.qvar / t.qn)
         if contributing == 0:
             return None
         return self._finalize(total_saved, total_baseline, var, n_requests, "measured")
