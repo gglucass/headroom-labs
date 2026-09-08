@@ -3620,6 +3620,27 @@ def _kill_proxy_by_pid(pid: int, port: int) -> bool:
     Sends SIGTERM first, falls back to SIGKILL after 5 seconds.
     Returns True if the port is free afterwards, False otherwise.
     """
+    if sys.platform == "win32":
+        # ``os.kill(..., SIGTERM)`` only targets one Windows process.  The
+        # native proxy launcher can own a serving child, so terminating the
+        # reported PID alone may leave that child bound to the port.  Walk the
+        # verified Headroom process tree, matching the existing Serena cleanup
+        # strategy used elsewhere in this module.
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        except Exception:
+            pass
+        for _ in range(50):
+            time.sleep(0.1)
+            if not _check_proxy(port):
+                return True
+        return False
+
     try:
         os.kill(pid, signal.SIGTERM)
     except PermissionError:
@@ -4601,6 +4622,19 @@ def _make_cleanup(proxy_proc_holder: list, port: int | list[int] = 8787) -> Any:
             if _other_clients_exist():
                 # Other clients still using the proxy — leave it running.
                 return
+            # Snapshot the serving PID before terminating the launcher.  On
+            # Windows the detached serving child can briefly make /health
+            # unavailable while the launcher exits, causing the later safety
+            # probe to classify our own listener as "unidentified" and leave
+            # it orphaned.  We still verify it through Headroom's health
+            # payload before trusting the PID.
+            serving_pid: int | None = None
+            if sys.platform == "win32" and _check_proxy(p):
+                running_config = _query_proxy_config(p)
+                try:
+                    serving_pid = int(running_config["pid"]) if running_config else None
+                except (KeyError, TypeError, ValueError):
+                    serving_pid = None
             if proc.poll() is None:
                 proc.terminate()
                 try:
@@ -4614,6 +4648,8 @@ def _make_cleanup(proxy_proc_holder: list, port: int | list[int] = 8787) -> Any:
             # Ctrl+C from the last wrapper must still stop the listener.
             if sys.platform == "win32" and _check_proxy(p):
                 stop_status = _stop_local_proxy_for_unwrap(p)
+                if stop_status == "unidentified" and serving_pid is not None:
+                    stop_status = "stopped" if _kill_proxy_by_pid(serving_pid, p) else "failed"
                 if stop_status not in {"stopped", "not_running"}:
                     click.echo(
                         f"  Warning: proxy on port {p} remained running "
@@ -6043,7 +6079,7 @@ def vscode_claude(
             click.echo("  Keep this command running. Press Ctrl+C to stop the proxy.")
             click.echo("  Authentication and the selected Claude model are preserved.")
             click.echo("  Undo later with: headroom unwrap vscode-claude")
-            click.echo("  Guide: https://headroom-docs.vercel.app/docs/vscode-claude-code")
+            click.echo("  Guide: https://docs.headroomlabs.ai/docs/vscode-claude-code")
             return
         click.echo(f"  Add these values under 'env' in {target_settings}:")
         click.echo(f'  "ANTHROPIC_BASE_URL": "{proxy_url}",')

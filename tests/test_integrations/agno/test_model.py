@@ -19,11 +19,6 @@ try:
     AGNO_AVAILABLE = True
 except ImportError:
     AGNO_AVAILABLE = False
-else:
-    try:  # agno < 3: the per-message usage dataclass lived at agno.models.metrics
-        from agno.models.metrics import Metrics
-    except ImportError:  # agno >= 3 moved it to agno.metrics, renamed MessageMetrics
-        from agno.metrics import MessageMetrics as Metrics
 
 from headroom import HeadroomConfig, HeadroomMode
 
