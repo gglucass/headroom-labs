@@ -30,6 +30,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+from headroom.proxy.conversation_savings import get_conversation_savings
+
 logger = logging.getLogger("headroom.proxy")
 
 
@@ -122,6 +124,20 @@ class RequestOutcome:
     #     one-field-add that proves the refactor pays out: per-
     #     harness visibility appears across EVERY handler with zero
     #     new bookkeeping at the call sites.
+    # conversation_key: stable across every turn of one conversation, from
+    #     ``conversation_key_from_body``. Paired with
+    #     ``conversation_tokens_saved`` it lets the funnel tell a first-time
+    #     removal from a re-run of one already counted. Both stay ``None`` on
+    #     paths whose ``tokens_saved`` is already novel-only -- every provider
+    #     that freezes its cached prefix, which is all of them except OpenAI's
+    #     ``/v1/responses``. See ``conversation_savings``.
+    # conversation_tokens_saved: the conversation's RUNNING removed-token
+    #     total as of this request, which on ``/v1/responses`` is what the
+    #     compressor reports every turn because it recompresses the whole
+    #     transcript. Not the same quantity as ``tokens_saved`` on the WS
+    #     path, where the outcome carries a per-turn delta.
+    conversation_key: str | None = None
+    conversation_tokens_saved: int | None = None
     transforms_applied: tuple[str, ...] = ()
     waste_signals: dict[str, int] | None = None
     num_messages: int = 0
@@ -208,6 +224,8 @@ class RequestOutcome:
         pipeline_timing: dict[str, float] | None = None,
         waste_signals: dict[str, int] | None = None,
         original_messages: list[dict] | None = None,
+        conversation_key: str | None = None,
+        conversation_tokens_saved: int | None = None,
     ) -> RequestOutcome:
         """Construct an outcome from the locals available at streaming
         finalize. Three streaming finalizers
@@ -280,6 +298,8 @@ class RequestOutcome:
             optimized_tokens=optimized_tokens,
             output_tokens=output_tokens,
             tokens_saved=tokens_saved,
+            conversation_key=conversation_key,
+            conversation_tokens_saved=conversation_tokens_saved,
             attempted_input_tokens=optimized_tokens + tokens_saved,
             cache_read_tokens=cache_read_tokens,
             cache_write_tokens=cache_write_tokens,
@@ -349,13 +369,25 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     # HTTP middleware / WS accept captured from ``X-Headroom-Project``.
     project = outcome.project or get_current_project()
 
+    # Savings that are new to this conversation. Per-request descriptions
+    # below keep ``outcome.tokens_saved`` -- the wire truth for THIS request --
+    # while everything that accumulates across turns uses this, so a removed
+    # token is counted once per conversation instead of once per turn. Falls
+    # back to ``tokens_saved`` on paths that do not distinguish, which is
+    # already the novel figure there. See ``conversation_savings``.
+    novel_tokens_saved = get_conversation_savings().novel(
+        outcome.conversation_key, outcome.conversation_tokens_saved
+    )
+    if novel_tokens_saved is None:
+        novel_tokens_saved = outcome.tokens_saved
+
     # 1. Prometheus / SavingsTracker.
     await handler.metrics.record_request(
         provider=outcome.provider,
         model=outcome.model,
         input_tokens=outcome.optimized_tokens,
         output_tokens=outcome.output_tokens,
-        tokens_saved=outcome.tokens_saved,
+        tokens_saved=novel_tokens_saved,
         latency_ms=outcome.total_latency_ms,
         cached=outcome.cache_hit,
         overhead_ms=outcome.overhead_ms,
@@ -377,7 +409,7 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     if cost_tracker is not None:
         cost_tracker.record_tokens(
             outcome.model,
-            outcome.tokens_saved,
+            novel_tokens_saved,
             outcome.optimized_tokens,
             cache_read_tokens=outcome.cache_read_tokens,
             cache_write_tokens=outcome.cache_write_tokens,
@@ -427,11 +459,17 @@ async def emit_request_outcome(handler: Any, outcome: RequestOutcome) -> None:
     #    line unchanged, and gives ``headroom perf --client X``
     #    parsers a clean key to filter on.
     client_part = f" client={outcome.client}" if outcome.client else ""
+    # Only when it differs: on every path that reports novel-only savings the
+    # two are equal and a second identical number is noise.
+    novel_part = (
+        f"tok_novel={novel_tokens_saved} " if novel_tokens_saved != outcome.tokens_saved else ""
+    )
     logger.info(
         f"[{outcome.request_id}] PERF "
         f"model={outcome.model} msgs={outcome.num_messages} "
         f"tok_before={outcome.original_tokens} tok_after={outcome.optimized_tokens} "
         f"tok_saved={outcome.tokens_saved} "
+        f"{novel_part}"
         f"cache_read={outcome.cache_read_tokens} cache_write={outcome.cache_write_tokens} "
         f"cache_hit_pct={outcome.cache_hit_pct} "
         f"opt_ms={outcome.overhead_ms:.0f} "

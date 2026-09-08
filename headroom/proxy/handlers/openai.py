@@ -3568,6 +3568,21 @@ class OpenAIHandlerMixin:
             )
             url = _append_request_query(url, request.url.query)
 
+        # Responses re-sends the whole transcript every turn and the router
+        # recompresses all of it, so ``tokens_saved`` below is the running
+        # total for the CONVERSATION, not for this turn. Carrying the key and
+        # the total lets the funnel count each removed token once instead of
+        # once per remaining turn (see ``conversation_savings``). Derived
+        # before compression so a rewritten first user message cannot move the
+        # key mid-conversation. Left None when compression did not run: a
+        # bypassed turn saves nothing and must not reset the running total.
+        from headroom.proxy.output_savings import conversation_key_from_body
+
+        responses_conversation_key: str | None = None
+        _pre_compression_conversation_key = (
+            conversation_key_from_body(body) if isinstance(body, dict) else None
+        )
+
         # The standalone Rust proxy has native /v1/responses item handling,
         # but the default CLI runtime is this Python proxy. Compress the
         # Python runtime path here by extracting mutable Responses text into
@@ -3595,6 +3610,7 @@ class OpenAIHandlerMixin:
                 if _modified:
                     body_mutation_tracker.mark_mutated("responses_compression")
                     tokens_saved = int(_tokens_saved)
+                    responses_conversation_key = _pre_compression_conversation_key
                     optimized_tokens = max(0, original_tokens - tokens_saved)
                     transforms_applied = [*_transforms, *list(transforms_applied)]
                     logger.info(
@@ -3744,6 +3760,8 @@ class OpenAIHandlerMixin:
                     body_mutated=body_mutation_tracker.mutated,
                     mutation_reasons=body_mutation_tracker.reasons,
                     waste_signals=waste_signals_dict,
+                    conversation_key=responses_conversation_key,
+                    conversation_tokens_saved=tokens_saved,
                 )
             else:
                 headers = await apply_copilot_api_auth(headers, url=url)
@@ -3945,6 +3963,8 @@ class OpenAIHandlerMixin:
                         waste_signals=waste_signals_dict,
                         num_messages=len(messages) if isinstance(messages, list) else 0,
                         tags=_resp_log_tags,
+                        conversation_key=responses_conversation_key,
+                        conversation_tokens_saved=tokens_saved,
                         turn_id=compute_turn_id(model, body.get("instructions"), messages),
                         request_messages=messages
                         if getattr(self.config, "log_full_messages", False)
@@ -4472,6 +4492,15 @@ class OpenAIHandlerMixin:
             attempted_input_tokens_total = 0
             transforms_applied: list[str] = []
             ws_frames_compressed = 0
+            # ``tokens_saved`` below SUMS each frame's figure, and each frame's
+            # figure is the whole transcript's removals as of that turn. The
+            # conversation's running total is therefore the LAST frame's
+            # figure, not the sum -- that is what the funnel differences to
+            # count a removed token once (see ``conversation_savings``).
+            from headroom.proxy.output_savings import conversation_key_from_body
+
+            ws_conversation_key: str | None = None
+            ws_conversation_tokens_saved: int | None = None
             try:
                 body = json.loads(first_msg_raw)
             except json.JSONDecodeError:
@@ -4916,6 +4945,12 @@ class OpenAIHandlerMixin:
                                 )
                                 _record_ws_compression_overhead(_rewrite_ms)
                                 tokens_saved += int(_ws_saved)
+                                ws_conversation_tokens_saved = int(_ws_saved)
+                                ws_conversation_key = (
+                                    conversation_key_from_body(_send_body)
+                                    if isinstance(_send_body, dict)
+                                    else None
+                                )
                                 attempted_input_tokens_total += int(_ws_attempted_tokens)
                                 for _t in _ws_transforms:
                                     if _t not in transforms_applied:
@@ -5112,6 +5147,7 @@ class OpenAIHandlerMixin:
                         frames in the WS session.
                         """
                         nonlocal tokens_saved, transforms_applied, attempted_input_tokens_total
+                        nonlocal ws_conversation_key, ws_conversation_tokens_saved
                         nonlocal ws_frames_compressed
                         if _ws_bypass:
                             _log_ws_passthrough(
@@ -5315,6 +5351,12 @@ class OpenAIHandlerMixin:
                         )
                         _record_ws_compression_overhead(_rewrite_ms)
                         tokens_saved += int(frame_saved)
+                        ws_conversation_tokens_saved = int(frame_saved)
+                        ws_conversation_key = (
+                            conversation_key_from_body(new_inner)
+                            if isinstance(new_inner, dict)
+                            else None
+                        )
                         attempted_input_tokens_total += int(frame_attempted_tokens)
                         for t in frame_transforms:
                             if t not in transforms_applied:
@@ -5622,6 +5664,8 @@ class OpenAIHandlerMixin:
                                     if isinstance(body, dict)
                                     else 0,
                                     tags=ws_tags,
+                                    conversation_key=ws_conversation_key,
+                                    conversation_tokens_saved=ws_conversation_tokens_saved,
                                     client=client,
                                 )
                             )
@@ -6161,6 +6205,8 @@ class OpenAIHandlerMixin:
                         pipeline_timing=final_pipeline_timing,
                         transforms_applied=tuple(transforms_applied),
                         tags=ws_session_tags,
+                        conversation_key=ws_conversation_key,
+                        conversation_tokens_saved=ws_conversation_tokens_saved,
                         client=client,
                     )
                 )
