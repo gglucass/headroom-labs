@@ -3738,6 +3738,18 @@ class OpenAIHandlerMixin:
                 )
                 openai_frozen_count = 0
 
+        # Provider-confirmed floor for the cross-turn overlay at the end of this
+        # function. This is the count derived from OpenAI's own
+        # `prompt_tokens_details.cached_tokens` (via the shared tracker),
+        # snapshotted HERE rather than read at the call site: the token path's
+        # `prepare_turn` below runs FREEZE_POLICY_REPLAYABLE, whose count is
+        # `max(cache_count, explicit)` over the LOCAL byte-replay cache and can
+        # therefore exceed what the provider actually confirmed. Replaying past
+        # the confirmed point unconditionally would pin content the provider
+        # never cached. A cold prefix zeroes this above, which collapses the
+        # floor and lets every accumulated improvement land - same as Anthropic.
+        _openai_confirmed_frozen = max(int(openai_frozen_count or 0), 0)
+
         _compression_failed = False
         original_messages = messages  # Preserve for 400-retry fallback
         # Cross-turn dedup rewrites repeated tool-output spans to bare
@@ -3918,6 +3930,18 @@ class OpenAIHandlerMixin:
             openai_prefix_tracker.get_last_original_messages(),
             openai_prefix_tracker.get_last_forwarded_messages(),
             count_tokens=tokenizer.count_messages,
+            # Same reasoning as the Anthropic call site: inside the
+            # provider-confirmed prefix the replay source IS what OpenAI
+            # hashed, so declining a byte-larger replay there re-forwards
+            # recompressed history and busts the prompt cache from the first
+            # changed byte. Beyond the floor the size bound still arbitrates.
+            # Exposure here is narrower than Anthropic's - the token path's
+            # REPLAYABLE freeze already stops most recompression of
+            # already-forwarded messages - but it is not zero: an entry
+            # evicted from the local byte-replay cache falls out of that
+            # freeze and can be recompressed, and cache mode freezes from the
+            # tracker only.
+            confirmed_frozen_count=_openai_confirmed_frozen,
         )
         if _final.replayed:
             optimized_messages = _final.messages
