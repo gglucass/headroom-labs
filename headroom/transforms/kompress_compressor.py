@@ -1300,12 +1300,10 @@ _payload_encoder: Any = None
 def payload_tokens(text: str) -> int:
     """Token count of a complete payload, in one consistent unit.
 
-    The unit is cl100k_base (tiktoken, a hard dependency): exact for OpenAI
-    models and an ESTIMATE for every other provider, whose tokenizers differ
-    in detail but not in the shape that matters here (a hex hash is many
-    tokens, a common word is one, a word's tokenization depends on what
-    precedes it). Without an encoder, one token per character, the most any
-    BPE can produce.
+    The unit is cl100k_base (tiktoken, a hard dependency), used as a fixed
+    estimate. Actual model tokenizers, including those of other OpenAI
+    models, can differ. Without an encoder, the fallback compares character
+    counts; that heuristic is not a bound on provider token counts.
 
     The CCR gate measures the whole original and the whole candidate-plus-
     marker with this, never a marker-only cost against a word count: the
