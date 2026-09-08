@@ -3333,10 +3333,15 @@ def strip_unsupported_tool_search_blocks(messages: Any, tools: Any) -> tuple[Any
                     dropped = 0
                     for b in inner:
                         if isinstance(b, dict) and b.get("type") == "tool_reference":
+                            # Validated against the available definitions ONLY.
+                            # A built-in tool_search_tool_* is deliberately not
+                            # required: Anthropic supports a custom client-side
+                            # search that returns tool_reference blocks from a
+                            # plain tool_use/tool_result pair, referencing the
+                            # top-level tools array. Gating on the server tool
+                            # deleted those valid references.
                             name = b.get("tool_name") or b.get("name")
-                            if not has_search_tool or (
-                                name is not None and str(name) not in available
-                            ):
+                            if name is not None and str(name) not in available:
                                 dropped += 1
                                 continue
                         kept_inner.append(b)

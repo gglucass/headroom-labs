@@ -718,3 +718,36 @@ def test_repair_drops_when_referenced_tool_absent_despite_search_tool_present() 
     ]
     messages, removed = strip_unsupported_tool_search_blocks(transcript, tools)
     assert removed == 2
+
+
+def test_repair_keeps_custom_client_side_references_without_a_builtin_search_tool() -> None:
+    """Anthropic supports a custom client-side search: a normal tool_use /
+    tool_result pair returning tool_reference blocks that point at the
+    top-level tools array. No ``tool_search_tool_*`` server tool is involved,
+    so gating the client-side branch on one deleted every valid reference."""
+    transcript = _client_side_transcript("Calendar")
+    messages, removed = strip_unsupported_tool_search_blocks(
+        transcript,
+        [
+            {"name": "ToolSearch", "input_schema": {}},
+            {"name": "Calendar", "input_schema": {}, "defer_loading": True},
+        ],
+    )
+    assert removed == 0
+    assert messages is transcript
+
+
+def test_repair_still_drops_an_absent_reference_without_a_builtin_search_tool() -> None:
+    messages, removed = strip_unsupported_tool_search_blocks(
+        _client_side_transcript("Calendar", "mcp__x__ghost"),
+        [
+            {"name": "ToolSearch", "input_schema": {}},
+            {"name": "Calendar", "input_schema": {}, "defer_loading": True},
+        ],
+    )
+    assert removed == 1
+    refs = messages[1]["content"][0]["content"]
+    names = [
+        r["tool_name"] for r in refs if isinstance(r, dict) and r.get("type") == "tool_reference"
+    ]
+    assert names == ["Calendar"]
