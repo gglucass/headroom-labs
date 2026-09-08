@@ -4376,6 +4376,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 OutputShaperSettings,
                 resolve_verbosity_level,
                 shaper_enabled_for,
+                steering_allowed_for,
             )
 
             # The active steering level enables the modelled fallback, which is
@@ -4385,12 +4386,24 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             _shaper_active = False
             _olevel: int | None = None
             try:
+                _oconfig = getattr(proxy, "config", None)
                 _osettings = OutputShaperSettings.from_env(
-                    enabled=shaper_enabled_for(getattr(proxy, "config", None))
+                    enabled=shaper_enabled_for(_oconfig),
+                    # Cache mode forces the resolved level to 0. The request
+                    # handlers pass this too; /stats has to build the SAME
+                    # settings or it reads a level the handlers never used.
+                    steering_enabled=steering_allowed_for(_oconfig),
                 )
                 if _osettings.enabled:
-                    _shaper_active = True
                     _olevel = resolve_verbosity_level(_osettings)[0]
+                    # Steering is the only lever this layer's ledger measures,
+                    # and level 0 is the documented "no steering" value -- the
+                    # same test `shape_request` applies before it touches a
+                    # body. An enabled shaper resolved to 0 (cache mode, an
+                    # explicit HEADROOM_VERBOSITY_LEVEL=0, a learned or
+                    # controller zero) shapes nothing, so it must not publish
+                    # the persisted ledger as a live claim either.
+                    _shaper_active = _olevel > 0
             except Exception:  # pragma: no cover - defensive
                 _shaper_active = False
                 _olevel = None

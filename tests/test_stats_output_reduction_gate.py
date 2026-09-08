@@ -129,3 +129,99 @@ def test_ledger_written_before_the_rule_drops_its_arms_but_keeps_the_baseline():
     assert ledger.baseline.lookup("opus|chat|m|tools")[2] == 40
     # Round-tripping now carries the marker, so it is kept next time.
     assert SavingsLedger.from_dict(ledger.to_dict()).baseline.lookup("opus|chat|m|tools")[2] == 40
+
+
+# --- endpoint-level: the boolean /stats actually passes ----------------------
+#
+# The payload helper above is only half the gate. The other half is which
+# boolean the /stats route hands it, and that is derived from the shaper's
+# EFFECTIVE steering configuration — the same one the request handlers build.
+# An enabled shaper whose level resolves to 0 (cache mode, an explicit
+# override, a learned or controller zero) shapes nothing, so it must not
+# publish the persisted ledger either. Testing the helper alone cannot catch a
+# wrong boolean at the call site.
+
+
+def _live_estimate() -> SavingsEstimate:
+    return SavingsEstimate(
+        tokens_saved=200.0,
+        baseline_tokens=1000.0,
+        pct=20.0,
+        ci_low_pct=15.0,
+        ci_high_pct=25.0,
+        n_requests=5,
+        kind="measured",
+    )
+
+
+def _stats_output_reduction(tmp_path, monkeypatch, *, mode: str = "token"):
+    """Hit the real /stats route with a ledger that already holds an estimate."""
+    from fastapi.testclient import TestClient
+
+    import headroom.proxy.output_savings as output_savings
+    from headroom.proxy.server import ProxyConfig, create_app
+
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path))
+    monkeypatch.setenv("HEADROOM_SAVINGS_PATH", str(tmp_path / "proxy_savings.json"))
+    monkeypatch.setenv("HEADROOM_OUTPUT_SHAPER", "1")
+
+    class _Recorder:
+        def estimate(self, level=None):
+            return _live_estimate()
+
+    monkeypatch.setattr(output_savings, "get_recorder", lambda: _Recorder())
+
+    config = ProxyConfig(
+        mode=mode,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        log_requests=False,
+    )
+    with TestClient(create_app(config)) as client:
+        response = client.get("/stats")
+    assert response.status_code == 200
+    return response.json()["tokens"]["output_reduction"]
+
+
+def test_stats_publishes_the_estimate_while_steering_is_live(tmp_path, monkeypatch):
+    monkeypatch.setenv("HEADROOM_VERBOSITY_LEVEL", "3")
+    payload = _stats_output_reduction(tmp_path, monkeypatch)
+    assert payload["active"] is True
+    assert payload["method"] == "measured"
+    assert payload["tokens_saved"] == 200
+    assert payload["reduction_percent"] == 20.0
+
+
+def test_stats_gates_an_explicit_verbosity_zero(tmp_path, monkeypatch):
+    monkeypatch.setenv("HEADROOM_VERBOSITY_LEVEL", "0")
+    payload = _stats_output_reduction(tmp_path, monkeypatch)
+    assert payload["active"] is False
+    assert payload["method"] == "inactive"
+    assert payload["tokens_saved"] == 0
+    assert payload["reduction_percent"] == 0.0
+
+
+def test_stats_gates_a_learned_verbosity_zero(tmp_path, monkeypatch):
+    monkeypatch.delenv("HEADROOM_VERBOSITY_LEVEL", raising=False)
+    (tmp_path / "verbosity.json").write_text('{"verbosity_level": 0}')
+    payload = _stats_output_reduction(tmp_path, monkeypatch)
+    assert payload["active"] is False
+    assert payload["method"] == "inactive"
+
+
+def test_stats_gates_a_controller_verbosity_zero(tmp_path, monkeypatch):
+    monkeypatch.delenv("HEADROOM_VERBOSITY_LEVEL", raising=False)
+    monkeypatch.setenv("HEADROOM_VERBOSITY_AUTOTUNE", "1")
+    (tmp_path / "verbosity_controller.json").write_text('{"level": 0}')
+    payload = _stats_output_reduction(tmp_path, monkeypatch)
+    assert payload["active"] is False
+    assert payload["method"] == "inactive"
+
+
+def test_stats_gates_cache_mode_even_with_a_level_set(tmp_path, monkeypatch):
+    """``mode="cache"`` forces the resolved level to 0 in the handlers. /stats
+    omitted ``steering_allowed_for``, so it kept publishing the ledger."""
+    monkeypatch.setenv("HEADROOM_VERBOSITY_LEVEL", "3")
+    payload = _stats_output_reduction(tmp_path, monkeypatch, mode="cache")
+    assert payload["active"] is False
+    assert payload["method"] == "inactive"
