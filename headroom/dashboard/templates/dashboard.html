@@ -223,12 +223,14 @@
                         <div class="text-xs text-gray-500 uppercase tracking-wide mb-1">Tokens Saved</div>
                         <div class="flex items-baseline gap-2">
                             <span class="text-3xl font-light tabular-nums text-accent" x-text="formatNumber(stats.tokens?.saved || 0)"></span>
-                            <!-- Active compression ratio: savings as a fraction of tokens we
-                                 *attempted* to compress (extracted units + tool schema). When
-                                 the attempted denominator is missing (backend-routed paths
-                                 that don't yet wire per-message live-zone tracking), fall back
-                                 to the whole-request ratio so the headline doesn't collapse to
-                                 0% while compression is happening (issue #455). -->
+                            <!-- Headline ratio: savings as a share of NEW input (uncached +
+                                 cache-write, the tokens compression could act on this turn)
+                                 when the provider reports a cache breakdown. The whole-wire
+                                 ratio recounts a session's cached history every turn, so a
+                                 long session reads ~0% there while compression is working;
+                                 it stays on the line below. Falls back to whole-wire when no
+                                 cache data exists (e.g. Bedrock) so the headline never
+                                 collapses to 0% while compression is happening (issue #455). -->
                             <span class="text-sm text-accent" x-text="headlineSavingsPercent.toFixed(1) + '%'" :title="headlineSavingsTitle"></span>
                         </div>
                         <div class="mt-1 text-xs text-gray-500 leading-relaxed">
@@ -2810,14 +2812,23 @@
 
                 // --- Headline savings percent ---
                 //
+                get headlineUsesNewInput() {
+                    return (this.stats.tokens?.new_input_tokens || 0) > 0;
+                },
+
                 get headlineSavingsPercent() {
+                    if (this.headlineUsesNewInput) {
+                        return this.stats.tokens?.new_input_savings_percent ?? 0;
+                    }
                     return this.stats.tokens?.savings_percent
                         ?? this.stats.tokens?.proxy_savings_percent
                         ?? 0;
                 },
 
                 get headlineSavingsTitle() {
-                    return 'Of total wire input tokens';
+                    return this.headlineUsesNewInput
+                        ? 'Of new input tokens (uncached + cache write): what compression could act on this turn'
+                        : 'Of total wire input tokens';
                 },
 
                 // --- Expandable Rows ---

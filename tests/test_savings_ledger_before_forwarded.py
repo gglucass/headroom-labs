@@ -64,8 +64,33 @@ async def test_record_savings_event_uses_original_input_as_before(
             "model": "claude-opus-4-6",
             "client": "claude-code",
             "source": "proxy",
+            # No cache breakdown on this request: the ledger gets no new-input
+            # denominator rather than a zero it would divide by.
+            "new_input_tokens": None,
+            "deferred_tokens": 0,
         }
     ]
+
+    # With a provider cache breakdown the ledger also gets the /stats
+    # new-input denominator (uncached + cache write) and the deferral share of
+    # the saving, so `headroom savings` can pair compression-only with new input.
+    calls.clear()
+    await metrics.record_request(
+        provider="anthropic",
+        model="claude-opus-4-6",
+        input_tokens=600,
+        output_tokens=25,
+        tokens_saved=400,
+        latency_ms=10.0,
+        client="claude-code",
+        cache_read_tokens=5000,
+        cache_write_tokens=700,
+        uncached_input_tokens=200,
+        tool_search_saved=150,
+    )
+    assert calls[0]["tokens_before"] == 1000 + 150
+    assert calls[0]["new_input_tokens"] == 900
+    assert calls[0]["deferred_tokens"] == 150
 
 
 @pytest.mark.asyncio

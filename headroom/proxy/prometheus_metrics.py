@@ -1004,6 +1004,17 @@ class PrometheusMetrics:
                 model=model,
                 client=client or "proxy",
                 source="proxy",
+                # Provider-billed new input (the /stats new_input denominator)
+                # and the deferral share of `saved`, so `headroom savings` can
+                # show the same new-input rate the dashboard headline does.
+                # Omitted when there is no cache breakdown (e.g. Bedrock), so
+                # the ledger never divides savings by themselves.
+                new_input_tokens=(
+                    int(uncached_input_tokens) + int(cache_write_tokens)
+                    if (uncached_input_tokens or cache_write_tokens)
+                    else None
+                ),
+                deferred_tokens=deferral_saved,
             )
 
         otel_metrics = self._get_otel_metrics()

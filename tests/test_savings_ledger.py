@@ -112,6 +112,50 @@ def test_windows_today_week_last30(monkeypatch, tmp_path):
     assert report.windows["today"]["savings_percent"] == pytest.approx(50.0)
 
 
+def test_new_input_basis_pairs_compression_only_with_new_input(monkeypatch, tmp_path):
+    _events_env(monkeypatch, tmp_path)
+    # 400 saved, of which 100 is tool-schema deferral; 900 tokens newly entered
+    # context. Compression-only 300 / (900 + 300) = 25%, same as /stats.
+    L.record_savings_event(
+        tokens_before=10_000,
+        tokens_after=9_600,
+        model=None,
+        client="claude-code",
+        new_input_tokens=900,
+        deferred_tokens=100,
+    )
+    # An event without a cache breakdown (MCP tool, Bedrock) keeps writing the
+    # old line and must not lend its savings to the new-input ratio.
+    L.record_savings_event(tokens_before=1000, tokens_after=500, model=None, client="mcp")
+    report = L.aggregate_savings()
+    window = report.windows["today"]
+    assert window["tokens_saved"] == 900
+    assert window["new_input_tokens"] == 900
+    assert window["new_input_savings_percent"] == pytest.approx(25.0)
+    clients = {row["client"]: row for row in report.by_client}
+    assert clients["mcp"]["new_input_tokens"] == 0
+    assert clients["mcp"]["new_input_savings_percent"] == 0.0
+    # The whole-wire ratio is untouched by the new field.
+    assert window["savings_percent"] == pytest.approx(900 / 11_000 * 100, abs=0.1)
+
+
+def test_savings_cli_prints_new_input_line_only_with_cache_data(monkeypatch, tmp_path):
+    from click.testing import CliRunner
+
+    from headroom.cli.savings import savings
+
+    _events_env(monkeypatch, tmp_path)
+    L.record_savings_event(tokens_before=1000, tokens_after=500, model=None, client="mcp")
+    out = CliRunner().invoke(savings, []).output
+    assert "of new input" not in out
+    L.record_savings_event(
+        tokens_before=10_000, tokens_after=9_600, model=None, client="c", new_input_tokens=900
+    )
+    out = CliRunner().invoke(savings, []).output
+    assert "of new input 30.8%" in out
+    assert "newly entered context" in out
+
+
 def test_retention_hard_capped_at_30_days(monkeypatch, tmp_path):
     _events_env(monkeypatch, tmp_path)
     now = datetime(2026, 6, 17, 12, 0, tzinfo=UTC)
