@@ -989,6 +989,7 @@ def test_tool_result_cache_control_protected(monkeypatch: pytest.MonkeyPatch) ->
             }
         ],
     }
+    counts: dict[str, int] = {}
     result = router._process_content_blocks(
         msg,
         msg["content"],
@@ -996,9 +997,98 @@ def test_tool_result_cache_control_protected(monkeypatch: pytest.MonkeyPatch) ->
         [],
         set(),
         set(),
+        route_counts=counts,
+        messages_from_end=3,
     )
-    # cache_control hard-skip applies to tool_result too
+    # cache_control hard-skip applies to tool_result too, on any message the
+    # provider may already hold under that key (anything but the final one).
     assert result["content"][0]["content"] == long_text
+    assert counts["cache_control_protected"] == 1
+
+
+def test_tool_result_cache_control_compressed_in_final_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The request's final user message has never been forwarded, so its
+    # cache_control marker is the client staking out NEXT turn's breakpoint,
+    # not a key the provider holds. Claude Code stamps its newest tool_result
+    # every turn; protecting it here skipped the freshest tool output on the
+    # one turn it was fresh.
+    router = ContentRouter(ContentRouterConfig())
+
+    def fake_compress(content, context: str = "", bias: float = 1.0, precomputed_detection=None):
+        # A real (hashable) lossless strategy: tool_result compression runs the
+        # reversibility gate, which looks the strategy up in a frozenset.
+        return SimpleNamespace(
+            compressed=content[: len(content) // 2] + "[compressed]",
+            compression_ratio=0.5,
+            strategy_used=CompressionStrategy.LOG,
+        )
+
+    monkeypatch.setattr(router, "compress", fake_compress)
+    long_text = "Z" * 1000
+    msg = {
+        "role": "user",
+        "content": [
+            {
+                "type": "tool_result",
+                "tool_use_id": "abc",
+                "content": long_text,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ],
+    }
+    counts: dict[str, int] = {}
+    result = router._process_content_blocks(
+        msg,
+        msg["content"],
+        "",
+        [],
+        set(),
+        set(),
+        route_counts=counts,
+        messages_from_end=1,
+    )
+    out = result["content"][0]
+    assert out["content"].endswith("[compressed]")
+    # The marker rides on the compressed block: that is what the provider
+    # caches, and what the frozen prefix replays next turn.
+    assert out["cache_control"] == {"type": "ephemeral"}
+    assert "cache_control_protected" not in counts
+    # Assistant blocks in the final position keep the hard skip: they are
+    # echoed back and were not the tool output this exception is for.
+    amsg = {
+        "role": "assistant",
+        "content": [{"type": "text", "text": long_text, "cache_control": {"type": "ephemeral"}}],
+    }
+    aresult = router._process_content_blocks(
+        amsg,
+        amsg["content"],
+        "",
+        [],
+        set(),
+        set(),
+        messages_from_end=1,
+        compress_assistant_text_blocks=True,
+    )
+    assert aresult["content"][0]["text"] == long_text
+    # A marked user TEXT block in the final position is the user's prompt,
+    # not tool output: it keeps the hard skip even with user compression on.
+    umsg = {
+        "role": "user",
+        "content": [{"type": "text", "text": long_text, "cache_control": {"type": "ephemeral"}}],
+    }
+    uresult = router._process_content_blocks(
+        umsg,
+        umsg["content"],
+        "",
+        [],
+        set(),
+        set(),
+        messages_from_end=1,
+        skip_user=False,
+    )
+    assert uresult["content"][0]["text"] == long_text
 
 
 def test_assistant_text_blocks_skipped_by_default(

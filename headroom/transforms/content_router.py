@@ -6057,7 +6057,18 @@ class ContentRouter(Transform):
              the cache key the upstream provider matches against, turning
              a 90% read discount into a 25% write penalty (Anthropic).
              We never modify cache_control'd blocks, regardless of role
-             or block type.
+             or block type -- EXCEPT a tool_result in the request's final
+             user/tool message. That message has never been forwarded, so
+             no provider key exists for it yet; the marker there is the
+             client staking out NEXT turn's breakpoint (Claude Code
+             stamps its newest tool_result every turn). Compressing it
+             now is what the marker gets cached as, and the frozen-prefix
+             guard replays those bytes from the next turn on. Skipping it
+             meant the freshest tool output was protected on the one turn
+             it was fresh (measured 1,229 cache_control_protected visits
+             across 650 Claude Code requests in a day, ~2 per request).
+             Text blocks keep the hard skip everywhere: a marked user
+             prompt is the user's words, not tool output.
           2. Assistant text blocks are echoed back by the client in
              subsequent turns and become part of the upstream provider's
              auto-prefix cache (DeepSeek, OpenAI). Default-skip; opt in
@@ -6112,6 +6123,13 @@ class ContentRouter(Transform):
         else:
             protect_text_blocks = True
 
+        # The final user/tool message is this turn's fresh content: not yet
+        # forwarded, so its cache_control marker names a key the provider has
+        # not written. Everything earlier may already be cached under its
+        # marker and stays byte-exact (contract 1). Only tool_result blocks
+        # are released; a marked text block is the user's prompt.
+        fresh_turn = messages_from_end == 1 and role in ("user", "tool")
+
         for block in content_blocks:
             if not isinstance(block, dict):
                 new_blocks.append(block)
@@ -6121,7 +6139,7 @@ class ContentRouter(Transform):
             # cache breakpoint. Frozen-message-count is a coarse
             # message-level approximation; this is the per-block
             # guarantee that we never bust an explicit cache key.
-            if "cache_control" in block:
+            if "cache_control" in block and not (fresh_turn and block.get("type") == "tool_result"):
                 new_blocks.append(block)
                 if route_counts is not None:
                     route_counts.setdefault("cache_control_protected", 0)
