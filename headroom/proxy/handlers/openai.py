@@ -3845,6 +3845,7 @@ class OpenAIHandlerMixin:
                                 if is_cache_mode(self.config.mode)
                                 else openai_frozen_count
                             ),
+                            prefix_replay_guaranteed=True,
                             biases=_hook_biases,
                             compression_policy=compression_policy,
                             cross_turn_dedup_recoverable=_dedup_pointers_recoverable,
@@ -3886,6 +3887,7 @@ class OpenAIHandlerMixin:
                             model_limit=context_limit,
                             context=extract_user_query(messages),
                             frozen_message_count=apply_frozen_count,
+                            prefix_replay_guaranteed=True,
                             biases=_hook_biases,
                             compression_policy=compression_policy,
                             cross_turn_dedup_recoverable=_dedup_pointers_recoverable,
@@ -9955,6 +9957,10 @@ class OpenAIHandlerMixin:
                     )
                     session_frozen = prep.frozen_message_count
                     pipeline_kwargs["frozen_message_count"] = session_frozen
+                    # finalize_turn below replays last turn's forwarded prefix,
+                    # which is what lets the router compress the final
+                    # message's cache_control tool_result (contract 1).
+                    pipeline_kwargs["prefix_replay_guaranteed"] = True
                     result = pipeline.apply(
                         messages=prep.pipeline_input, model=model, **pipeline_kwargs
                     )

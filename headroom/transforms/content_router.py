@@ -4809,6 +4809,11 @@ class ContentRouter(Transform):
             "compress_assistant_text_blocks",
             self.config.compress_assistant_text_blocks,
         )
+        # Set only by callers that replay last turn's forwarded prefix over
+        # this turn's output (the proxy handlers, via finalize_turn). It
+        # unlocks compression of a cache_control tool_result in the final
+        # message; see contract 1 in _process_content_blocks.
+        prefix_replay_guaranteed = kwargs.get("prefix_replay_guaranteed") is True
         min_chars_for_block_compression = kwargs.get(
             "min_chars_for_block_compression",
             self.config.min_chars_for_block_compression,
@@ -5159,6 +5164,7 @@ class ContentRouter(Transform):
                     skip_user=skip_user,
                     skip_system=skip_system,
                     compress_assistant_text_blocks=compress_assistant_text_blocks,
+                    prefix_replay_guaranteed=prefix_replay_guaranteed,
                 )
                 result_slots[i] = transformed_message
                 route_counts["content_blocks"] += 1
@@ -6048,6 +6054,7 @@ class ContentRouter(Transform):
         skip_user: bool = True,
         skip_system: bool = True,
         compress_assistant_text_blocks: bool = False,
+        prefix_replay_guaranteed: bool = False,
     ) -> dict[str, Any]:
         """Process content blocks (Anthropic format) for compression.
 
@@ -6067,8 +6074,16 @@ class ContentRouter(Transform):
              meant the freshest tool output was protected on the one turn
              it was fresh (measured 1,229 cache_control_protected visits
              across 650 Claude Code requests in a day, ~2 per request).
-             Text blocks keep the hard skip everywhere: a marked user
-             prompt is the user's words, not tool output.
+             The exception is only sound for a caller that replays last
+             turn's FORWARDED bytes over this turn's pipeline output (the
+             proxy's frozen-prefix overlay, session_engine.finalize_turn):
+             next turn the block is no longer final, this contract
+             hard-skips it again, and the router alone would forward the
+             client's original bytes and bust the key it just wrote.
+             Such callers pass ``prefix_replay_guaranteed=True``; every
+             other caller (SDK client, evals, a bare router) keeps the
+             hard skip. Text blocks keep the hard skip everywhere: a
+             marked user prompt is the user's words, not tool output.
           2. Assistant text blocks are echoed back by the client in
              subsequent turns and become part of the upstream provider's
              auto-prefix cache (DeepSeek, OpenAI). Default-skip; opt in
@@ -6128,7 +6143,9 @@ class ContentRouter(Transform):
         # not written. Everything earlier may already be cached under its
         # marker and stays byte-exact (contract 1). Only tool_result blocks
         # are released; a marked text block is the user's prompt.
-        fresh_turn = messages_from_end == 1 and role in ("user", "tool")
+        fresh_turn = (
+            prefix_replay_guaranteed and messages_from_end == 1 and role in ("user", "tool")
+        )
 
         for block in content_blocks:
             if not isinstance(block, dict):

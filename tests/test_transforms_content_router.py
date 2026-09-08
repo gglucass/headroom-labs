@@ -1048,6 +1048,7 @@ def test_tool_result_cache_control_compressed_in_final_message(
         set(),
         route_counts=counts,
         messages_from_end=1,
+        prefix_replay_guaranteed=True,
     )
     out = result["content"][0]
     assert out["content"].endswith("[compressed]")
@@ -1070,6 +1071,7 @@ def test_tool_result_cache_control_compressed_in_final_message(
         set(),
         messages_from_end=1,
         compress_assistant_text_blocks=True,
+        prefix_replay_guaranteed=True,
     )
     assert aresult["content"][0]["text"] == long_text
     # A marked user TEXT block in the final position is the user's prompt,
@@ -1087,8 +1089,102 @@ def test_tool_result_cache_control_compressed_in_final_message(
         set(),
         messages_from_end=1,
         skip_user=False,
+        prefix_replay_guaranteed=True,
     )
     assert uresult["content"][0]["text"] == long_text
+
+
+_FRESH_CC_OUTPUT = "tool output line " * 200
+
+
+def _fresh_cc_router(monkeypatch: pytest.MonkeyPatch) -> tuple[ContentRouter, list[str]]:
+    router = ContentRouter(ContentRouterConfig())
+    calls: list[str] = []
+
+    def fake_compress(content, context: str = "", bias: float = 1.0, precomputed_detection=None):
+        calls.append(content)
+        return SimpleNamespace(
+            compressed=content[: len(content) // 2] + "[compressed]",
+            compression_ratio=0.5,
+            strategy_used=CompressionStrategy.LOG,
+        )
+
+    monkeypatch.setattr(router, "compress", fake_compress)
+    return router, calls
+
+
+def _fresh_cc_turn1() -> list[dict]:
+    return [
+        {"role": "user", "content": "run the tests"},
+        {
+            "role": "assistant",
+            "content": [{"type": "tool_use", "id": "t1", "name": "bash", "input": {}}],
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "t1",
+                    "content": _FRESH_CC_OUTPUT,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+        },
+    ]
+
+
+def _fresh_cc_turn2() -> list[dict]:
+    return _fresh_cc_turn1() + [
+        {"role": "assistant", "content": "done"},
+        {"role": "user", "content": "now fix the lint"},
+    ]
+
+
+def test_fresh_cache_control_stays_hard_skipped_without_replay_guarantee(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A caller that hands apply() the client's raw transcript every turn with
+    # no frozen-prefix overlay (SDK client, evals, a bare router). Had turn 1
+    # compressed the marked block, turn 2 would hard-skip it (no longer final)
+    # and forward the original bytes, busting the key the marker names. So
+    # without the guarantee the block is never touched, on either turn.
+    router, calls = _fresh_cc_router(monkeypatch)
+    t1 = router.apply(_fresh_cc_turn1(), _ChurnTokenizer(), model_limit=100_000)
+    assert t1.messages[2]["content"][0]["content"] == _FRESH_CC_OUTPUT
+    t2 = router.apply(_fresh_cc_turn2(), _ChurnTokenizer(), model_limit=100_000)
+    assert t2.messages[2]["content"][0]["content"] == _FRESH_CC_OUTPUT
+    assert calls == []
+
+
+def test_fresh_cache_control_compressed_under_replay_guarantee_is_stable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from headroom.cache.prefix_tracker import overlay_cached_prefix
+
+    router, _ = _fresh_cc_router(monkeypatch)
+    kw = {"model_limit": 100_000, "prefix_replay_guaranteed": True}
+    t1 = router.apply(_fresh_cc_turn1(), _ChurnTokenizer(), **kw)
+    forwarded = t1.messages[2]["content"][0]
+    assert forwarded["content"].endswith("[compressed]")
+    assert forwarded["cache_control"] == {"type": "ephemeral"}
+    # Retried final message (the client resends the same transcript, e.g.
+    # after a 529): byte-identical, so the key written on the first attempt
+    # still matches.
+    retry = router.apply(_fresh_cc_turn1(), _ChurnTokenizer(), **kw)
+    assert retry.messages[2] == t1.messages[2]
+    # Next turn the block is no longer final and contract 1 hard-skips it, so
+    # the router alone emits the client's original bytes: this is the reversal
+    # the guarantee exists for.
+    t2_original = _fresh_cc_turn2()
+    t2 = router.apply(t2_original, _ChurnTokenizer(), **kw)
+    assert t2.messages[2]["content"][0]["content"] == _FRESH_CC_OUTPUT
+    # The guaranteeing caller replays last turn's forwarded prefix over the
+    # pipeline output (what the proxy does in finalize_turn), restoring the
+    # compressed bytes the provider cached under that marker.
+    replayed = overlay_cached_prefix(t2.messages, t2_original, _fresh_cc_turn1(), t1.messages)
+    assert replayed[2] == t1.messages[2]
+    assert replayed[3:] == t2.messages[3:]
 
 
 def test_assistant_text_blocks_skipped_by_default(
