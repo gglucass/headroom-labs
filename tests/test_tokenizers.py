@@ -727,3 +727,34 @@ class TestLargeToolBlobEstimation:
             cur = cur["n"]
         cur["leaf"] = "x" * 60_000
         assert EstimatingTokenCounter()._count_serialized(deep) >= 0
+
+
+class TestThinkingBlockCounting:
+    """Thinking blocks count their text, never the opaque signature."""
+
+    def test_thinking_signature_is_not_counted_as_text(self):
+        counter = EstimatingTokenCounter()
+        text = "consider the failing test " * 20
+        with_sig = {
+            "role": "assistant",
+            "content": [{"type": "thinking", "thinking": text, "signature": "A" * 4000}],
+        }
+        without_sig = {
+            "role": "assistant",
+            "content": [{"type": "thinking", "thinking": text}],
+        }
+        assert counter.count_messages([with_sig]) == counter.count_messages([without_sig])
+        # Sanity: the text itself is still priced (not zeroed with the signature).
+        empty = {"role": "assistant", "content": [{"type": "thinking", "thinking": ""}]}
+        assert counter.count_messages([with_sig]) > counter.count_messages([empty])
+
+    def test_provider_walker_shares_the_thinking_rule(self):
+        from headroom.tokenizers.base import count_content_blocks
+
+        counter = EstimatingTokenCounter()
+        text = "consider the failing test " * 20
+        with_sig = [{"type": "thinking", "thinking": text, "signature": "A" * 4000}]
+        without_sig = [{"type": "thinking", "thinking": text}]
+        assert count_content_blocks(with_sig, counter.count_text) == count_content_blocks(
+            without_sig, counter.count_text
+        )

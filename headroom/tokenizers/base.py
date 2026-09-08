@@ -328,6 +328,16 @@ class BaseTokenizer(ABC):
                         total += frames * 1000
                     else:
                         total += 3200
+                elif part_type == "thinking":
+                    # Anthropic extended thinking replayed by the client. Only
+                    # the thinking text is model input; ``signature`` is an
+                    # opaque server-side verification blob (~1 KB of base64 per
+                    # block) that the provider does not tokenize or bill. The
+                    # JSON catch-all below priced it as text: on a 369-message
+                    # Claude Code session, 99 signatures counted 256K of 414K
+                    # tokens against a provider-reported ~313K, inflating every
+                    # tokens_before-derived figure and the size stratum.
+                    total += self.count_text(part.get("thinking", "") or "")
                 else:
                     # Unknown type - estimate from JSON
                     total += self._count_serialized(part)
