@@ -1195,6 +1195,8 @@ class StreamingMixin:
                 outcome_provider=outcome_provider,
                 waste_signals=waste_signals,
                 session_key=session_key,
+                conversation_key=conversation_key,
+                conversation_tokens_saved=conversation_tokens_saved,
             )
         except (Exception, asyncio.CancelledError):
             self._cleanup_mid_turn_stream(session_key)
@@ -1225,6 +1227,8 @@ class StreamingMixin:
         outcome_provider: str | None,
         waste_signals: dict[str, int] | None,
         session_key: str,
+        conversation_key: str | None = None,
+        conversation_tokens_saved: int | None = None,
     ) -> Response | StreamingResponse:
         """Actual streaming implementation, guarded by _stream_response's cleanup wrapper."""
         from fastapi.responses import Response, StreamingResponse
