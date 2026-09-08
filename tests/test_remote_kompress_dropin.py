@@ -191,3 +191,33 @@ def test_the_common_path_without_an_override_is_unchanged(monkeypatch) -> None:
     assert stored["original"] == ORIGINAL
     # Still the endpoint's own count when no override was supplied.
     assert stored["tokens"] == 999
+
+
+def test_remote_marker_gate_matches_local_on_single_token_words(monkeypatch) -> None:
+    """Parity with KompressCompressor: 100 single-token words dropping 41 save
+    41 tokens against a 43-token marker (real source-derived hash), so the
+    remote path passes through too; a saving that covers the marker reports
+    kept words plus the measured marker cost."""
+    import hashlib
+
+    from headroom.transforms.kompress_compressor import ccr_marker_cost, ccr_retrieval_marker
+
+    def _store(original, compressed, original_tokens):  # noqa: ANN001
+        return hashlib.sha256(original.encode()).hexdigest()[:24]
+
+    monkeypatch.setattr("headroom.transforms.kompress_remote.store_kompress_in_ccr", _store)
+    source = " ".join(["alpha"] * 99 + ["nfs"])
+    kept = " ".join(source.split()[41:])
+    c = _compressor(monkeypatch, enable_ccr=True, payload={"compressed": kept})
+    result = c.compress(source)
+    assert result.compressed == source
+    assert result.cache_key is None
+    assert result.compression_ratio == 1.0
+
+    big = " ".join(["alpha"] * 299 + ["nfs"])
+    kept = " ".join(big.split()[60:])
+    c = _compressor(monkeypatch, enable_ccr=True, payload={"compressed": kept})
+    result = c.compress(big)
+    marker = ccr_retrieval_marker(300, 240, big, _store(big, kept, 300))
+    assert result.compressed == kept + marker
+    assert result.compressed_tokens == 240 + ccr_marker_cost(marker)

@@ -58,9 +58,9 @@ import logging
 import httpx
 
 from .kompress_compressor import (
-    CCR_MARKER_COST_WORDS,
     KompressConfig,
     KompressResult,
+    ccr_marker_cost,
     ccr_retrieval_marker,
     store_kompress_in_ccr,
 )
@@ -246,8 +246,6 @@ class RemoteKompressCompressor:
         if self.config.enable_ccr and compressed != content:
             # Same gate as KompressCompressor: the marked payload must save
             # tokens, and a result that cannot pay for the marker passes through.
-            if result.original_tokens - result.compressed_tokens <= CCR_MARKER_COST_WORDS:
-                return self._passthrough(content, n_words)
             # Store the PRE-protection text when the caller supplied it. ``content``
             # may be the tag-protected placeholder intermediate, and storing that
             # makes a later full retrieval hand back {{HEADROOM_TAG_N}} instead of
@@ -262,14 +260,18 @@ class RemoteKompressCompressor:
             )
             cache_key = store_kompress_in_ccr(ccr_source, compressed, ccr_source_tokens)
             if cache_key:
-                result.cache_key = cache_key
                 # Report the source line span so a reader can tell content was
                 # compressed away rather than absent (#2586).
-                result.compressed += ccr_retrieval_marker(
+                marker = ccr_retrieval_marker(
                     result.original_tokens, result.compressed_tokens, ccr_source, cache_key
                 )
+                marker_cost = ccr_marker_cost(marker)
+                if result.original_tokens - result.compressed_tokens <= marker_cost:
+                    return self._passthrough(content, n_words)
+                result.cache_key = cache_key
+                result.compressed += marker
                 # The accounting covers the payload as shipped, marker included.
-                result.compressed_tokens += CCR_MARKER_COST_WORDS
+                result.compressed_tokens += marker_cost
                 result.compression_ratio = (
                     result.compressed_tokens / result.original_tokens
                     if result.original_tokens

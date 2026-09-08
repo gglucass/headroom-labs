@@ -11,13 +11,15 @@ marker in its own accounting.
 
 from __future__ import annotations
 
+import hashlib
+
 import pytest
 
 from headroom.transforms import kompress_compressor as kc
 from headroom.transforms.kompress_compressor import (
-    CCR_MARKER_COST_WORDS,
     KompressCompressor,
     KompressConfig,
+    ccr_marker_cost,
     ccr_retrieval_marker,
 )
 
@@ -62,71 +64,78 @@ def _prose(n: int) -> str:
     return " ".join(f"w{chr(97 + i % 26)}{chr(97 + (i // 26) % 26)}" for i in range(n))
 
 
-HASH = "c00eb437e5e5c00eb437e5e5"  # real CCR hash length
+def _real_key(source: str) -> str:
+    """The CCR store's own key: the SHA-256 prefix of the stored source."""
+    return hashlib.sha256(source.encode()).hexdigest()[:24]
 
 
 def _compressor(monkeypatch, **config) -> KompressCompressor:
     compressor = KompressCompressor(KompressConfig(min_input_words=10, **config))
     monkeypatch.setattr(compressor, "_should_batch_single_content", lambda *a, **k: False)
     monkeypatch.setattr(compressor, "_should_use_sequential_fallback", lambda: False)
-    monkeypatch.setattr(compressor, "_store_in_ccr", lambda *a, **k: HASH)
+    monkeypatch.setattr(compressor, "_store_in_ccr", lambda source, *a, **k: _real_key(source))
     return compressor
 
 
-def test_marker_cost_bound_covers_a_real_marker_in_tokens():
+# 100 single-token words: the tightest source there is. Dropping 41 saves 41
+# tokens, and the marker for it (with its real source-derived hash) costs 43.
+SINGLE_TOKEN_SOURCE = " ".join(["alpha"] * 99 + ["nfs"])
+
+
+def test_marker_cost_is_the_real_marker_priced_in_tokens():
     enc = pytest.importorskip("tiktoken").get_encoding("cl100k_base")
-    marker = ccr_retrieval_marker(12345, 9876, "x\n" * 400, HASH)
-    # Every dropped word is at least one token, so a bound in words covers the
-    # marker whenever it exceeds the marker's token count.
-    assert len(enc.encode(marker)) < CCR_MARKER_COST_WORDS
+    marker = ccr_retrieval_marker(100, 59, SINGLE_TOKEN_SOURCE, _real_key(SINGLE_TOKEN_SOURCE))
+    assert _real_key(SINGLE_TOKEN_SOURCE) == "7dbb8f8de9f3e1d7c6f3a6e1"
+    assert ccr_marker_cost(marker) == len(enc.encode(marker)) == 43
+    # Digits and a different hash change the price; it is measured, not fixed.
+    other = ccr_retrieval_marker(123456, 98765, "x\n" * 400, "c00eb437e5e5c00eb437e5e5")
+    assert ccr_marker_cost(other) == len(enc.encode(other))
 
 
-def test_weak_shrink_gets_a_marker_and_reports_it(monkeypatch):
-    # 300 -> 240 words is ratio 0.80: the old `ratio < 0.8` gate shipped this
-    # unmarked and the router threw it away.
-    _install(monkeypatch, drop=60)
-    result = _compressor(monkeypatch).compress(_prose(300))
-    assert result.cache_key == HASH
-    assert f"Retrieve more: hash={HASH}" in result.compressed
-    assert result.compressed_tokens == 240 + CCR_MARKER_COST_WORDS
-    assert result.compression_ratio == (240 + CCR_MARKER_COST_WORDS) / 300
+def test_marker_cost_without_an_encoder_is_one_token_per_character(monkeypatch):
+    monkeypatch.setattr(kc, "_marker_encoder", False)
+    marker = ccr_retrieval_marker(100, 59, SINGLE_TOKEN_SOURCE, _real_key(SINGLE_TOKEN_SOURCE))
+    assert ccr_marker_cost(marker) == len(marker)
 
 
-def test_saving_that_cannot_pay_for_the_marker_passes_through(monkeypatch):
-    # The reviewer's case: drop 16 of 100 words and append a real-length
-    # marker, and cl100k goes 196 -> 200. Under the 13-word gate this shipped
-    # as ratio 0.84.
-    _install(monkeypatch, drop=16)
-    prose = _prose(100)
-    result = _compressor(monkeypatch).compress(prose)
-    assert result.compressed == prose
+def test_single_token_words_that_cannot_pay_for_the_marker_pass_through(monkeypatch):
+    # 100 -> 59 words saves 41 tokens; the marked payload is 102 tokens. Under
+    # the earlier fixed 40-word allowance this shipped at reported ratio 0.99.
+    _install(monkeypatch, drop=41)
+    result = _compressor(monkeypatch).compress(SINGLE_TOKEN_SOURCE)
+    assert result.compressed == SINGLE_TOKEN_SOURCE
     assert result.cache_key is None
-    assert result.compressed_tokens == 100
-    assert result.compression_ratio == 1.0
-    enc = pytest.importorskip("tiktoken").get_encoding("cl100k_base")
-    marked = " ".join(prose.split()[16:]) + ccr_retrieval_marker(100, 84, prose, HASH)
-    assert len(enc.encode(marked)) > len(enc.encode(prose))
+    assert (result.original_tokens, result.compressed_tokens, result.compression_ratio) == (
+        100,
+        100,
+        1.0,
+    )
+    [batched] = _compressor(monkeypatch).compress_batch([SINGLE_TOKEN_SOURCE], batch_size=8)
+    assert batched.compressed == SINGLE_TOKEN_SOURCE and batched.compression_ratio == 1.0
 
 
-def test_batch_path_uses_the_same_gate_and_accounting(monkeypatch):
+def test_marked_result_reports_kept_words_plus_the_measured_marker(monkeypatch):
+    # 300 single-token words, drop 60: 60 saved tokens cover a ~43-token marker.
+    source = " ".join(["alpha"] * 299 + ["nfs"])
     _install(monkeypatch, drop=60)
-    [marked] = _compressor(monkeypatch).compress_batch([_prose(300)], batch_size=8)
-    assert f"Retrieve more: hash={HASH}" in marked.compressed
-    assert marked.compressed_tokens == 240 + CCR_MARKER_COST_WORDS
-    _install(monkeypatch, drop=16)
-    prose = _prose(100)
-    [through] = _compressor(monkeypatch).compress_batch([prose], batch_size=8)
-    assert through.compressed == prose
-    assert through.compression_ratio == 1.0
+    result = _compressor(monkeypatch).compress(source)
+    marker = ccr_retrieval_marker(300, 240, source, _real_key(source))
+    assert result.compressed == " ".join(source.split()[60:]) + marker
+    assert result.cache_key == _real_key(source)
+    assert result.compressed_tokens == 240 + ccr_marker_cost(marker)
+    assert result.compression_ratio == (240 + ccr_marker_cost(marker)) / 300
+    [batched] = _compressor(monkeypatch).compress_batch([source], batch_size=8)
+    assert batched.compressed == result.compressed
+    assert batched.compressed_tokens == result.compressed_tokens
 
 
 def test_no_ccr_mode_ships_unmarked_lossy_unchanged(monkeypatch):
     # Without CCR there is no marker to pay for: the deliberate output is the
     # bare lossy result, on both paths, exactly as before.
-    _install(monkeypatch, drop=16)
+    _install(monkeypatch, drop=41)
     compressor = _compressor(monkeypatch, enable_ccr=False)
-    result = compressor.compress(_prose(100))
-    assert result.compressed_tokens == 84
+    result = compressor.compress(SINGLE_TOKEN_SOURCE)
+    assert result.compressed_tokens == 59
     assert "Retrieve more" not in result.compressed
-    [batched] = compressor.compress_batch([_prose(100)], batch_size=8)
-    assert batched.compressed_tokens == 84
+    [batched] = compressor.compress_batch([SINGLE_TOKEN_SOURCE], batch_size=8)
+    assert batched.compressed_tokens == 59

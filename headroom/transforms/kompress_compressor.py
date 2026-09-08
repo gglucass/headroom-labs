@@ -1294,19 +1294,41 @@ class KompressResult:
         return (self.tokens_saved / self.original_tokens) * 100
 
 
-# Conservative cost of the retrieval marker below, in the word unit this
-# module accounts in. The marker is 12 words but 36-38 cl100k_base tokens (the
-# 24-hex hash alone is 16), while the words Kompress drops are the cheap ones,
-# at worst ~1 token each. So "saved words > marker words" (13) admitted results
-# whose marked payload was LARGER in tokens than the original: drop 16 of 100
-# words, append the marker, and cl100k goes 196 -> 200. Requiring more than 40
-# saved words covers the marker even when every dropped word was a single
-# token; a result that cannot pay for it is passed through untouched, since
-# under CCR an unmarked lossy result is discarded by the router (#1307) anyway.
-# The old gate was a flat ratio < 0.8: results that shrank 1-20 percent shipped
-# without a marker and were thrown away, so the ML pass ran and saved nothing
-# (218 discards in one day of Claude Code traffic).
-CCR_MARKER_COST_WORDS = 40
+_marker_encoder: Any = None
+
+
+def ccr_marker_cost(marker: str) -> int:
+    """Token cost of a retrieval marker, in the tokens the provider will bill.
+
+    The marker is 12 words but 36-45 cl100k_base tokens: the 24-hex hash alone
+    is ~16 and the word counts add a token per few digits, so any fixed word
+    allowance is wrong for some hash or some count (a 40-word allowance let a
+    43-token marker ship on a payload of 100 single-token words: 100 -> 102).
+    Price the actual marker text with cl100k_base (a hard dependency) and fall
+    back to one token per character, the most any BPE can produce, if the
+    encoder is unavailable.
+
+    The compressor accounts in words, and the words it drops are the cheap
+    ones, at least one token each. So comparing saved WORDS against marker
+    TOKENS is conservative in the direction that matters: a marker is added
+    only when the dropped words are worth at least its tokens under the
+    tightest possible tokenization, and the reported ``compressed_tokens``
+    (kept words plus marker tokens) errs high, never low.
+    """
+    global _marker_encoder
+    if _marker_encoder is None:
+        try:
+            import tiktoken
+
+            _marker_encoder = tiktoken.get_encoding("cl100k_base")
+        except Exception:
+            _marker_encoder = False
+    if _marker_encoder:
+        try:
+            return len(_marker_encoder.encode(marker))
+        except Exception:
+            pass
+    return len(marker)
 
 
 def ccr_retrieval_marker(
@@ -1744,11 +1766,10 @@ class KompressCompressor(Transform):
             marker_cost = 0
 
             # CCR marker: anything the lossy pass shrank must stay retrievable,
-            # and the complete marked payload must still be a saving. A result
-            # whose saving cannot pay for the marker is passed through.
+            # and the complete marked payload must still be a saving. The
+            # marker is built first and priced (ccr_marker_cost); a result
+            # whose saved words cannot pay for it is passed through.
             if self.config.enable_ccr:
-                if n_words - compressed_count <= CCR_MARKER_COST_WORDS:
-                    return self._passthrough(content, n_words)
                 ccr_source = ccr_original if ccr_original is not None else content
                 ccr_source_tokens = len(ccr_source.split())
                 cache_key = self._store_in_ccr(ccr_source, compressed, ccr_source_tokens)
@@ -1756,10 +1777,11 @@ class KompressCompressor(Transform):
                     # Report the source line span so a reader can tell content was
                     # compressed away rather than absent — "items" counts words, which
                     # does not map to lines and reads as evidence of absence (#2586).
-                    compressed += ccr_retrieval_marker(
-                        n_words, compressed_count, ccr_source, cache_key
-                    )
-                    marker_cost = CCR_MARKER_COST_WORDS
+                    marker = ccr_retrieval_marker(n_words, compressed_count, ccr_source, cache_key)
+                    marker_cost = ccr_marker_cost(marker)
+                    if n_words - compressed_count <= marker_cost:
+                        return self._passthrough(content, n_words)
+                    compressed += marker
 
             # The accounting covers the payload as shipped, marker included.
             compressed_tokens = compressed_count + marker_cost
@@ -2148,9 +2170,6 @@ class KompressCompressor(Transform):
 
             # Same gate and accounting as the single path.
             if self.config.enable_ccr:
-                if n_words - compressed_count <= CCR_MARKER_COST_WORDS:
-                    results[text_idx] = self._passthrough(content, n_words)
-                    continue
                 ccr_source = ccr_sources[text_idx]
                 if ccr_source is None:
                     ccr_source = content
@@ -2160,10 +2179,12 @@ class KompressCompressor(Transform):
                     # Report the source line span so a reader can tell content was
                     # compressed away rather than absent — "items" counts words, which
                     # does not map to lines and reads as evidence of absence (#2586).
-                    compressed += ccr_retrieval_marker(
-                        n_words, compressed_count, ccr_source, cache_key
-                    )
-                    marker_cost = CCR_MARKER_COST_WORDS
+                    marker = ccr_retrieval_marker(n_words, compressed_count, ccr_source, cache_key)
+                    marker_cost = ccr_marker_cost(marker)
+                    if n_words - compressed_count <= marker_cost:
+                        results[text_idx] = self._passthrough(content, n_words)
+                        continue
+                    compressed += marker
 
             compressed_tokens = compressed_count + marker_cost
             results[text_idx] = KompressResult(
