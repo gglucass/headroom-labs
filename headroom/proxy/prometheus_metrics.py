@@ -279,6 +279,10 @@ class PrometheusMetrics:
                 "cache_write_5m_requests": 0,
                 "cache_write_1h_requests": 0,
                 "uncached_input_tokens": 0,
+                # Compression savings from the same requests that fill the
+                # uncached/cache-write denominator above, so /stats can pair
+                # new_input_savings_percent over one cohort.
+                "new_input_saved_tokens": 0,
                 "requests": 0,
                 "hit_requests": 0,  # requests with cache_read > 0
                 "bust_count": 0,
@@ -855,6 +859,7 @@ class PrometheusMetrics:
                 if cache_write_1h_tokens > 0:
                     pc["cache_write_1h_requests"] += 1
                 pc["uncached_input_tokens"] += uncached_input_tokens
+                pc["new_input_saved_tokens"] += max(0, int(tokens_saved))
                 pc["requests"] += 1
                 if cache_read_tokens > 0:
                     pc["hit_requests"] += 1
@@ -981,7 +986,11 @@ class PrometheusMetrics:
         # sessions and drops deferral-only turns from the ledger entirely (#2795).
         deferral_saved = max(0, int(tool_search_saved))
         ledger_saved = tokens_saved + deferral_saved
-        if ledger_saved > 0 and not self._stateless:
+        # A request with a provider cache breakdown is written even when it
+        # saved nothing: the ledger's new-input basis needs the denominator
+        # from every request that newly billed input (see record_savings_event).
+        has_new_input = bool(uncached_input_tokens or cache_write_tokens)
+        if (ledger_saved > 0 or has_new_input) and not self._stateless:
             # `input_tokens` here is the optimized (post-compression) count
             # that was actually forwarded — see emit_request_outcome, which
             # passes `input_tokens=outcome.optimized_tokens`. The ledger's
@@ -1010,9 +1019,7 @@ class PrometheusMetrics:
                 # Omitted when there is no cache breakdown (e.g. Bedrock), so
                 # the ledger never divides savings by themselves.
                 new_input_tokens=(
-                    int(uncached_input_tokens) + int(cache_write_tokens)
-                    if (uncached_input_tokens or cache_write_tokens)
-                    else None
+                    int(uncached_input_tokens) + int(cache_write_tokens) if has_new_input else None
                 ),
                 deferred_tokens=deferral_saved,
             )

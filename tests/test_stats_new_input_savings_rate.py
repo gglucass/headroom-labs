@@ -79,3 +79,41 @@ def test_stats_new_input_rate_is_zero_without_cache_usage_data(tmp_path, monkeyp
 
     assert tokens["new_input_tokens"] == 0
     assert tokens["new_input_savings_percent"] == 0
+
+
+def test_stats_new_input_rate_pairs_savings_with_qualified_requests(tmp_path, monkeypatch):
+    """The numerator must come from the same requests as the denominator. A
+    request with no cache breakdown (Bedrock, an MCP tool) never enters
+    new_input_tokens, so its savings must not lend themselves to that ratio:
+    one qualified 50 percent request plus one unqualified 10,000-token saving
+    used to read as 99 percent."""
+    with _make_client(tmp_path, monkeypatch) as client:
+        proxy = client.app.state.proxy
+        asyncio.run(
+            proxy.metrics.record_request(
+                provider="anthropic",
+                model="claude-opus-4-6",
+                input_tokens=1_100,
+                output_tokens=10,
+                tokens_saved=100,
+                latency_ms=10.0,
+                cache_read_tokens=1_000,
+                uncached_input_tokens=100,
+            )
+        )
+        assert client.get("/stats").json()["tokens"]["new_input_savings_percent"] == 50.0
+        asyncio.run(
+            proxy.metrics.record_request(
+                provider="bedrock",
+                model="claude-opus-4-6",
+                input_tokens=20_000,
+                output_tokens=10,
+                tokens_saved=10_000,
+                latency_ms=10.0,
+            )
+        )
+        tokens = client.get("/stats").json()["tokens"]
+    assert tokens["new_input_tokens"] == 100
+    assert tokens["new_input_savings_percent"] == 50.0
+    # The whole-wire figures still count the unqualified request.
+    assert tokens["saved"] >= 10_100

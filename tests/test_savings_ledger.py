@@ -361,3 +361,30 @@ def test_cli_days_flag_capped_at_30(monkeypatch, tmp_path, bad_days):
     result = CliRunner().invoke(savings, ["--days", bad_days])
     assert result.exit_code != 0
     assert "30" in result.output  # IntRange error mentions the allowed max
+
+
+def test_zero_saving_request_keeps_its_place_in_the_new_input_denominator(monkeypatch, tmp_path):
+    """100 saved on 100 new input, then 0 saved on 10,000 new input. The
+    new-input basis is 100 / (10,100 + 100), under 1 percent, not the 50
+    percent that only counting requests that saved would report. The
+    saved-event figures do not see the second request at all."""
+    _events_env(monkeypatch, tmp_path)
+    assert L.record_savings_event(
+        tokens_before=200, tokens_after=100, model=None, client="claude-code", new_input_tokens=100
+    )
+    assert L.record_savings_event(
+        tokens_before=10_000,
+        tokens_after=10_000,
+        model=None,
+        client="claude-code",
+        new_input_tokens=10_000,
+    )
+    # Without a new-input figure a zero-saving request is still not an event.
+    assert not L.record_savings_event(
+        tokens_before=500, tokens_after=500, model=None, client="claude-code"
+    )
+    window = L.aggregate_savings().windows["today"]
+    assert window["tokens_saved"] == 100
+    assert window["new_input_tokens"] == 10_100
+    assert window["new_input_savings_percent"] == pytest.approx(1.0, abs=0.05)
+    assert window["savings_percent"] == pytest.approx(50.0)

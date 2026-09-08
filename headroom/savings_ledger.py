@@ -143,6 +143,13 @@ def record_savings_event(
     ledger pairs compression-only savings with new input exactly as /stats
     does. Both are optional so MCP-tool events and older callers keep writing
     the same line they always did.
+
+    A request that saved nothing but carries ``new_input_tokens`` is still
+    written, as a denominator-only observation: the new-input basis must see
+    every request that newly billed input, not only the ones compression
+    touched, or a 100-saved/100-new turn followed by a 0-saved/10,000-new turn
+    reads as 50 percent instead of under 1. Without ``new_input_tokens`` a
+    zero-saving request is skipped exactly as before.
     """
 
     try:
@@ -152,7 +159,7 @@ def record_savings_event(
         return False
 
     saved = max(before - after, 0)
-    if saved <= 0:
+    if saved <= 0 and new_input_tokens is None:
         return False
 
     model_label = _normalize_model(model)
@@ -263,6 +270,12 @@ class _Bucket:
         new_input: int | None = None,
         deferred: int = 0,
     ) -> None:
+        if saved <= 0 and new_input is not None:
+            # Denominator-only observation (see record_savings_event): it
+            # belongs in the new-input basis and nowhere else, so calls,
+            # before/saved and cost keep their saved-event semantics.
+            self.new_input_tokens += new_input
+            return
         self.tokens_saved += saved
         self.tokens_before += before
         self.cost_usd += cost

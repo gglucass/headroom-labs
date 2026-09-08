@@ -4238,6 +4238,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         new_input_tokens = int(_pc_totals.get("uncached_input_tokens", 0) or 0) + int(
             _pc_totals.get("cache_write_tokens", 0) or 0
         )
+        # Paired numerator: savings from the SAME requests that supplied the
+        # denominator. tokens_saved_total also counts requests with no cache
+        # breakdown (Bedrock, MCP tools), which would lend savings to a
+        # denominator they never entered: one qualified request at 50 percent
+        # plus one unqualified 10,000-token saving read as 99 percent.
+        new_input_saved_tokens = int(_pc_totals.get("new_input_saved_tokens", 0) or 0)
 
         # Build human-readable summary
         summary = _build_session_summary(proxy, m, prefix_cache_stats, total_tokens_before)
@@ -4483,7 +4489,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 # and report ~100%. No usage data -> report 0, not a lie.
                 "new_input_tokens": new_input_tokens,
                 "new_input_savings_percent": round(
-                    (proxy_compression_tokens / (new_input_tokens + proxy_compression_tokens) * 100)
+                    (new_input_saved_tokens / (new_input_tokens + new_input_saved_tokens) * 100)
                     if new_input_tokens > 0
                     else 0,
                     2,
