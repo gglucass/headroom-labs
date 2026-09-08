@@ -37,14 +37,95 @@ once per conversation instead of once per turn.
 
 from __future__ import annotations
 
+import hashlib
 import threading
 from collections import OrderedDict
+from typing import Any
+
+from headroom.proxy.output_savings_policy import _unwrap_response_create_body
 
 __all__ = [
     "ConversationSavings",
     "get_conversation_savings",
     "reset_conversation_savings",
+    "savings_conversation_key",
 ]
+
+_ID_KEYS = ("id", "conversation_id", "session_id", "thread_id")
+
+
+def _explicit_id(value: Any) -> str:
+    if isinstance(value, str):
+        return value if value and value.lower() != "auto" else ""
+    if isinstance(value, dict):
+        for key in _ID_KEYS:
+            nested = value.get(key)
+            if isinstance(nested, str) and nested:
+                return nested
+    return ""
+
+
+def savings_conversation_key(body: Any, *, session_id: str | None = None) -> str | None:
+    """Identity under which a Responses request's ``tokens_saved`` is a running total.
+
+    Returns ``None`` unless BOTH premises of the cumulative accounting hold, in
+    which case the funnel keeps ordinary per-request accounting:
+
+    1. The request names one conversation. Only an explicit id counts: the
+       client's own conversation id (``prompt_cache_key``, which Codex sets per
+       conversation), a top-level ``conversation_id``/``session_id``/
+       ``thread_id``, one of those inside ``metadata``/``client_metadata``, or
+       a transport-scoped ``session_id`` the caller vouches for (a WebSocket, a
+       session header). The holdout key's fallbacks (the instructions prefix,
+       the literal ``responses``) are deliberately NOT accepted: two
+       independent conversations with the same instructions would share a
+       running total and suppress each other's savings.
+    2. The request carries the whole transcript. With ``previous_response_id``
+       or a server-side ``conversation`` the provider holds prior context and
+       the payload is this turn's increment, so ``tokens_saved`` is already
+       per-request and must not be differenced.
+
+    Chat-completions bodies (no ``input``) return ``None``: their handlers
+    freeze the cached prefix, so their ``tokens_saved`` is novel-only already.
+    """
+    if not isinstance(body, dict):
+        return None
+    body = _unwrap_response_create_body(body)
+    if "input" not in body:
+        return None
+    if body.get("previous_response_id") or body.get("conversation"):
+        return None
+
+    identity = ""
+    for key in ("prompt_cache_key", "conversation_id", "session_id", "thread_id"):
+        value = _explicit_id(body.get(key))
+        if value:
+            identity = f"{key}:{value}"
+            break
+    if not identity:
+        for container_key in ("client_metadata", "metadata"):
+            container = body.get(container_key)
+            if not isinstance(container, dict):
+                continue
+            for key in (
+                "conversation_id",
+                "conversation_key",
+                "session_id",
+                "thread_id",
+                "codex_session_id",
+            ):
+                value = _explicit_id(container.get(key))
+                if value:
+                    identity = f"{container_key}.{key}:{value}"
+                    break
+            if identity:
+                break
+    if not identity and session_id:
+        identity = f"session:{session_id}"
+    if not identity:
+        return None
+    return hashlib.sha256(("savings\x00" + identity).encode("utf-8", "ignore")).hexdigest()
+
 
 # Conversations tracked before the oldest is forgotten. A forgotten
 # conversation that is still live restarts from zero and re-counts its

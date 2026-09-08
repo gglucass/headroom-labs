@@ -19,6 +19,7 @@ from headroom.proxy.conversation_savings import (
     ConversationSavings,
     get_conversation_savings,
     reset_conversation_savings,
+    savings_conversation_key,
 )
 from headroom.proxy.outcome import RequestOutcome, emit_request_outcome
 
@@ -262,3 +263,77 @@ def test_the_streaming_constructor_defaults_the_pair_off() -> None:
     )
     assert outcome.conversation_key is None
     assert outcome.conversation_tokens_saved is None
+
+
+# --- identity: real Responses bodies, not an injected key -------------------
+
+_INSTRUCTIONS = "You are Codex, a coding agent running in the user's terminal. " * 20
+
+
+def _responses_body(text: str, **extra: Any) -> dict[str, Any]:
+    return {
+        "model": "gpt-6-astra",
+        "instructions": _INSTRUCTIONS,
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": text}]}],
+        "store": False,
+        **extra,
+    }
+
+
+def test_shared_instructions_with_distinct_input_are_not_one_conversation() -> None:
+    """Two ordinary payloads, same model and instructions, different user
+    input. The holdout key merges them (its Responses fallback is the
+    instructions prefix); the savings key must not, or independent sessions
+    suppress each other's savings through the process-wide ledger."""
+    from headroom.proxy.output_savings_policy import conversation_key_from_body
+
+    a_body = _responses_body("fix the failing test")
+    b_body = _responses_body("write the release notes")
+    assert conversation_key_from_body(a_body) == conversation_key_from_body(b_body)
+    a, b = savings_conversation_key(a_body), savings_conversation_key(b_body)
+    assert a is None and b is None
+    ledger = ConversationSavings()
+    assert ledger.novel(a, 100) is None and ledger.novel(b, 100) is None
+
+
+def test_codex_prompt_cache_key_names_the_conversation() -> None:
+    turn1 = _responses_body("fix the failing test", prompt_cache_key="conv-1234")
+    turn2 = _responses_body("fix the failing test", prompt_cache_key="conv-1234")
+    turn2["input"].append(
+        {"role": "user", "content": [{"type": "input_text", "text": "now the lint"}]}
+    )
+    key = savings_conversation_key(turn1)
+    assert key is not None
+    assert savings_conversation_key(turn2) == key
+    other = _responses_body("fix the failing test", prompt_cache_key="conv-5678")
+    assert savings_conversation_key(other) not in (None, key)
+    assert savings_conversation_key(_responses_body("x", prompt_cache_key="auto")) is None
+
+
+def test_explicit_ids_and_caller_vouched_sessions() -> None:
+    assert savings_conversation_key(_responses_body("x", metadata={"conversation_id": "c-1"}))
+    assert savings_conversation_key(_responses_body("x", thread_id="t-1"))
+    ws_a = savings_conversation_key(_responses_body("x"), session_id="ws:a")
+    ws_b = savings_conversation_key(_responses_body("x"), session_id="ws:b")
+    assert ws_a is not None and ws_b is not None and ws_a != ws_b
+    frame = {"type": "response.create", "response": _responses_body("x", prompt_cache_key="c")}
+    assert savings_conversation_key(frame) == savings_conversation_key(
+        _responses_body("x", prompt_cache_key="c")
+    )
+
+
+def test_server_side_state_means_incremental_input() -> None:
+    """With ``previous_response_id`` or a ``conversation`` the provider holds
+    the history and each payload is a fresh increment: its ``tokens_saved``
+    is per-request already, even under an explicit conversation id."""
+    assert (
+        savings_conversation_key(
+            _responses_body("more", prompt_cache_key="conv-1", previous_response_id="resp_1")
+        )
+        is None
+    )
+    assert savings_conversation_key(_responses_body("more", conversation="conv_abc")) is None
+    assert (
+        savings_conversation_key(_responses_body("more", conversation={"id": "conv_abc"})) is None
+    )
+    assert savings_conversation_key({"model": "gpt-6-astra", "messages": []}) is None

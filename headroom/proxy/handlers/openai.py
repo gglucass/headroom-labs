@@ -23,6 +23,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote, unquote, urlparse
 
+from headroom.proxy.conversation_savings import savings_conversation_key
 from headroom.proxy.helpers import (
     COMPRESSION_TIMEOUT_SECONDS,
     _headroom_bypass_enabled,
@@ -5848,11 +5849,18 @@ class OpenAIHandlerMixin:
         # before compression so a rewritten first user message cannot move the
         # key mid-conversation. Left None when compression did not run: a
         # bypassed turn saves nothing and must not reset the running total.
-        from headroom.proxy.output_savings import conversation_key_from_body
-
+        # ``savings_conversation_key`` is None without an explicit conversation
+        # id (Codex's ``prompt_cache_key``, a session header) or when the body
+        # carries ``previous_response_id``/``conversation`` (incremental input
+        # against server-side state); the funnel then books per request.
         responses_conversation_key: str | None = None
-        _pre_compression_conversation_key = (
-            conversation_key_from_body(body) if isinstance(body, dict) else None
+        _pre_compression_conversation_key = savings_conversation_key(
+            body,
+            session_id=(
+                request.headers.get("conversation_id")
+                or request.headers.get("session_id")
+                or request.headers.get("x-headroom-session-id")
+            ),
         )
 
         # The standalone Rust proxy has native /v1/responses item handling,
@@ -7233,7 +7241,6 @@ class OpenAIHandlerMixin:
             # conversation's running total is therefore the LAST frame's
             # figure, not the sum -- that is what the funnel differences to
             # count a removed token once (see ``conversation_savings``).
-            from headroom.proxy.output_savings import conversation_key_from_body
 
             ws_conversation_key: str | None = None
             ws_conversation_tokens_saved: int | None = None
@@ -7740,10 +7747,8 @@ class OpenAIHandlerMixin:
                                 _record_ws_compression_overhead(_rewrite_ms)
                                 tokens_saved += int(_ws_saved)
                                 ws_conversation_tokens_saved = int(_ws_saved)
-                                ws_conversation_key = (
-                                    conversation_key_from_body(_send_body)
-                                    if isinstance(_send_body, dict)
-                                    else None
+                                ws_conversation_key = savings_conversation_key(
+                                    _send_body, session_id=f"ws:{session_id}"
                                 )
                                 attempted_input_tokens_total += int(_ws_attempted_tokens)
                                 logger.info(
@@ -8217,10 +8222,8 @@ class OpenAIHandlerMixin:
                         _record_ws_compression_overhead(_rewrite_ms)
                         tokens_saved += int(frame_saved)
                         ws_conversation_tokens_saved = int(frame_saved)
-                        ws_conversation_key = (
-                            conversation_key_from_body(new_inner)
-                            if isinstance(new_inner, dict)
-                            else None
+                        ws_conversation_key = savings_conversation_key(
+                            new_inner, session_id=f"ws:{session_id}"
                         )
                         attempted_input_tokens_total += int(frame_attempted_tokens)
                         ws_frames_compressed += 1
