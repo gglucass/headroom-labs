@@ -206,3 +206,30 @@ def test_stratum_label_round_trips_arm_and_key() -> None:
     assert parse_stratum_label(stratum_label("treatment", key)) == ("treatment", key)
     assert parse_stratum_label(stratum_label("control", key)) == ("control", key)
     assert parse_stratum_label("unrelated") is None
+
+
+def test_responses_conversation_key_seeds_on_a_plain_string_input() -> None:
+    """/v1/responses accepts `input` as a bare string, not only an item list.
+
+    That shape skips the item loop entirely, so it needs its own seeding path
+    or every string-input conversation hashes to the same key and lands in one
+    arm together.
+    """
+
+    def body(question: str) -> dict:
+        return {"model": "gpt-5.2-codex", "input": question}
+
+    assert conversation_key_from_responses_body(
+        body("add a cache")
+    ) != conversation_key_from_responses_body(body("delete the cache"))
+    assert conversation_key_from_responses_body(
+        body("add a cache")
+    ) == conversation_key_from_responses_body(body("add a cache"))
+    # And it agrees with the equivalent item-list form. The seed is the opening
+    # user text, not the wire shape carrying it, so a client that switches
+    # between the two mid-session stays in the arm it was assigned.
+    assert conversation_key_from_responses_body(body("add a cache")) == (
+        conversation_key_from_responses_body(
+            {"model": "gpt-5.2-codex", "input": [{"role": "user", "content": "add a cache"}]}
+        )
+    )
