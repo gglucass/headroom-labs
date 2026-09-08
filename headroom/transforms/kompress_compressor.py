@@ -1294,6 +1294,16 @@ class KompressResult:
         return (self.tokens_saved / self.original_tokens) * 100
 
 
+# Word cost of the retrieval marker below, measured once so the marker gate can
+# ask "does the saving pay for the marker" without building it first. A marker
+# is appended only when the lossy pass saves MORE than this. The old gate was a
+# flat ratio < 0.8: results that shrank 1-20 percent shipped without a marker
+# and were then discarded by the router's lossy-unrecoverable guard (#1307), so
+# the ML pass ran and saved nothing (measured 218 discards in one day of Claude
+# Code traffic, where the router accepts any shrink).
+CCR_MARKER_WORDS = 13
+
+
 def ccr_retrieval_marker(
     n_words: int, compressed_count: int, ccr_source: str, cache_key: str
 ) -> str:
@@ -1736,8 +1746,9 @@ class KompressCompressor(Transform):
                 model_used=self.config.model_id,
             )
 
-            # CCR marker
-            if self.config.enable_ccr and ratio < 0.8:
+            # CCR marker: whenever the lossy pass saves more than the marker
+            # costs. Anything it shrank is lossy and must stay retrievable.
+            if self.config.enable_ccr and n_words - compressed_count > CCR_MARKER_WORDS:
                 ccr_source = ccr_original if ccr_original is not None else content
                 ccr_source_tokens = len(ccr_source.split())
                 cache_key = self._store_in_ccr(ccr_source, compressed, ccr_source_tokens)
@@ -2130,7 +2141,7 @@ class KompressCompressor(Transform):
                 model_used=self.config.model_id,
             )
 
-            if self.config.enable_ccr and comp_ratio < 0.8:
+            if self.config.enable_ccr and n_words - compressed_count > CCR_MARKER_WORDS:
                 ccr_source = ccr_sources[text_idx]
                 if ccr_source is None:
                     ccr_source = content
