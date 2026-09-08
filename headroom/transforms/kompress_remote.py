@@ -57,7 +57,13 @@ import logging
 
 import httpx
 
-from .kompress_compressor import KompressConfig, KompressResult, store_kompress_in_ccr
+from .kompress_compressor import (
+    CCR_MARKER_COST_WORDS,
+    KompressConfig,
+    KompressResult,
+    ccr_retrieval_marker,
+    store_kompress_in_ccr,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +100,6 @@ _MIN_WORDS = 10
 
 # Accept-any-shrink CCR gate, identical to KompressCompressor.compress: only
 # store + mark when the shrink is worth the retrieval marker's own cost.
-_CCR_RATIO_GATE = 0.8
 
 
 class RemoteKompressCompressor:
@@ -238,7 +243,11 @@ class RemoteKompressCompressor:
         # CCR stays PROXY-LOCAL: endpoint is stateless (enable_ccr=False), so we
         # store the mapping + append the retrieval marker here — same policy and
         # marker format as KompressCompressor.compress.
-        if self.config.enable_ccr and result.compression_ratio < _CCR_RATIO_GATE:
+        if self.config.enable_ccr and compressed != content:
+            # Same gate as KompressCompressor: the marked payload must save
+            # tokens, and a result that cannot pay for the marker passes through.
+            if result.original_tokens - result.compressed_tokens <= CCR_MARKER_COST_WORDS:
+                return self._passthrough(content, n_words)
             # Store the PRE-protection text when the caller supplied it. ``content``
             # may be the tag-protected placeholder intermediate, and storing that
             # makes a later full retrieval hand back {{HEADROOM_TAG_N}} instead of
@@ -256,12 +265,15 @@ class RemoteKompressCompressor:
                 result.cache_key = cache_key
                 # Report the source line span so a reader can tell content was
                 # compressed away rather than absent (#2586).
-                source_lines = ccr_source.count("\n") + 1
-                line_word = "line" if source_lines == 1 else "lines"
-                result.compressed += (
-                    f"\n[{result.original_tokens} words compressed to "
-                    f"{result.compressed_tokens} (from {source_lines} source {line_word})."
-                    f" Retrieve more: hash={cache_key}]"
+                result.compressed += ccr_retrieval_marker(
+                    result.original_tokens, result.compressed_tokens, ccr_source, cache_key
+                )
+                # The accounting covers the payload as shipped, marker included.
+                result.compressed_tokens += CCR_MARKER_COST_WORDS
+                result.compression_ratio = (
+                    result.compressed_tokens / result.original_tokens
+                    if result.original_tokens
+                    else 1.0
                 )
 
         return result

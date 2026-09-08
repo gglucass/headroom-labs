@@ -117,8 +117,9 @@ def _compressor(monkeypatch, *, enable_ccr: bool, payload: dict):
     return c
 
 
-ORIGINAL = "real secret block " * 20
-PLACEHOLDER = "{{HEADROOM_TAG_0}} " * 20
+# 60 words: "short" saves 59, past the marker cost gate (CCR_MARKER_COST_WORDS).
+ORIGINAL = "real secret block " * 60
+PLACEHOLDER = "{{HEADROOM_TAG_0}} " * 60
 
 
 def test_passing_ccr_original_no_longer_raises(monkeypatch) -> None:
