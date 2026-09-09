@@ -515,6 +515,19 @@ def dashboard(port: int, no_open: bool) -> None:
     ),
 )
 @click.option(
+    "--write-timeout-seconds",
+    type=click.IntRange(min=1),
+    default=None,
+    envvar="HEADROOM_WRITE_TIMEOUT_SECONDS",
+    help=(
+        "Seconds the upstream send may take before it is abandoned (default: 150). "
+        "On HTTP/1.1 this bounds the whole request body, so raise it if you push "
+        "large bodies over a slow link. Lower it to fail over a dead pooled "
+        "connection faster; --connect-timeout-seconds only guards a fresh connect. "
+        "Env: HEADROOM_WRITE_TIMEOUT_SECONDS."
+    ),
+)
+@click.option(
     "--anthropic-buffered-request-timeout-seconds",
     type=click.IntRange(min=1),
     default=None,
@@ -1042,6 +1055,7 @@ def proxy(
     retry_max_delay_ms: int | None,
     request_timeout_seconds: int | None,
     connect_timeout_seconds: int | None,
+    write_timeout_seconds: int | None,
     anthropic_buffered_request_timeout_seconds: int | None,
     anthropic_pre_upstream_concurrency: int | None,
     anthropic_pre_upstream_acquire_timeout_seconds: float | None,
@@ -1330,12 +1344,22 @@ def proxy(
         protect_recent=_get_env_int_optional("HEADROOM_PROTECT_RECENT"),
         protect_analysis_context=_get_env_bool_optional("HEADROOM_PROTECT_ANALYSIS_CONTEXT"),
         accuracy_guard=os.environ.get("HEADROOM_ACCURACY_GUARD") or None,
-        # CCR opt-out: --no-ccr disables both halves at once (markers in content
-        # AND the injected retrieve tool). Markers without a tool — or a tool
-        # without markers — are useless, so it is a single switch. Default keeps
-        # CCR fully on.
+        # CCR opt-out: --no-ccr disables every half at once — markers in
+        # content, the injected retrieve tool, AND server-side response
+        # handling. Markers without a tool, or a tool without markers, are
+        # useless, so it is a single switch. Default keeps CCR fully on.
+        #
+        # Response handling has to be part of it. The buffered stream:false
+        # path keys off ``headroom_retrieve`` being present in the *request's*
+        # tools, and a client can advertise that tool on its own — the bundled
+        # OpenCode plugin registers it unconditionally. So with response
+        # handling left on, `--no-ccr` silently kept flipping streaming turns
+        # to buffered whenever history still held a redeemable marker, and the
+        # documented escape hatch for the CCR buffered-stream bugs did nothing
+        # for exactly the clients told to use it (#3082).
         ccr_inject_tool=not no_ccr,
         ccr_inject_marker=not no_ccr,
+        ccr_handle_responses=not no_ccr,
         ccr_resolve_markers_inline=ccr_inline_resolve,
         lossless=lossless,
         ccr_proactive_expansion=not no_ccr_proactive_expansion,
@@ -1366,6 +1390,7 @@ def proxy(
         connect_timeout_seconds=connect_timeout_seconds
         if connect_timeout_seconds is not None
         else 10,
+        write_timeout_seconds=write_timeout_seconds if write_timeout_seconds is not None else 150,
         anthropic_buffered_request_timeout_seconds=(
             anthropic_buffered_request_timeout_seconds
             if anthropic_buffered_request_timeout_seconds is not None
