@@ -931,6 +931,12 @@ class StreamingMixin:
         parsed_response: dict[str, Any] | None = None,
         client: str | None = None,
         waste_signals: dict[str, int] | None = None,
+        # Set only by paths whose ``tokens_saved`` is the CONVERSATION's
+        # running total rather than this turn's -- OpenAI ``/v1/responses``,
+        # which re-sends and recompresses the whole transcript every turn.
+        # See ``conversation_savings``.
+        conversation_key: str | None = None,
+        conversation_tokens_saved: int | None = None,
     ) -> None:
         from headroom.proxy.outcome import RequestOutcome
 
@@ -1112,6 +1118,8 @@ class StreamingMixin:
             pipeline_timing=pipeline_timing,
             original_messages=original_messages,
             waste_signals=waste_signals,
+            conversation_key=conversation_key,
+            conversation_tokens_saved=conversation_tokens_saved,
         )
         await self._record_request_outcome(outcome)
 
@@ -1141,6 +1149,8 @@ class StreamingMixin:
         outcome_provider: str | None = None,
         waste_signals: dict[str, int] | None = None,
         session_key: str | None = None,
+        conversation_key: str | None = None,
+        conversation_tokens_saved: int | None = None,
     ) -> Response | StreamingResponse:
         """Stream response with metrics tracking and memory tool handling.
 
@@ -1185,6 +1195,8 @@ class StreamingMixin:
                 outcome_provider=outcome_provider,
                 waste_signals=waste_signals,
                 session_key=session_key,
+                conversation_key=conversation_key,
+                conversation_tokens_saved=conversation_tokens_saved,
             )
         except (Exception, asyncio.CancelledError):
             self._cleanup_mid_turn_stream(session_key)
@@ -1215,6 +1227,8 @@ class StreamingMixin:
         outcome_provider: str | None,
         waste_signals: dict[str, int] | None,
         session_key: str,
+        conversation_key: str | None = None,
+        conversation_tokens_saved: int | None = None,
     ) -> Response | StreamingResponse:
         """Actual streaming implementation, guarded by _stream_response's cleanup wrapper."""
         from fastapi.responses import Response, StreamingResponse
@@ -1518,6 +1532,8 @@ class StreamingMixin:
                 original_messages=original_messages,
                 client=client,
                 waste_signals=waste_signals,
+                conversation_key=conversation_key,
+                conversation_tokens_saved=conversation_tokens_saved,
             )
             self._cleanup_mid_turn_stream(session_key)
             return Response(
@@ -1797,6 +1813,8 @@ class StreamingMixin:
                     parsed_response=parsed_response,
                     client=client,
                     waste_signals=waste_signals,
+                    conversation_key=conversation_key,
+                    conversation_tokens_saved=conversation_tokens_saved,
                 )
                 if supports_mid_turn_coalescing(client) and pending_messages:
                     pending_event = json.dumps(
