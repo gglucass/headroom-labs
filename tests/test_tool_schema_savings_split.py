@@ -24,12 +24,35 @@ buckets -- so message-only dollars are recoverable by subtraction.
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from headroom.proxy.savings_tracker import SavingsTracker, _normalize_history_entry
 
 MODEL = "claude-opus-5"
+
+
+def _iso(moment: datetime) -> str:
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _recent() -> str:
+    """A timestamp inside the display-session window, anchored to wall clock.
+
+    ``_display_session_snapshot_locked`` expires the session against
+    ``_utc_now()``, not against the recorded timestamp, so a frozen literal
+    silently stops populating ``display_session`` once it ages past
+    ``DEFAULT_DISPLAY_SESSION_INACTIVITY_MINUTES``. This suite was written with
+    a hardcoded date and went red three weeks later for exactly that reason.
+    """
+    return _iso(datetime.now(timezone.utc) - timedelta(minutes=1))
+
+
+def _hour_base() -> datetime:
+    """A whole hour safely in the past, so derived buckets are stable and never future-dated."""
+    now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    return now - timedelta(hours=3)
 
 
 def _tracker(tmp_path) -> SavingsTracker:
@@ -47,7 +70,7 @@ def _record(
     tool_search_saved: int = 500,
     compression_usd: float = 1.0,
     tool_usd: float = 5.0,
-    timestamp: str = "2026-08-21T09:10:00Z",
+    timestamp: str | None = None,
 ) -> None:
     tracker.record_request(
         model=MODEL,
@@ -60,7 +83,7 @@ def _record(
             "output_shaping": 0.0,
             "provider_cache": 0.0,
         },
-        timestamp=timestamp,
+        timestamp=timestamp or _recent(),
     )
 
 
@@ -162,14 +185,25 @@ def test_tool_only_request_appends_a_checkpoint(tmp_path):
 
 def test_rollups_expose_tool_schema_deltas(tmp_path):
     tracker = _tracker(tmp_path)
-    _record(tracker, timestamp="2026-08-21T09:10:00Z")
-    _record(tracker, tool_search_saved=250, tool_usd=2.5, timestamp="2026-08-21T09:40:00Z")
-    _record(tracker, tool_search_saved=1_000, tool_usd=10.0, timestamp="2026-08-21T10:05:00Z")
+    base = _hour_base()
+    _record(tracker, timestamp=_iso(base + timedelta(minutes=10)))
+    _record(
+        tracker,
+        tool_search_saved=250,
+        tool_usd=2.5,
+        timestamp=_iso(base + timedelta(minutes=40)),
+    )
+    _record(
+        tracker,
+        tool_search_saved=1_000,
+        tool_usd=10.0,
+        timestamp=_iso(base + timedelta(minutes=65)),
+    )
 
     hourly = tracker.history_response()["series"]["hourly"]
     assert [point["timestamp"] for point in hourly] == [
-        "2026-08-21T09:00:00Z",
-        "2026-08-21T10:00:00Z",
+        _iso(base),
+        _iso(base + timedelta(hours=1)),
     ]
 
     first, second = hourly
@@ -195,8 +229,9 @@ def test_rollups_expose_tool_schema_deltas(tmp_path):
 
 def test_rollup_csv_exports_the_delta_columns(tmp_path):
     tracker = _tracker(tmp_path)
-    _record(tracker, timestamp="2026-08-21T09:10:00Z")
-    _record(tracker, timestamp="2026-08-21T09:40:00Z")
+    base = _hour_base()
+    _record(tracker, timestamp=_iso(base + timedelta(minutes=10)))
+    _record(tracker, timestamp=_iso(base + timedelta(minutes=40)))
 
     header = tracker.export_csv(series="hourly").splitlines()[0]
     assert "tool_tokens_saved_delta" in header
