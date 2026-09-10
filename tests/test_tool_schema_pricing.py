@@ -20,10 +20,9 @@ import types
 
 import pytest
 
+from headroom.proxy import cost
 from headroom.proxy import savings_tracker as st
 from headroom.proxy.savings_tracker import (
-    _CACHE_READ_MULTIPLIER,
-    _CACHE_WRITE_MULTIPLIER,
     DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN,
     _estimate_tool_schema_savings_usd,
     estimate_request_savings_usd,
@@ -92,16 +91,28 @@ def test_no_billed_breakdown_falls_back_to_list_price(priced):
     assert _estimate_tool_schema_savings_usd(MODEL, 1_000_000) == pytest.approx(1_000_000 * LIST)
 
 
-def test_missing_cache_prices_derive_from_the_models_list_price(monkeypatch):
-    monkeypatch.setattr(
-        st,
-        "_get_litellm_module",
-        lambda: _fake_litellm({"some-model": {"input_cost_per_token": LIST}}),
-    )
-    read = _estimate_tool_schema_savings_usd("some-model", 1_000_000, cache_read_tokens=1)
-    write = _estimate_tool_schema_savings_usd("some-model", 1_000_000, cache_write_tokens=1)
-    assert read == pytest.approx(1_000_000 * LIST * _CACHE_READ_MULTIPLIER)
-    assert write == pytest.approx(1_000_000 * LIST * _CACHE_WRITE_MULTIPLIER)
+def test_missing_cache_prices_price_exactly_as_the_cost_card_does(monkeypatch):
+    """Both real pricing paths, on a catalog entry with no cache rates at all.
+
+    A hardcoded provider multiplier here would have quoted $0.50/M for a fully
+    read-cached request while ``CostTracker`` quoted $5/M for the same tokens of
+    the same request -- and would have overstated savings for any provider that
+    does not bill cache like Anthropic. Both sides now read the absent rate as
+    the list price, via the one shared policy in ``cost._cache_input_rates``.
+    """
+    catalog = {"some-model": {"input_cost_per_token": LIST}}
+    monkeypatch.setattr(st, "_get_litellm_module", lambda: _fake_litellm(catalog))
+    monkeypatch.setattr(cost, "_get_litellm_module", lambda: _fake_litellm(catalog))
+    monkeypatch.setattr("headroom.pricing.litellm_pricing.resolve_litellm_model", lambda m: m)
+    st._resolve_litellm_model.cache_clear()
+
+    card = cost.CostTracker()._get_cache_prices("some-model")
+    assert card == (LIST, LIST, LIST)
+    for mix, card_rate in zip(
+        ("cache_read_tokens", "cache_write_tokens", "uncached_tokens"), card, strict=True
+    ):
+        got = _estimate_tool_schema_savings_usd("some-model", 1_000_000, **{mix: 1})
+        assert got == pytest.approx(1_000_000 * card_rate)
 
 
 def test_free_model_prices_as_zero(monkeypatch):
@@ -128,9 +139,9 @@ def test_unpriced_model_falls_back_to_the_default_rate(monkeypatch, litellm):
         "_get_litellm_module",
         (lambda: None) if litellm is None else (lambda: _fake_litellm({})),
     )
+    st._resolve_litellm_model.cache_clear()
     got = _estimate_tool_schema_savings_usd("unknown-model", 1_000_000, cache_read_tokens=1)
-    expected = 1_000_000 * _CACHE_READ_MULTIPLIER * DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN
-    assert got == pytest.approx(expected)
+    assert got == pytest.approx(1_000_000 * DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
 
 
 def test_zero_and_negative_token_counts_price_as_zero(priced):

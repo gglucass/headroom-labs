@@ -24,7 +24,7 @@ from typing import Any
 
 from headroom import paths as _paths
 from headroom.proxy import project_name_policy
-from headroom.proxy.cost import _bucket_by_cache_mix
+from headroom.proxy.cost import _bucket_by_cache_mix, _cache_input_rates
 from headroom.proxy.persistent_metrics import PersistentMetricsState
 
 PROJECT_NAME_MAX_LENGTH = project_name_policy.PROJECT_NAME_MAX_LENGTH
@@ -330,46 +330,31 @@ def _estimate_cache_savings_usd(model: str, cache_read_tokens: int) -> float:
         return 0.0
 
 
-# Multipliers used only when litellm knows a model's list price but not its
-# cache prices. Anthropic bills cache reads at 0.1x input and cold writes at
-# 1.25x; OpenAI and Gemini read between 0.1x and 0.25x. Reads take the
-# conservative (cheapest) end so an unknown cache price cannot inflate savings.
-_CACHE_READ_MULTIPLIER = 0.1
-_CACHE_WRITE_MULTIPLIER = 1.25
-
-
 def _model_input_rates(model: str) -> tuple[float, float, float]:
     """``(cache_read, cache_write, list)`` per-token input rates for ``model``.
 
-    Mirrors ``_estimate_compression_savings_usd``'s fallback rules: an
-    unavailable litellm or an unpriced model falls back to
-    ``DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN``, and a legitimately free model
-    (a real ``0.0``) prices as free rather than as "unknown".
+    Rates and the missing-cache-price fallback come from ``cost.py``'s
+    ``_cache_input_rates``, the same policy the cost card prices real requests
+    with, so the two surfaces cannot disagree about what a deferred token would
+    have cost. Only the catalog lookup is local, because this module resolves
+    model names through its own alias-aware ``_resolve_litellm_model``.
+
+    Mirrors ``_estimate_compression_savings_usd``'s outer rules: an unavailable
+    litellm or an unpriced model falls back to
+    ``DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN`` for all three rates, and a
+    legitimately free model (a real ``0.0``) prices as free rather than as
+    "unknown".
     """
     litellm = _get_litellm_module()
+    if litellm is not None:
+        try:
+            rates = _cache_input_rates(litellm.model_cost.get(_resolve_litellm_model(model), {}))
+        except Exception:
+            rates = None
+        if rates is not None:
+            return rates
     fallback = float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
-    default = (
-        fallback * _CACHE_READ_MULTIPLIER,
-        fallback * _CACHE_WRITE_MULTIPLIER,
-        fallback,
-    )
-    if litellm is None:
-        return default
-    try:
-        info = litellm.model_cost.get(_resolve_litellm_model(model), {})
-        list_cost = info.get("input_cost_per_token")
-        if list_cost is None:
-            raise RuntimeError("input cost unavailable")
-        list_rate = float(list_cost)
-        read_cost = info.get("cache_read_input_token_cost")
-        write_cost = info.get("cache_creation_input_token_cost")
-        return (
-            float(read_cost) if read_cost is not None else list_rate * _CACHE_READ_MULTIPLIER,
-            float(write_cost) if write_cost is not None else list_rate * _CACHE_WRITE_MULTIPLIER,
-            list_rate,
-        )
-    except Exception:
-        return default
+    return (fallback, fallback, fallback)
 
 
 def _estimate_tool_schema_savings_usd(
