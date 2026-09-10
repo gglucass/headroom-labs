@@ -62,10 +62,8 @@ FROM python:3.11-slim
 
 ENV DEBIAN_FRONTEND=noninteractive \
     AIDER_CHAT_VERSION=0.86.2 \
-    CODEX_VERSION=0.118.0 \
-    OPENCLAW_VERSION=2026.4.7 \
     OPENCODE_VERSION=1.17.8 \
-    PATH="/opt/headroom-venv/bin:/opt/aider-venv/bin:${PATH}" \
+    PATH="/opt/wrap-tools/node_modules/.bin:/opt/headroom-venv/bin:/opt/aider-venv/bin:${PATH}" \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
     PYTHONUNBUFFERED=1 \
@@ -88,6 +86,12 @@ RUN apt-get update && \
 # OpenClaw plugin (Cannot read properties of null, reading 'edgesOut'). Pin the
 # tested npm version so both wrap-e2e callers use the same working installer.
 RUN npm install -g --no-fund --no-audit npm@11.16.0
+
+# Freeze transitive CLI dependencies as well as the top-level versions.
+# Global npm install re-resolves ranges and can select partially published
+# dependency releases; npm ci consumes the reviewed lockfile instead.
+COPY e2e/wrap/tools/package.json e2e/wrap/tools/package-lock.json /opt/wrap-tools/
+RUN npm ci --prefix /opt/wrap-tools --no-fund --no-audit
 
 WORKDIR /workspace
 
@@ -114,7 +118,6 @@ RUN python -m venv /opt/headroom-venv && \
     python -m venv /opt/aider-venv && \
     /opt/aider-venv/bin/python -m pip install --upgrade pip && \
     /opt/aider-venv/bin/python -m pip install "aider-chat==${AIDER_CHAT_VERSION}" && \
-    npm install -g --no-fund --no-audit "@openai/codex@${CODEX_VERSION}" "openclaw@${OPENCLAW_VERSION}" && \
     curl -fsSL https://opencode.ai/install | VERSION="${OPENCODE_VERSION}" bash
 
 # The opencode installer adds its bin dir to .bashrc. Non-login shells
