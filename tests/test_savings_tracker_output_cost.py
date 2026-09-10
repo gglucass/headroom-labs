@@ -120,3 +120,45 @@ def test_rollup_series_carries_the_per_bucket_output_spend(monkeypatch, tmp_path
     # Three requests at $0.01 of emitted output each, as a delta and a total.
     assert bucket["total_output_cost_usd_delta"] == 0.03
     assert bucket["total_output_cost_usd"] == 0.03
+
+
+def test_lifetime_output_spend_survives_a_restart(monkeypatch, tmp_path):
+    """The field is a LIFETIME total, so a reload must not restart it at 0.
+
+    The lifetime block accumulates in memory and is checkpointed into history;
+    on load the block has to be recovered from both. Without that, request two
+    lands on a zeroed counter and the rollup's ``max(delta, 0)`` clamp hides
+    the regression by reporting a flat total instead of a negative one.
+    """
+    monkeypatch.setattr(st, "_get_litellm_module", _priced_litellm)
+    path = tmp_path / "savings.json"
+
+    def record(tracker: SavingsTracker) -> None:
+        tracker.record_request(
+            model="test-model",
+            input_tokens=1_000,
+            tokens_saved=100,
+            output_tokens=2_000,
+            output_tokens_saved=400,
+        )
+
+    first = SavingsTracker(path=path, save_flush_every=1)
+    record(first)
+    assert first.snapshot()["lifetime"]["total_output_cost_usd"] == 0.01
+
+    reloaded = SavingsTracker(path=path, save_flush_every=1)
+    restored = reloaded.snapshot()["lifetime"]
+    assert restored["total_output_cost_usd"] == 0.01
+    assert restored["output_savings_usd"] == 0.002
+    assert restored["output_tokens_saved"] == 400
+
+    record(reloaded)
+    lifetime = reloaded.snapshot()["lifetime"]
+    assert lifetime["total_output_cost_usd"] == 0.02
+    assert lifetime["output_savings_usd"] == 0.004
+    assert lifetime["output_tokens_saved"] == 800
+
+    bucket = reloaded.history_response()["series"]["daily"][-1]
+    assert bucket["total_output_cost_usd"] == 0.02
+    assert bucket["total_output_cost_usd_delta"] == 0.02
+    assert bucket["output_savings_usd_delta"] == 0.004

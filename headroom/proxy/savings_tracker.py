@@ -1330,6 +1330,9 @@ class SavingsTracker:
                 "cache_savings_usd": 0.0,
                 "total_input_tokens": 0,
                 "total_input_cost_usd": 0.0,
+                "output_tokens_saved": 0,
+                "output_savings_usd": 0.0,
+                "total_output_cost_usd": 0.0,
             },
             "display_session": _empty_display_session(),
             "history": [],
@@ -1392,6 +1395,9 @@ class SavingsTracker:
         lifetime_cache_savings_usd = 0.0
         lifetime_input_tokens = 0
         lifetime_input_cost_usd = 0.0
+        lifetime_output_tokens_saved = 0
+        lifetime_output_savings_usd = 0.0
+        lifetime_output_cost_usd = 0.0
         if isinstance(lifetime_raw, dict):
             lifetime_requests = _coerce_int(lifetime_raw.get("requests"))
             lifetime_tokens_saved = _coerce_int(lifetime_raw.get("tokens_saved"))
@@ -1400,6 +1406,9 @@ class SavingsTracker:
             lifetime_cache_savings_usd = _coerce_float(lifetime_raw.get("cache_savings_usd"))
             lifetime_input_tokens = _coerce_int(lifetime_raw.get("total_input_tokens"))
             lifetime_input_cost_usd = _coerce_float(lifetime_raw.get("total_input_cost_usd"))
+            lifetime_output_tokens_saved = _coerce_int(lifetime_raw.get("output_tokens_saved"))
+            lifetime_output_savings_usd = _coerce_float(lifetime_raw.get("output_savings_usd"))
+            lifetime_output_cost_usd = _coerce_float(lifetime_raw.get("total_output_cost_usd"))
 
         if normalized_history:
             last = normalized_history[-1]
@@ -1419,6 +1428,22 @@ class SavingsTracker:
                 lifetime_input_cost_usd,
                 _coerce_float(last.get("total_input_cost_usd")),
             )
+            # The output side accumulates the same way and is checkpointed the
+            # same way, so it recovers the same way. Without this a restart
+            # restarted the counters at 0 while history kept the old totals,
+            # and the rollup's max(delta, 0) then swallowed the difference.
+            lifetime_output_tokens_saved = max(
+                lifetime_output_tokens_saved,
+                _coerce_int(last.get("output_tokens_saved")),
+            )
+            lifetime_output_savings_usd = max(
+                lifetime_output_savings_usd,
+                _coerce_float(last.get("output_savings_usd")),
+            )
+            lifetime_output_cost_usd = max(
+                lifetime_output_cost_usd,
+                _coerce_float(last.get("total_output_cost_usd")),
+            )
 
         state = {
             "schema_version": SCHEMA_VERSION,
@@ -1430,6 +1455,9 @@ class SavingsTracker:
                 "cache_savings_usd": round(lifetime_cache_savings_usd, 6),
                 "total_input_tokens": lifetime_input_tokens,
                 "total_input_cost_usd": round(lifetime_input_cost_usd, 6),
+                "output_tokens_saved": lifetime_output_tokens_saved,
+                "output_savings_usd": round(lifetime_output_savings_usd, 6),
+                "total_output_cost_usd": round(lifetime_output_cost_usd, 6),
             },
             "display_session": _normalize_display_session(raw.get("display_session")),
             "history": normalized_history,
