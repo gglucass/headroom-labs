@@ -54,12 +54,16 @@ from .output_savings_policy import (
     conversation_key_from_responses_body as conversation_key_from_responses_body,
 )
 from .output_savings_policy import (
+    conversation_label as conversation_label,
+)
+from .output_savings_policy import (
     input_bucket as input_bucket,
 )
 from .output_savings_policy import (
     model_family as model_family,
 )
 from .output_savings_policy import (
+    parse_conversation_label,
     parse_stratum_label,
 )
 from .output_savings_policy import (
@@ -71,6 +75,21 @@ from .output_savings_policy import (
 
 logger = logging.getLogger(__name__)
 
+# A stratum enters the measured (A/B) estimate only once BOTH arms hold this
+# many distinct conversations. Assignment is per conversation, so conversations
+# -- not requests -- are the independent draws: one agent session in the holdout
+# can leave 2,500 control requests in a single stratum, and every request-count
+# gate we have waves that through as a well-sampled arm. On a real ledger that
+# produced a -1.6% "measured" reduction whose two largest terms came from strata
+# with four control requests apiece.
+MEASURED_MIN_CLUSTERS = 5
+
+# Distinct conversations tracked per arm/stratum. The count is only ever
+# compared against the threshold above, so there is nothing to gain from an
+# exact tally of a busy stratum -- and this keeps a flushed-every-25-requests
+# ledger from growing a set per conversation forever.
+_CLUSTER_CAP = 32
+
 
 @dataclass
 class _Accum:
@@ -79,11 +98,43 @@ class _Accum:
     n: int = 0
     sum: float = 0.0
     sumsq: float = 0.0
+    #: Distinct conversation ids behind ``qn``, capped at ``_CLUSTER_CAP``.
+    clusters: set[str] = field(default_factory=set)
+    #: The conversation-QUALIFIED subset of n / sum / sumsq: observations that
+    #: arrived carrying a conversation label. Kept separate because the cluster
+    #: count alone cannot vouch for the totals. An accumulator upgraded from an
+    #: older ledger holds requests of unknown provenance -- possibly one
+    #: conversation, possibly thousands -- and five fresh labelled
+    #: conversations arriving afterwards would otherwise qualify all of that
+    #: legacy traffic for the measured estimate too, which is exactly the case
+    #: the cluster gate exists to exclude. Later unlabelled requests are
+    #: likewise kept out of an already-qualified stratum. The full totals stay
+    #: intact for the estimated / modelled tiers and historical reporting.
+    qn: int = 0
+    qsum: float = 0.0
+    qsumsq: float = 0.0
 
-    def add(self, x: float) -> None:
+    def add(self, x: float, cluster: str | None = None) -> None:
         self.n += 1
         self.sum += x
         self.sumsq += x * x
+        if cluster is None:
+            return
+        self.qn += 1
+        self.qsum += x
+        self.qsumsq += x * x
+        if len(self.clusters) < _CLUSTER_CAP:
+            self.clusters.add(cluster)
+
+    @property
+    def n_clusters(self) -> int:
+        """Distinct conversations observed, saturating at ``_CLUSTER_CAP``.
+
+        0 for an accumulator written before conversations were tracked, which
+        is why that data cannot clear :data:`MEASURED_MIN_CLUSTERS`: an
+        unverifiable arm is treated as an unqualified one.
+        """
+        return len(self.clusters)
 
     @property
     def mean(self) -> float:
@@ -96,6 +147,18 @@ class _Accum:
             return 0.0
         return max(0.0, (self.sumsq - self.sum * self.sum / self.n) / (self.n - 1))
 
+    @property
+    def qmean(self) -> float:
+        """Mean over the conversation-qualified observations only."""
+        return self.qsum / self.qn if self.qn else 0.0
+
+    @property
+    def qvar(self) -> float:
+        """Sample variance over the conversation-qualified observations only."""
+        if self.qn < 2:
+            return 0.0
+        return max(0.0, (self.qsumsq - self.qsum * self.qsum / self.qn) / (self.qn - 1))
+
     def merge(self, other: _Accum) -> None:
         """Fold another accumulator's observations into this one.
 
@@ -105,16 +168,35 @@ class _Accum:
         self.n += other.n
         self.sum += other.sum
         self.sumsq += other.sumsq
+        self.qn += other.qn
+        self.qsum += other.qsum
+        self.qsumsq += other.qsumsq
+        self.clusters |= set(list(other.clusters)[: _CLUSTER_CAP - len(self.clusters)])
 
-    def to_dict(self) -> dict[str, float]:
-        return {"n": self.n, "sum": self.sum, "sumsq": self.sumsq}
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {"n": self.n, "sum": self.sum, "sumsq": self.sumsq}
+        # Omitted when empty so a baseline model (which has no conversations to
+        # track) serializes exactly as it did before.
+        if self.clusters:
+            d["clusters"] = sorted(self.clusters)
+        if self.qn:
+            d["qn"] = self.qn
+            d["qsum"] = self.qsum
+            d["qsumsq"] = self.qsumsq
+        return d
 
     @classmethod
-    def from_dict(cls, d: dict[str, float]) -> _Accum:
+    def from_dict(cls, d: dict[str, Any]) -> _Accum:
         a = cls()
         a.n = int(d.get("n", 0))
         a.sum = float(d.get("sum", 0.0))
         a.sumsq = float(d.get("sumsq", 0.0))
+        a.clusters = {str(c) for c in (d.get("clusters") or ())}
+        # Absent in a pre-upgrade ledger, which is the point: those requests
+        # carry no conversation provenance and stay out of the measured arm.
+        a.qn = int(d.get("qn", 0))
+        a.qsum = float(d.get("qsum", 0.0))
+        a.qsumsq = float(d.get("qsumsq", 0.0))
         return a
 
 
@@ -251,16 +333,17 @@ class SavingsEstimate:
         return asdict(self)
 
 
-# A stratum contributes to the measured (A/B) estimate only once BOTH of its
-# arms hold at least this many observations. Below it an arm mean is a draw
-# rather than a mean, and its sample variance has too few degrees of freedom
-# for the normal approximation in ``_finalize``: a single observation reports
-# variance 0, so one stale control request enters the sum with an arbitrary
-# per-request delta and contributes nothing to the width of the band that is
-# supposed to catch it. 30 is the conventional floor at which a z-interval on
-# an estimated variance is defensible; below it the interval would need a
-# t-quantile, which this module does not compute.
-MEASURED_MIN_ARM_SAMPLES = 30
+# Emitted by ``output_shaper.shape_request`` only when it actually changed the
+# request, so its presence is the per-request proof that shaping happened.
+_SHAPED_LABEL_PREFIX = "output_shaper:verbosity:"
+
+
+# Whether an arm is a real sample is decided by :data:`MEASURED_MIN_CLUSTERS`
+# in ``estimate_from_holdout``, not here: assignment is conversation-stable, so
+# requests are not independent draws and a per-arm REQUEST floor would pass 30
+# turns of one session while failing five separate ones. The two gates below
+# are about something else -- whether a qualifying measurement has earned the
+# headline slot away from the synthetic control.
 
 # A measured (A/B holdout) estimate replaces the synthetic-control one only
 # once strata with data in both arms account for this share of the requests the
@@ -269,7 +352,7 @@ MEASURED_MIN_ARM_SAMPLES = 30
 MEASURED_MIN_COVERAGE = 0.5
 
 # ...and only once its 95% band is at least this tight, in percentage points of
-# reduction. An arm can clear the sample floor and still be too noisy to say
+# reduction. An arm can clear the cluster gate and still be too noisy to say
 # anything: the observation that produced 20% +/- 277pp was three control
 # samples spread over an order of magnitude, and that spread does not go away
 # just because the arm eventually fills.
@@ -307,9 +390,11 @@ class SavingsLedger:
 
     # ---- recording -------------------------------------------------------
 
-    def record(self, arm: str, key: str, output_tokens: int) -> None:
+    def record(
+        self, arm: str, key: str, output_tokens: int, conversation: str | None = None
+    ) -> None:
         target = self.treatment if arm == "treatment" else self.control
-        target.setdefault(key, _Accum()).add(output_tokens)
+        target.setdefault(key, _Accum()).add(output_tokens, conversation)
 
     # ---- estimation ------------------------------------------------------
 
@@ -344,12 +429,25 @@ class SavingsLedger:
     def estimate_from_holdout(self) -> SavingsEstimate | None:
         """A/B measurement: per-stratum control mean minus treatment mean.
 
-        Only strata whose BOTH arms clear ``MEASURED_MIN_ARM_SAMPLES``
-        contribute: a one-request arm has no variance to propagate, so it would
-        enter the sum with an arbitrary delta and widen the band by nothing.
-        Returns ``None`` when no stratum qualifies -- there is no holdout
-        traffic yet, or not enough of it to divide by. Weighted by treatment
-        volume; this is the unbiased causal number.
+        Only strata with conversation-labelled data in BOTH arms contribute,
+        and only once both arms hold :data:`MEASURED_MIN_CLUSTERS` distinct
+        conversations. Returns ``None`` if no such stratum exists (no holdout
+        traffic yet, or none of it spread across enough conversations).
+        Weighted by treatment volume; this is the unbiased causal number.
+
+        The number is built from the QUALIFIED subset of each arm, never the
+        arm totals: an upgraded ledger's legacy requests have no conversation
+        provenance, so five fresh conversations arriving afterwards must not
+        drag thousands of unattributable requests into the measurement with
+        them. The totals remain available to the estimated and modelled tiers.
+
+        The cluster gate is not a sample-size nicety. Assignment is
+        conversation-stable, so the requests inside one conversation are one
+        draw answering one question, and the variance below (which divides by
+        the REQUEST count) reads a single 2,500-request session as a precise
+        measurement. Strata that thin get excluded rather than down-weighted:
+        the arm they describe is one conversation's worth of work, and no
+        weighting recovers a comparison that was never made.
         """
         total_saved = 0.0
         total_baseline = 0.0
@@ -358,16 +456,20 @@ class SavingsLedger:
         contributing = 0
         for key, t in self.treatment.items():
             c = self.control.get(key)
-            if c is None or min(c.n, t.n) < MEASURED_MIN_ARM_SAMPLES:
+            if c is None or c.qn == 0 or t.qn == 0:
+                continue
+            if c.n_clusters < MEASURED_MIN_CLUSTERS or t.n_clusters < MEASURED_MIN_CLUSTERS:
                 continue
             contributing += 1
-            n = t.n
+            # Everything below reads the qualified subset only. The clusters
+            # vouch for those observations and for nothing else.
+            n = t.qn
             n_requests += n
-            delta = c.mean - t.mean  # tokens saved per request in this stratum
+            delta = c.qmean - t.qmean  # tokens saved per request in this stratum
             total_saved += n * delta
-            total_baseline += n * c.mean
+            total_baseline += n * c.qmean
             # Var of (c.mean - t.mean) = σ²_c/n_c + σ²_t/n_t, scaled by n².
-            var += (n * n) * (c.var / c.n + t.var / t.n)
+            var += (n * n) * (c.qvar / c.qn + t.qvar / t.qn)
         if contributing == 0:
             return None
         return self._finalize(total_saved, total_baseline, var, n_requests, "measured")
@@ -459,10 +561,9 @@ class SavingsLedger:
         has to either render or suppress. Neither is the estimator's job to
         force. So the measured number displaces the synthetic control only when
         it actually measures the traffic: every stratum it is built from must
-        hold enough of both arms to support a variance estimate (see
-        ``estimate_from_holdout``), it must cover a real share of the requests
-        the baseline can also speak to, and it must carry a band tight enough
-        to mean something.
+        clear the conversation-cluster gate in ``estimate_from_holdout``, it
+        must cover a real share of the requests the baseline can also speak to,
+        and it must carry a band tight enough to mean something.
         """
         estimated = self.estimate_from_baseline()
         measured = self.estimate_from_holdout()
@@ -480,6 +581,10 @@ class SavingsLedger:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            # Marks arms accumulated under the shaped-only recording rule (see
+            # ``record_from_labels``). Absent = written before that rule, so the
+            # arms may hold unshaped observations.
+            "shaped_only": True,
             "baseline": self.baseline.to_dict(),
             "treatment": {k: a.to_dict() for k, a in self.treatment.items()},
             "control": {k: a.to_dict() for k, a in self.control.items()},
@@ -488,6 +593,21 @@ class SavingsLedger:
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> SavingsLedger:
         ledger = cls(baseline=BaselineModel.from_dict(d.get("baseline") or {}))
+        if not d.get("shaped_only"):
+            # Pre-rule arms cannot be told apart from shaped ones entry by
+            # entry, and republishing them is the reported bug. Drop them and
+            # re-accumulate from live traffic (hours, not weeks). The offline
+            # baseline is kept: it is learned from pre-shaper history, costs a
+            # `learn --verbosity` run to rebuild, and was never the poisoned part.
+            if d.get("treatment") or d.get("control"):
+                logger.warning(
+                    "output-savings ledger predates shaped-only recording; "
+                    "dropping %d treatment and %d control strata and "
+                    "re-accumulating (baseline kept)",
+                    len(d.get("treatment") or {}),
+                    len(d.get("control") or {}),
+                )
+            return ledger
         for k, a in (d.get("treatment") or {}).items():
             ledger.treatment[k] = _Accum.from_dict(a)
         for k, a in (d.get("control") or {}).items():
@@ -550,19 +670,38 @@ class SavingsRecorder:
 
     def record_from_labels(self, labels: Any, output_tokens: int) -> bool:
         """Record one outcome given its transforms_applied labels. Returns True
-        if a shaping label was found and recorded."""
-        for label in labels or ():
-            parsed = parse_stratum_label(str(label))
-            if parsed is None:
-                continue
-            arm, key = parsed
-            with self._lock:
-                self._ledger.record(arm, key, output_tokens)
-                self._since_flush += 1
-                if self._since_flush >= self._flush_every:
-                    self._flush_locked()
-            return True
-        return False
+        if a shaping label was found and recorded.
+
+        The conversation label may sit either side of the stratum label, so the
+        labels are scanned once for both before recording. A request that
+        carries no conversation label (an older client, or a path that has not
+        adopted it) still records its output tokens; it just does not advance
+        the stratum's cluster count.
+        """
+        label_strings = tuple(str(label) for label in labels or ())
+        arm_key: tuple[str, str] | None = None
+        conversation: str | None = None
+        for label in label_strings:
+            text = str(label)
+            if arm_key is None:
+                arm_key = parse_stratum_label(text)
+                if arm_key is not None:
+                    continue
+            if conversation is None:
+                conversation = parse_conversation_label(text)
+        if arm_key is None:
+            return False
+        arm, key = arm_key
+        if arm == "treatment" and not any(
+            str(label).startswith(_SHAPED_LABEL_PREFIX) for label in label_strings
+        ):
+            return False
+        with self._lock:
+            self._ledger.record(arm, key, output_tokens, conversation)
+            self._since_flush += 1
+            if self._since_flush >= self._flush_every:
+                self._flush_locked()
+        return True
 
     def estimate_request_savings(self, labels: Any, output_tokens: int) -> int:
         """Per-request output tokens saved, for the savings rollup.

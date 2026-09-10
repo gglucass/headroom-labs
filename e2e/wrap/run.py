@@ -515,7 +515,10 @@ def verify_installs() -> None:
     for tool in ("headroom", "codex", "aider", "openclaw"):
         assert_true(shutil.which(tool) is not None, f"Expected '{tool}' on PATH")
     run(["headroom", "--help"], timeout=30)
-    run(["npm", "list", "-g", "--depth=0", "@openai/codex", "openclaw"], timeout=60)
+    run(
+        ["npm", "list", "--prefix", "/opt/wrap-tools", "--depth=0", "@openai/codex", "openclaw"],
+        timeout=60,
+    )
     run(["/opt/aider-venv/bin/python", "-m", "pip", "show", "aider-chat"], timeout=60)
 
 
