@@ -225,7 +225,11 @@ def build_prefix_cache_stats(
         "cache_write_5m_requests": 0,
         "cache_write_1h_requests": 0,
         "uncached_input_tokens": 0,
-        "new_input_saved_tokens": 0,
+        # New-input basis, from the metrics object rather than the per-provider
+        # cache rows: its cohort is "newly billed input", which is not the
+        # cache-activity cohort those rows are gated on.
+        "new_input_tokens": int(getattr(metrics, "new_input_tokens_total", 0) or 0),
+        "new_input_saved_tokens": int(getattr(metrics, "new_input_saved_tokens_total", 0) or 0),
         "requests": 0,
         "hit_requests": 0,
         "bust_count": 0,
@@ -365,7 +369,6 @@ def build_prefix_cache_stats(
         totals["cache_write_5m_requests"] += write_5m_requests
         totals["cache_write_1h_requests"] += write_1h_requests
         totals["uncached_input_tokens"] += uncached_tokens
-        totals["new_input_saved_tokens"] += int(pc.get("new_input_saved_tokens", 0) or 0)
         totals["requests"] += pc["requests"]
         totals["hit_requests"] += pc["hit_requests"]
         totals["bust_count"] += pc["bust_count"]
