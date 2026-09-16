@@ -25,7 +25,7 @@ import json
 import logging
 import sys
 from collections import deque
-from dataclasses import asdict
+from dataclasses import asdict, fields
 from pathlib import Path
 from threading import Lock
 from typing import TYPE_CHECKING, Any
@@ -80,6 +80,10 @@ def redact_image_base64(payload: Any) -> Any:
         with _redactions_lock:
             _redactions_total += result.redactions
     return result.value
+
+
+# Payload fields `get_recent` never returns and therefore must never walk.
+_HEAVY_FIELDS = frozenset({"request_messages", "compressed_messages", "response_content"})
 
 
 class RequestLogger:
@@ -147,11 +151,20 @@ class RequestLogger:
         """Get recent log entries (without request/compressed messages and response_content)."""
         # Convert deque to list for slicing (deque doesn't support slicing)
         entries = list(self._logs)[-n:]
+        # Not asdict(): that deep-copies every field BEFORE the heavy ones are
+        # dropped, so each entry cost a full walk of its request_messages and
+        # compressed_messages (~3.4 ms for a 400 KB Claude Code transcript).
+        # /stats calls this with n=10_000 synchronously on the event loop, so
+        # a full deque made every /stats build take ~30 s and a dashboard
+        # polling it starved /v1/messages. The kept fields are scalars and
+        # flat dict/list containers; a shallow copy of those is what asdict
+        # returned for them.
         return [
             {
-                k: v
-                for k, v in asdict(e).items()
-                if k not in ("request_messages", "compressed_messages", "response_content")
+                f.name: (v.copy() if isinstance(v, (dict, list)) else v)
+                for f in fields(e)
+                if f.name not in _HEAVY_FIELDS
+                for v in (getattr(e, f.name),)
             }
             for e in entries
         ]

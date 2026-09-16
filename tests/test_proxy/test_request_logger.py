@@ -98,3 +98,31 @@ def test_get_memory_stats_accounts_for_compressed_messages():
     stats = logger.get_memory_stats()
     assert stats.entry_count == 1
     assert stats.size_bytes > 0
+
+
+def test_get_recent_never_walks_message_payloads():
+    """`/stats` calls get_recent(10_000) on the event loop; the payloads it
+    drops must not be traversed first (asdict deep-copied them, ~30 s per call
+    on a full deque). A leaf that refuses to be deep-copied proves the walk
+    is gone."""
+
+    class _NoCopy:
+        def __deepcopy__(self, memo):
+            raise AssertionError("get_recent walked a message payload")
+
+    logger = RequestLogger(log_file=None, log_full_messages=True)
+    logger.log(
+        _entry(
+            request_messages=[{"role": "user", "content": _NoCopy()}],
+            compressed_messages=[{"role": "user", "content": _NoCopy()}],
+            tags={"agent": "codex"},
+            transforms_applied=["smart_crusher"],
+        )
+    )
+
+    recent = logger.get_recent(10)
+    assert recent[0]["tags"] == {"agent": "codex"}
+    assert recent[0]["transforms_applied"] == ["smart_crusher"]
+    # Still copies, not aliases, of the entry's own containers.
+    recent[0]["tags"]["agent"] = "x"
+    assert logger.get_recent(10)[0]["tags"] == {"agent": "codex"}
