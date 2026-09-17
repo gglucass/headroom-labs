@@ -115,14 +115,20 @@ def test_get_recent_never_walks_message_payloads():
         _entry(
             request_messages=[{"role": "user", "content": _NoCopy()}],
             compressed_messages=[{"role": "user", "content": _NoCopy()}],
-            tags={"agent": "codex"},
+            tags={"agent": "codex", "meta": {"depth": 1}},
             transforms_applied=["smart_crusher"],
+            savings_breakdown=[{"tokens": 60}],
         )
     )
 
     recent = logger.get_recent(10)
-    assert recent[0]["tags"] == {"agent": "codex"}
+    assert recent[0]["tags"] == {"agent": "codex", "meta": {"depth": 1}}
     assert recent[0]["transforms_applied"] == ["smart_crusher"]
-    # Still copies, not aliases, of the entry's own containers.
+    # Still copies, not aliases, of the entry's own containers, all the way
+    # down: mutating a nested value must not change the next /stats result.
     recent[0]["tags"]["agent"] = "x"
-    assert logger.get_recent(10)[0]["tags"] == {"agent": "codex"}
+    recent[0]["tags"]["meta"]["depth"] = 99
+    recent[0]["savings_breakdown"][0]["tokens"] = 0
+    again = logger.get_recent(10)[0]
+    assert again["tags"] == {"agent": "codex", "meta": {"depth": 1}}
+    assert again["savings_breakdown"] == [{"tokens": 60}]

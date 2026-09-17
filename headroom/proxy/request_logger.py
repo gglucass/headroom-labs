@@ -25,6 +25,7 @@ import json
 import logging
 import sys
 from collections import deque
+from copy import deepcopy
 from dataclasses import asdict, fields
 from pathlib import Path
 from threading import Lock
@@ -156,16 +157,11 @@ class RequestLogger:
         # compressed_messages (~3.4 ms for a 400 KB Claude Code transcript).
         # /stats calls this with n=10_000 synchronously on the event loop, so
         # a full deque made every /stats build take ~30 s and a dashboard
-        # polling it starved /v1/messages. The kept fields are scalars and
-        # flat dict/list containers; a shallow copy of those is what asdict
-        # returned for them.
+        # polling it starved /v1/messages. The retained fields are still
+        # deep-copied, so callers cannot reach nested containers (tags,
+        # savings_breakdown) that the in-memory log owns.
         return [
-            {
-                f.name: (v.copy() if isinstance(v, (dict, list)) else v)
-                for f in fields(e)
-                if f.name not in _HEAVY_FIELDS
-                for v in (getattr(e, f.name),)
-            }
+            {f.name: deepcopy(getattr(e, f.name)) for f in fields(e) if f.name not in _HEAVY_FIELDS}
             for e in entries
         ]
 
