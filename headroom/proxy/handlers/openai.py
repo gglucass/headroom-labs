@@ -10113,7 +10113,17 @@ class OpenAIHandlerMixin:
                     # the pipeline introduced — byte-identical is the contract
                     # the caller forwards on.
                     turn = finalize_turn(result.messages, messages, prev_original, prev_returned)
-                    final = turn.messages
+                    # A replay can carry an earlier turn's cache_control marker
+                    # after the caller moved its breakpoint forward, and
+                    # Anthropic rejects more than four. Keep message markers at
+                    # the caller's current positions, as the /v1/messages
+                    # handler does after its own replay. The gateway's finish
+                    # step still enforces the hard budget on the whole body.
+                    from headroom.cache.prefix_tracker import normalize_message_cache_control
+
+                    final = normalize_message_cache_control(
+                        turn.messages, prev_returned, client_messages=messages
+                    )
                     if _turn is not None:
                         # AFTER the replay overlay, BEFORE update_from_result /
                         # record_returned: the turn's output is what the caller
