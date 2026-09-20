@@ -4954,8 +4954,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         return proxy.metrics.savings_tracker.history_response(history_mode=history_mode)
 
     @app.get("/transformations/feed", dependencies=[Depends(_require_loopback)])
-    async def transformations_feed(limit: int = 20):
+    async def transformations_feed(limit: int = 20, include_messages: bool = True):
         """Get recent message transformations for the live feed.
+
+        ``?include_messages=0`` omits the three message-body fields, and skips
+        copying them server-side, for pollers that only read the per-request
+        numbers. A ``limit=100`` pull with bodies is ~44 MB and its
+        serialization blocks the event loop; the dashboard's live feed keeps
+        the default.
 
         Loopback-only: when ``log_full_messages`` is enabled this returns the
         full request/response message bodies (prompt content and completions)
@@ -4974,29 +4980,29 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         log_full_messages = proxy.config.log_full_messages if proxy else False
 
         if proxy and proxy.logger:
-            logs = proxy.logger.get_recent_with_messages(limit)
+            logs = proxy.logger.get_recent_with_messages(limit, include_messages=include_messages)
             for log in logs:
-                transformations.append(
-                    {
-                        "request_id": log.get("request_id"),
-                        "timestamp": log.get("timestamp"),
-                        "provider": resolve_display_provider(
-                            log.get("provider"),
-                            openai_api_url=proxy.config.openai_api_url,
-                            provider_name=proxy.config.provider_name,
-                        ),
-                        "model": log.get("model"),
-                        "input_tokens_original": log.get("input_tokens_original"),
-                        "input_tokens_optimized": log.get("input_tokens_optimized"),
-                        "tokens_saved": log.get("tokens_saved"),
-                        "savings_percent": log.get("savings_percent"),
-                        "transforms_applied": log.get("transforms_applied", []),
-                        "request_messages": log.get("request_messages"),
-                        "compressed_messages": log.get("compressed_messages"),
-                        "response_content": log.get("response_content"),
-                        "turn_id": log.get("turn_id"),
-                    }
-                )
+                item = {
+                    "request_id": log.get("request_id"),
+                    "timestamp": log.get("timestamp"),
+                    "provider": resolve_display_provider(
+                        log.get("provider"),
+                        openai_api_url=proxy.config.openai_api_url,
+                        provider_name=proxy.config.provider_name,
+                    ),
+                    "model": log.get("model"),
+                    "input_tokens_original": log.get("input_tokens_original"),
+                    "input_tokens_optimized": log.get("input_tokens_optimized"),
+                    "tokens_saved": log.get("tokens_saved"),
+                    "savings_percent": log.get("savings_percent"),
+                    "transforms_applied": log.get("transforms_applied", []),
+                    "turn_id": log.get("turn_id"),
+                }
+                if include_messages:
+                    item["request_messages"] = log.get("request_messages")
+                    item["compressed_messages"] = log.get("compressed_messages")
+                    item["response_content"] = log.get("response_content")
+                transformations.append(item)
 
         return {"transformations": transformations, "log_full_messages": log_full_messages}
 
