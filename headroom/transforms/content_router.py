@@ -83,6 +83,7 @@ from .content_detector import (
     _try_detect_structured_config,
 )
 from .content_detector import detect_content_type as _regex_detect_content_type
+from .dense_line_elider import elide_dense_lines
 from .error_detection import content_has_strong_error_indicators
 from .lossless_provider import (
     get_lossless_generation,
@@ -1602,6 +1603,10 @@ class ContentRouterConfig:
     enable_tabular_compressor: bool = True  # CSV/TSV/markdown tables via SmartCrusher
     enable_config_compressor: bool = True  # YAML/TOML/INI structural compression
     enable_html_extractor: bool = True  # HTML content extraction
+    # Last-resort fallback for blocks no compressor could shrink: elide the
+    # middle of long, whitespace-free lines (minified JS/CSS, base64, RSC
+    # payloads). See ``dense_line_elider``.
+    enable_dense_line_elision: bool = True
     enable_image_optimizer: bool = True  # Image token optimization
 
     # Routing preferences
@@ -1932,6 +1937,21 @@ class ContentRouter(Transform):
     # the whole dict is dropped rather than evicted entry-by-entry, which keeps
     # the memo O(1) and unlockable at the cost of an occasional cold start.
     _LOSSLESS_FIRST_MEMO_MAX = 256
+
+    # Strategies whose result is still plain text, so dense-line elision can
+    # run on top of them (see ``_elide_dense``).
+    _DENSE_ELIDE_AFTER = frozenset(
+        {
+            CompressionStrategy.HTML,
+            CompressionStrategy.LOG,
+            CompressionStrategy.TEXT,
+            CompressionStrategy.CODE_AWARE,
+            # grep-style output is line-oriented (path, then ``N:match``), so a
+            # dense match line can be elided without breaking the format.
+            CompressionStrategy.SEARCH,
+            CompressionStrategy.PASSTHROUGH,
+        }
+    )
 
     def __init__(
         self,
@@ -3766,6 +3786,13 @@ class ContentRouter(Transform):
                         compressed = (
                             output.content if output is not None and output.compressed else None
                         )
+                        # A page that is all <script>/<style> extracts to "".
+                        # That is "nothing extracted" (fall through to the
+                        # passthrough / dense-line path), not a compression
+                        # to zero tokens: the unit layer rejects an empty
+                        # block and keeps the original verbatim.
+                        if compressed is not None and not compressed.strip():
+                            compressed = None
                         # Estimate tokens from extracted text (simple word count)
                         compressed_tokens = _estimate_tokens(compressed) if compressed else 0
                         decision_reason = "html_extractor"
@@ -3944,6 +3971,21 @@ class ContentRouter(Transform):
             # Re-narrow for mypy: all reassignments above produce str, but
             # mypy 1.14.x widens after nested try/except/else reassignments.
             assert compressed is not None
+            # Dense-line elision: whatever survived the chain, long
+            # whitespace-free lines (minified bundles, base64, RSC payloads)
+            # are still in it, because no structural compressor understands
+            # them. Runs on the RESULT so it composes with a partial win
+            # (code_aware at 0.95 on minified JS) as well as a no-op.
+            # Only after strategies that hand back the text AS TEXT. SmartCrusher,
+            # tabular, config and diff emit their own structured (and
+            # CCR-marked) forms; Kompress is lossy with its own marker. Eliding
+            # inside those would corrupt output another compressor owns.
+            if self.config.enable_dense_line_elision and actual_strategy in self._DENSE_ELIDE_AFTER:
+                dense = self._elide_dense(compressed, context)
+                if dense is not None and dense[1] < compressed_tokens:
+                    compressed, compressed_tokens = dense
+                    strategy_chain.append("dense_elide")
+                    decision_reason = f"{decision_reason}_dense_elide"
             if logger.isEnabledFor(logging.DEBUG):
                 _log_router_debug(
                     "content_router_strategy_result",
@@ -3978,6 +4020,21 @@ class ContentRouter(Transform):
             return compressed, compressed_tokens, strategy_chain
 
         # Fallback: return unchanged
+        if self.config.enable_dense_line_elision:
+            dense = self._elide_dense(content, context)
+            if dense is not None and dense[1] < original_tokens:
+                elided, elided_tokens = dense
+                strategy_chain.append("dense_elide")
+                self._record_to_toin(
+                    strategy=strategy,
+                    content=content,
+                    compressed=elided,
+                    original_tokens=original_tokens,
+                    compressed_tokens=elided_tokens,
+                    language=language,
+                    context=context,
+                )
+                return elided, elided_tokens, strategy_chain
         strategy_chain.append(CompressionStrategy.PASSTHROUGH.value)
         if logger.isEnabledFor(logging.DEBUG):
             _log_router_debug(
@@ -4000,6 +4057,40 @@ class ContentRouter(Transform):
                 error=error,
             )
         return content, original_tokens, strategy_chain
+
+    def _elide_dense(self, text: str, context: str) -> tuple[str, int] | None:
+        """Dense-line elision with a CCR retrieval marker; None when no line is dense.
+
+        The elided middle is lossy, so the pre-elision block is stored in the
+        CCR store and a ``Retrieve original: hash=`` marker is appended, the
+        same contract Kompress honours: the messages path discards a lossy
+        result that carries no marker (#1307), and the agent can get the
+        exact bytes back if it turns out to need them.
+        """
+        # Lossy by nature: never in lossless mode, where nothing may be dropped.
+        if self.config.lossless:
+            return None
+        elided, n_dense = elide_dense_lines(text)
+        if not n_dense:
+            return None
+        if self.config.ccr_inject_marker:
+            try:
+                from ..cache.compression_store import get_compression_store
+
+                key = get_compression_store().store(
+                    text,
+                    elided,
+                    original_tokens=_estimate_tokens(text),
+                    compressed_tokens=_estimate_tokens(elided),
+                    query_context=context or None,
+                    compression_strategy="dense_elide",
+                )
+                noun = "line" if n_dense == 1 else "lines"
+                elided += f"\n[{n_dense} dense machine-generated {noun} elided. Retrieve original: hash={key}]"
+            except Exception as exc:  # noqa: BLE001 - store optional; keep the block verbatim
+                logger.debug("dense-line elision: CCR store unavailable (%s); skipping", exc)
+                return None
+        return elided, _estimate_tokens(elided)
 
     def _try_ml_compressor(
         self,
