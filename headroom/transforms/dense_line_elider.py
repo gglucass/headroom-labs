@@ -11,7 +11,8 @@ This module keeps a head and a tail of each such line and replaces the middle
 with a one-line marker. It is deliberately dumb: a line is "dense" when it is
 long AND has a tiny fraction of spaces. Prose, code, logs, JSON with any
 indentation, CSV and markdown all have far more than 6% spaces, so they are
-never touched, and a JSON-shaped line is left to SmartCrusher. Measured on a replayed Codex web-research session against the
+never touched, a JSON-shaped line is left to SmartCrusher, and a lone dense
+value (JWT, signed URL, PATH) is below the per-block minimum. Measured on a replayed Codex web-research session against the
 installed 0.37.0 wheel: novel savings went from 7.2% to 25.1% of new input, on
 top of (not instead of) what the router already removed.
 """
@@ -20,6 +21,10 @@ from __future__ import annotations
 
 MIN_LINE_CHARS = 300
 MAX_SPACE_RATIO = 0.06
+# A single dense line (a JWT, a signed URL, a PATH, an RSA modulus) is a value
+# the agent asked for, not a dump: a block is only elided when its dense lines
+# add up to at least this many chars. Real bundle dumps are tens of KB.
+MIN_DENSE_TOTAL_CHARS = 2000
 HEAD_CHARS = 160
 TAIL_CHARS = 80
 
@@ -32,7 +37,9 @@ def is_dense_line(line: str) -> bool:
     the elider must never pre-empt it.
     """
     n = len(line)
-    if n < MIN_LINE_CHARS or (line.count(" ") / n) >= MAX_SPACE_RATIO:
+    # Tabs: TSV / ``psql -A`` rows pass the space ratio but are data the agent
+    # asked for; minified assets and encoded blobs never carry tabs.
+    if n < MIN_LINE_CHARS or "\t" in line or (line.count(" ") / n) >= MAX_SPACE_RATIO:
         return False
     stripped = line.strip()
     return not (stripped[:1] in "{[" and stripped[-1:] in "}]")
@@ -47,9 +54,12 @@ def elide_dense_lines(text: str) -> tuple[str, int]:
     """
     if len(text) < MIN_LINE_CHARS:
         return text, 0
+    lines = text.split("\n")
+    if sum(len(line) for line in lines if is_dense_line(line)) < MIN_DENSE_TOTAL_CHARS:
+        return text, 0
     out: list[str] = []
     n_elided = 0
-    for line in text.split("\n"):
+    for line in lines:
         if is_dense_line(line):
             omitted = len(line) - HEAD_CHARS - TAIL_CHARS
             out.append(

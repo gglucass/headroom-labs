@@ -20,10 +20,10 @@ MINIFIED_JS = (
     "!function(){var e=window,t=e.document,n=t.createElement('div');"
     "n.className='x';for(var r=0;r<1e3;r++){n.appendChild(t.createTextNode(r))}"
     "e.__x=n;var a=e.location.search.replace(/^\\?/,'').split('&');"
-) * 8
+) * 16
 BASE64 = (
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
-    * 6
+    * 12
 )
 PROSE = "This is an ordinary paragraph with plenty of spaces in it, " * 12
 CODE = "\n".join(f"    value_{i} = compute(arg_{i}, other_{i})  # comment {i}" for i in range(40))
@@ -102,6 +102,17 @@ def test_messages_path_keeps_elided_tool_result(tokenizer):
     text = block if isinstance(block, str) else block[0]["text"]
     assert "content elided" in text and "Retrieve original: hash=" in text
     assert len(text) < len(body) // 2
+
+
+def test_single_dense_values_and_tsv_are_kept():
+    """A lone JWT / signed URL / PATH / modulus is a value the agent asked for; TSV is data."""
+    jwt = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9." + "eyJzdWIiOiIxMjM0NTY3ODkwIn0" * 40 + ".sig"
+    url = "https://d1.cloudfront.net/v.mp4?Policy=" + "A" * 500 + "&Signature=" + "b" * 128
+    path = "PATH=" + ":".join(f"/opt/homebrew/opt/package{i}/bin" for i in range(24))
+    modulus = "Modulus: " + ":".join("ab" for _ in range(256))
+    tsv = "\n".join("\t".join(f"column_{i}_value_{j}" for i in range(35)) for j in range(5))
+    for text in (jwt, url, path, modulus, tsv, "Output:\n" + tsv * 3):
+        assert elide_dense_lines(text) == (text, 0)
 
 
 def test_compact_json_lines_are_left_to_smart_crusher():
