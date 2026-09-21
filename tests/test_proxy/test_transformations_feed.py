@@ -91,6 +91,9 @@ async def test_transformations_feed_can_omit_message_bodies(app):
             tags={},
             cache_hit=False,
             transforms_applied=["kompress:user:0.4"],
+            cache_read_tokens=1000,
+            cache_write_tokens=5,
+            uncached_input_tokens=30,
             request_messages=[{"role": "user", "content": "hi"}],
             compressed_messages=[{"role": "user", "content": "hi"}],
             response_content="ok",
@@ -108,5 +111,12 @@ async def test_transformations_feed_can_omit_message_bodies(app):
     assert full_item["request_messages"] == [{"role": "user", "content": "hi"}]
     bodies = {"request_messages", "compressed_messages", "response_content"}
     assert not bodies & slim_item.keys()
+    # The prefix-cache split rides along, so a poller can rate tokens_saved
+    # against new input (uncached + cache_write) like /stats does.
+    assert (
+        slim_item["uncached_input_tokens"],
+        slim_item["cache_write_tokens"],
+        slim_item["cache_read_tokens"],
+    ) == (30, 5, 1000)
     assert {k: v for k, v in full_item.items() if k not in bodies} == slim_item
     assert slim["log_full_messages"] == full["log_full_messages"]

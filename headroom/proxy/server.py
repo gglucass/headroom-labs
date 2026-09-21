@@ -4997,6 +4997,13 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                     "savings_percent": log.get("savings_percent"),
                     "transforms_applied": log.get("transforms_applied", []),
                     "turn_id": log.get("turn_id"),
+                    # Per-request prefix-cache split, so a number-only poller can put
+                    # tokens_saved on the new-input basis /stats reports as
+                    # new_input_savings_percent (saved / (saved + uncached + cache_write))
+                    # instead of the full-transcript basis of savings_percent.
+                    "uncached_input_tokens": log.get("uncached_input_tokens", 0),
+                    "cache_write_tokens": log.get("cache_write_tokens", 0),
+                    "cache_read_tokens": log.get("cache_read_tokens", 0),
                 }
                 if include_messages:
                     item["request_messages"] = log.get("request_messages")
