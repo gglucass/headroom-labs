@@ -15,7 +15,7 @@ import json
 import os
 import re
 import sys
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -49,7 +49,8 @@ FAIL = "fail"
 SKIP = "skip"
 
 _LOOPBACK_URL_RE = re.compile(r"https?://(?:127\.0\.0\.1|localhost):(\d+)")
-_CODEX_BASE_URL_RE = re.compile(r'base_url\s*=\s*"https?://(?:127\.0\.0\.1|localhost):(\d+)')
+_CODEX_BASE_URL_RE = re.compile(r'(?m)^[ \t]*base_url\s*=\s*"([^"\r\n]+)"')
+_CODEX_MODEL_PROVIDER_RE = re.compile(r'(?m)^[ \t]*model_provider\s*=\s*"([^"\r\n]+)"')
 
 # Ollama's fixed default port. `ollama launch claude` writes
 # ``ANTHROPIC_BASE_URL=http://127.0.0.1:11434`` into the launched Claude Code
@@ -149,47 +150,76 @@ def check_version_drift(livez: dict[str, Any] | None, installed: str) -> CheckRe
     )
 
 
-def check_claude_routing(settings_path: Path, port: int) -> CheckResult:
-    """Is Claude Code configured to route through the proxy?"""
+def _claude_base_url_in(path: Path) -> tuple[str, CheckResult | None]:
+    """Read ``env.ANTHROPIC_BASE_URL`` from one Claude settings file.
+
+    Returns ``(base_url, error)``. A parse problem comes back as a WARN so the
+    caller surfaces it verbatim instead of skipping the file and reporting the
+    misleading "not routed".
+    """
     name = "claude"
-    if not settings_path.exists():
-        return CheckResult(
-            name=name,
-            status=WARN,
-            summary="not routed (no ~/.claude/settings.json)",
-            hint="wrap it: headroom wrap claude",
-        )
     try:
-        payload = json.loads(settings_path.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
-        return CheckResult(
-            name=name,
-            status=WARN,
-            summary=f"could not parse {settings_path}: {exc}",
-        )
+        return "", CheckResult(name=name, status=WARN, summary=f"could not parse {path}: {exc}")
     # `json.loads` succeeds on valid non-object JSON (e.g. `[]`, `null`, `42`),
     # which a hand-edited or reset settings file can contain. `.get` on a
     # non-dict raises AttributeError, and it is not one of the caught parse
     # errors above, so it would crash the very command run to diagnose the
     # broken config. Treat a non-object like an unparseable file.
     if not isinstance(payload, dict):
-        return CheckResult(
+        return "", CheckResult(
             name=name,
             status=WARN,
-            summary=f"could not parse {settings_path}: not a JSON object",
+            summary=f"could not parse {path}: not a JSON object",
         )
-    base_url = ""
     env_block = payload.get("env")
     if isinstance(env_block, dict):
-        base_url = str(env_block.get("ANTHROPIC_BASE_URL", "") or "")
-    if not base_url:
+        return str(env_block.get("ANTHROPIC_BASE_URL", "") or ""), None
+    return "", None
+
+
+def check_claude_routing(
+    settings_path: Path,
+    port: int,
+    project_settings_paths: Sequence[Path] | None = None,
+) -> CheckResult:
+    """Is Claude Code configured to route through the proxy?
+
+    Claude Code layers project settings over user settings, and `headroom init
+    claude` without --global writes the project-scoped
+    ``.claude/settings.local.json``. Reading only ``~/.claude/settings.json``
+    reported "not routed" for sessions that demonstrably were -- confirmed by
+    `ps eww` on the live process and by active compression on it (#3205).
+    Candidates are consulted in Claude's own precedence order, and the summary
+    names the file that supplied the routing so the scope is never ambiguous.
+    """
+    name = "claude"
+    candidates = [*(project_settings_paths or []), settings_path]
+    existing = [path for path in candidates if path.exists()]
+    if not existing:
         return CheckResult(
             name=name,
             status=WARN,
-            summary="not routed (no ANTHROPIC_BASE_URL in settings env)",
+            summary="not routed (no ~/.claude/settings.json)",
             hint="wrap it: headroom wrap claude",
         )
-    return _classify_routing_url(name, base_url, port, source=str(settings_path))
+    first_error: CheckResult | None = None
+    for candidate in existing:
+        base_url, error = _claude_base_url_in(candidate)
+        if error is not None:
+            first_error = first_error or error
+            continue
+        if base_url:
+            return _classify_routing_url(name, base_url, port, source=str(candidate))
+    if first_error is not None:
+        return first_error
+    return CheckResult(
+        name=name,
+        status=WARN,
+        summary="not routed (no ANTHROPIC_BASE_URL in settings env)",
+        hint="wrap it: headroom wrap claude",
+    )
 
 
 def check_claude_auth_conflict(
@@ -373,9 +403,10 @@ def check_wrap_marker_staleness(settings_path: Path) -> CheckResult:
 def check_codex_routing(config_path: Path, port: int) -> CheckResult:
     """Is Codex configured to route through the proxy?
 
-    Detection keys on the ``[model_providers.headroom]`` section, which both
-    writers emit (install's persistent block and wrap's auto-injected block).
-    Substring matching keeps malformed TOML a WARN instead of a crash.
+    Detection prefers the active ``model_provider`` section's loopback
+    ``base_url``, while retaining the ``[model_providers.headroom]`` fallback
+    emitted by persistent and wrap installs. Best-effort matching keeps
+    malformed TOML a WARN instead of a crash.
     """
     name = "codex"
     if not config_path.exists():
@@ -389,22 +420,66 @@ def check_codex_routing(config_path: Path, port: int) -> CheckResult:
         text = config_path.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
         return CheckResult(name=name, status=WARN, summary=f"could not read {config_path}: {exc}")
-    if "[model_providers.headroom]" not in text:
+    active_match = _CODEX_MODEL_PROVIDER_RE.search(text)
+    provider_id = active_match.group(1) if active_match else "headroom"
+    base_url = _codex_provider_base_url(text, provider_id)
+    if base_url is None:
         return CheckResult(
             name=name,
             status=WARN,
-            summary="not routed (no Headroom provider in config.toml)",
+            summary="not routed (no active provider base_url in config.toml)",
             hint="wrap it: headroom wrap codex",
         )
-    match = _CODEX_BASE_URL_RE.search(text)
-    if match and int(match.group(1)) != port:
+    routing = _classify_routing_url(name, base_url, port, source=str(config_path))
+    if routing.status != PASS:
+        return routing
+    # Routed, but Codex may still attach no credentials. A ChatGPT-OAuth user
+    # needs `requires_openai_auth = true` in the active provider block or Codex
+    # sends no Authorization header and every request fails with 401 (#3206).
+    if _codex_block_missing_openai_auth(text, config_path, provider_id):
         return CheckResult(
             name=name,
             status=WARN,
-            summary=f"routed to port {match.group(1)}, but doctor probed port {port}",
-            hint=f"re-run with: headroom doctor --port {match.group(1)}",
+            summary="routed, but Codex will send no Authorization (missing requires_openai_auth)",
+            hint="re-run: headroom wrap codex (or headroom init codex) to rewrite the block",
         )
-    return CheckResult(name=name, status=PASS, summary=f"routed ({config_path})")
+    return routing
+
+
+def _codex_provider_base_url(text: str, provider_id: str) -> str | None:
+    section_match = re.search(
+        rf"(?m)^[ \t]*\[model_providers\.{re.escape(provider_id)}\][ \t]*(?:#.*)?$",
+        text,
+    )
+    if section_match is None:
+        return None
+    section = text[section_match.end() :]
+    next_section = re.search(r"(?m)^[ \t]*\[", section)
+    if next_section is not None:
+        section = section[: next_section.start()]
+    base_url_match = _CODEX_BASE_URL_RE.search(section)
+    return base_url_match.group(1) if base_url_match else None
+
+
+def _codex_block_missing_openai_auth(
+    text: str, config_path: Path, provider_id: str = "headroom"
+) -> bool:
+    """ChatGPT-OAuth Codex routed without ``requires_openai_auth`` (#3206)."""
+    section = f"[model_providers.{provider_id}]"
+    start = text.find(section)
+    if start == -1:
+        return False
+    rest = text[start + len(section) :]
+    end = rest.find("\n[")
+    block = rest if end == -1 else rest[:end]
+    if "requires_openai_auth" in block:
+        return False
+    try:
+        from headroom.providers.codex.install import codex_uses_chatgpt_auth
+
+        return codex_uses_chatgpt_auth(config_path.parent / "auth.json")
+    except Exception:  # pragma: no cover - never let a doctor check crash
+        return False
 
 
 def check_shell_env(environ: Mapping[str, str], port: int) -> CheckResult:
@@ -653,7 +728,11 @@ def doctor(port: int, emit_json: bool) -> None:
     checks = [
         check_proxy_liveness(livez, base_url),
         check_version_drift(livez, installed),
-        check_claude_routing(claude_settings_path(), port),
+        check_claude_routing(
+            claude_settings_path(),
+            port,
+            [project_local_claude_settings, project_claude_settings],
+        ),
         check_wrap_marker_staleness(project_local_claude_settings),
         check_codex_routing(codex_config_path(), port),
         check_shell_env(os.environ, port),
