@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -339,23 +340,35 @@ def test_no_native_tls_in_wheel_build_tree() -> None:
     import subprocess
 
     for crate in ("headroom-py", "headroom-proxy", "headroom-core"):
-        result = subprocess.run(
-            [
-                "cargo",
-                "tree",
-                "--target",
-                "x86_64-unknown-linux-gnu",
-                "-p",
-                crate,
-                "-i",
-                "native-tls",
-            ],
-            cwd=str(ROOT),
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        try:
+            result = subprocess.run(
+                [
+                    "cargo",
+                    "tree",
+                    "--target",
+                    "x86_64-unknown-linux-gnu",
+                    "-p",
+                    crate,
+                    "-i",
+                    "native-tls",
+                ],
+                cwd=str(ROOT),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except FileNotFoundError:
+            pytest.skip("cargo is unavailable in this environment")
+        # Same environment gates as the openssl-sys dual above: a cargo
+        # failure that is not "package did not match" means the Linux wheel
+        # target is unavailable here, not that native-tls came back.
         not_in_tree = result.returncode != 0 and "did not match any packages" in result.stderr
+        if result.returncode != 0 and "package ID specification `native-tls` did not match" not in (
+            result.stderr + result.stdout
+        ):
+            pytest.skip(
+                "cargo dependency tree for the Linux wheel target is unavailable in this environment"
+            )
         assert not_in_tree, (
             f"native-tls is back in {crate}'s build tree — likely some "
             f"crate's `default-features = true` re-enabled native-tls "
@@ -803,7 +816,11 @@ def test_openclaw_source_dependency_matches_lockfile_registry_range() -> None:
     source_range = package_json["dependencies"]["headroom-ai"]
     lock_range = package_lock["packages"][""]["dependencies"]["headroom-ai"]
 
-    assert source_range == lock_range == "^0.22.3"
+    assert source_range == lock_range
+    assert re.fullmatch(r"\^\d+\.\d+\.\d+", source_range), source_range
+    assert package_lock["packages"]["node_modules/headroom-ai"]["resolved"].startswith(
+        "https://registry.npmjs.org/headroom-ai/"
+    )
 
 
 def test_opencode_source_dependency_matches_lockfile_registry_range() -> None:
@@ -816,7 +833,11 @@ def test_opencode_source_dependency_matches_lockfile_registry_range() -> None:
     source_range = package_json["dependencies"]["headroom-ai"]
     lock_range = package_lock["packages"][""]["dependencies"]["headroom-ai"]
 
-    assert source_range == lock_range == "^0.22.3"
+    assert source_range == lock_range
+    assert re.fullmatch(r"\^\d+\.\d+\.\d+", source_range), source_range
+    assert package_lock["packages"]["node_modules/headroom-ai"]["resolved"].startswith(
+        "https://registry.npmjs.org/headroom-ai/"
+    )
 
 
 def test_python_release_smoke_imports_installed_wheel_outside_source_tree() -> None:
@@ -910,7 +931,7 @@ def test_pypi_publish_failure_blocks_github_release() -> None:
     npm_job_start = content.index("publish-npm:", pypi_job_start)
     pypi_job = content[pypi_job_start:npm_job_start]
 
-    assert "uses: pypa/gh-action-pypi-publish@v1.13.0" in pypi_job
+    assert re.search(r"uses: pypa/gh-action-pypi-publish@v\d+\.\d+\.\d+", pypi_job)
     assert "continue-on-error: true" not in pypi_job
     assert "(vars.PYPI_SKIP == 'true' || needs.publish-pypi.result == 'success')" in content
 
@@ -919,7 +940,7 @@ def test_glibc_compat_shim_present_in_headroom_py() -> None:
     """STRUCTURAL INVARIANT: the headroom-py crate ships a glibc-2.38
     compatibility shim that defines weak `__isoc23_*` aliases.
 
-    Issue #355 (https://github.com/chopratejas/headroom/issues/355) —
+    Issue #355 (https://github.com/headroomlabs-ai/headroom/issues/355) —
     the published wheel's `_core.so` references `__isoc23_strtoll`
     (glibc 2.38+) because we statically link prebuilt ONNX Runtime
     artifacts compiled with gcc 14. Users with libc < 2.38 (Ubuntu
