@@ -16,6 +16,16 @@ PROXY_ENV_KEY = "GROK_MODELS_BASE_URL"
 _XAI_TOKEN_AUTH_HEADER = "x-xai-token-auth"
 _XAI_TOKEN_AUTH_VALUE = "xai-grok-cli"
 _GROK_UA_PREFIXES = ("grok-shell/", "grok/")
+#: User agents trusted to REDIRECT a credential, which is a stricter question
+#: than "is this a Grok CLI". The bare ``grok/`` prefix is deliberately absent:
+#: it is already claimed with a different meaning in
+#: ``headroom.proxy.auth_policy`` (SUBSCRIPTION_UA_PREFIXES, CLIENT_UA_MAP), so
+#: reusing it here would let any client that borrows that loose prefix steer
+#: where its Authorization header is sent.
+_SESSION_UA_PREFIXES = ("grok-shell/",)
+#: Kill switch for an operator who never wants a request re-pointed at
+#: grok.com, whatever it claims to be. Any value but "0" leaves routing on.
+SESSION_ROUTING_ENV_KEY = "HEADROOM_GROK_SESSION_ROUTING"
 
 
 def proxy_base_url(port: int) -> str:
@@ -52,7 +62,12 @@ def _header(headers: Mapping[str, str], name: str) -> str | None:
 
 
 def is_grok_cli_request(headers: Mapping[str, str]) -> bool:
-    """Return True when the inbound headers identify the official Grok CLI."""
+    """Return True when the inbound headers identify the official Grok CLI.
+
+    Attribution only. Every signal it reads is client-controlled, so it must
+    never decide where a credential is SENT - see :func:`session_upstream`,
+    which asks a deliberately narrower question.
+    """
     token_auth = _header(headers, _XAI_TOKEN_AUTH_HEADER)
     if token_auth is not None and token_auth.strip().lower() == _XAI_TOKEN_AUTH_VALUE:
         return True
@@ -74,11 +89,43 @@ def session_upstream(headers: Mapping[str, str]) -> str | None:
     clients keep their configured target, and a Grok CLI carrying an ``xai-``
     key keeps ``api.x.ai``.
     """
-    if not is_grok_cli_request(headers) or _bearer_is_api_key(headers):
+    if os.environ.get(SESSION_ROUTING_ENV_KEY, "").strip() == "0":
+        return None
+    if not _is_grok_session_client(headers) or _bearer_is_api_key(headers):
+        return None
+    # The credential itself has the final say. Headers that merely claim to be
+    # the Grok CLI are trivially forged, and being wrong here does not degrade
+    # a request - it forwards somebody's Authorization to a public third-party
+    # host. A `grok login` session token is always a JWT; the gateway keys this
+    # must never redirect (`sk-`, `sk-proj-`, `sk-litellm-`, `ghu_`) never are.
+    if not _bearer_is_session_jwt(headers):
         return None
     return SESSION_API_URL
+
+
+def _is_grok_session_client(headers: Mapping[str, str]) -> bool:
+    """Grok CLI signals strong enough to justify re-pointing a credential."""
+    token_auth = _header(headers, _XAI_TOKEN_AUTH_HEADER)
+    if token_auth is not None and token_auth.strip().lower() == _XAI_TOKEN_AUTH_VALUE:
+        return True
+    user_agent = (_header(headers, "user-agent") or "").lower()
+    return any(token.startswith(_SESSION_UA_PREFIXES) for token in user_agent.split())
 
 
 def _bearer_is_api_key(headers: Mapping[str, str]) -> bool:
     value = (_header(headers, "authorization") or "").strip().lower()
     return value.startswith("bearer xai-")
+
+
+def _bearer_is_session_jwt(headers: Mapping[str, str]) -> bool:
+    """True when the bearer is JWT-shaped, as a `grok login` token always is.
+
+    Not case-folded: base64url is case-sensitive and a real JWT header segment
+    starts with the exact bytes ``eyJ``.
+    """
+    raw = (_header(headers, "authorization") or "").strip()
+    if len(raw) < 7 or raw[:7].lower() != "bearer ":
+        return False
+    token = raw[7:].strip()
+    segments = token.split(".")
+    return len(segments) == 3 and token.startswith("eyJ") and all(segments)

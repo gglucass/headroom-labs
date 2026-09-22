@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import pytest
+
 from headroom.providers.grok import (
     PROXY_ENV_KEY,
     SESSION_API_URL,
+    SESSION_ROUTING_ENV_KEY,
     build_launch_env,
     proxy_base_url,
     session_upstream,
@@ -46,9 +49,53 @@ def test_session_upstream_routes_grok_login_token_to_session_host() -> None:
         "User-Agent": "grok-shell/0.2.112 (macos; aarch64)",
     }
     assert session_upstream(headers) == SESSION_API_URL
-    # Either signal alone is enough; header lookup is case-insensitive.
+    # Either strong signal alone is enough; header lookup is case-insensitive.
     assert session_upstream({"authorization": _SESSION_JWT, "x-xai-token-auth": "xai-grok-cli"})
-    assert session_upstream({"authorization": _SESSION_JWT, "user-agent": "grok/0.1.0"})
+    assert session_upstream({"authorization": _SESSION_JWT, "user-agent": "grok-shell/0.2.112"})
+
+
+# Re-pointing a request sends somebody's Authorization header to a public
+# third-party host, so every signal that decides it is client-controlled and
+# must be treated as hostile. These are the shapes an install could see when
+# Headroom fronts an internal gateway (Kong, LiteLLM) rather than xAI.
+@pytest.mark.parametrize(
+    ("headers", "why"),
+    [
+        (
+            {"authorization": "Bearer sk-proj-REALKEY", "user-agent": "grok/1.0"},
+            "bare grok/ UA is claimed elsewhere in auth_policy and is not a session signal",
+        ),
+        (
+            {"authorization": "Bearer sk-litellm-abc", "x-xai-token-auth": "xai-grok-cli"},
+            "marker header cannot launder a gateway key",
+        ),
+        ({"user-agent": "grok/1.0"}, "no credential at all"),
+        (
+            {"authorization": "Bearer ghu_abcdef", "x-xai-token-auth": "xai-grok-cli"},
+            "GitHub token is not JWT-shaped",
+        ),
+        (
+            {"authorization": "Bearer eyJabc", "user-agent": "grok-shell/0.2.112"},
+            "eyJ prefix without three segments is not a JWT",
+        ),
+        (
+            {"authorization": "Bearer eyJa..y", "user-agent": "grok-shell/0.2.112"},
+            "empty JWT segment",
+        ),
+    ],
+)
+def test_session_upstream_never_redirects_a_foreign_credential(headers, why) -> None:
+    assert session_upstream(headers) is None, why
+
+
+def test_session_routing_kill_switch(monkeypatch) -> None:
+    """An operator must be able to refuse this entirely, whatever a client claims."""
+    headers = {"authorization": _SESSION_JWT, "user-agent": "grok-shell/0.2.112"}
+    assert session_upstream(headers) == SESSION_API_URL
+    monkeypatch.setenv(SESSION_ROUTING_ENV_KEY, "0")
+    assert session_upstream(headers) is None
+    monkeypatch.setenv(SESSION_ROUTING_ENV_KEY, "1")
+    assert session_upstream(headers) == SESSION_API_URL
 
 
 def test_session_upstream_keeps_api_keys_on_configured_target() -> None:
