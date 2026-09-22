@@ -46,6 +46,8 @@ if TYPE_CHECKING:
     from fastapi import Request, WebSocket
     from fastapi.responses import JSONResponse, Response, StreamingResponse
 
+    from headroom.proxy.cost import CostTracker
+
 import httpx
 
 from headroom.agent_savings import proxy_pipeline_kwargs
@@ -89,6 +91,7 @@ from headroom.proxy.output_shaper import shaper_enabled_for, steering_allowed_fo
 from headroom.proxy.passthrough import (
     custom_base_passthrough_telemetry as _custom_base_passthrough_telemetry,
 )
+from headroom.proxy.passthrough import is_opencode_zen_base
 from headroom.proxy.project_context import (
     classify_project,
     get_current_project,
@@ -1190,13 +1193,21 @@ def _should_buffer_openai_responses_stream_ccr(
     ccr_response_handler_enabled: bool,
     tools: Any,
     is_chatgpt_auth: bool,
+    upstream_base_url: str | None = None,
 ) -> bool:
-    """Return whether streaming Responses CCR should use buffered JSON mode."""
+    """Return whether streaming Responses CCR should use buffered JSON mode.
+
+    OpenCode Zen validates OpenCode-client attribution on the wire and rejects
+    requests Headroom has reshaped (``stream:false`` plus
+    ``accept: application/json``) with ``403 FreeTierError`` (#3656). Leave the
+    client's streaming request untouched for that gateway.
+    """
 
     return bool(
         stream
         and ccr_response_handler_enabled
         and not is_chatgpt_auth
+        and not is_opencode_zen_base(upstream_base_url)
         and _has_headroom_retrieve_tool_responses(tools)
     )
 
@@ -1727,6 +1738,8 @@ def _prefers_http1_passthrough(base_url: str) -> bool:
 class OpenAIHandlerMixin:
     """Mixin providing OpenAI API handler methods for HeadroomProxy."""
 
+    cost_tracker: CostTracker | None = None
+
     async def _count_tokens_offloaded(self, model, messages):  # noqa: ANN001, ANN201
         from headroom.proxy.token_counting import count_tokens_offloaded
 
@@ -2160,10 +2173,13 @@ class OpenAIHandlerMixin:
         # _tool_call_command_text helper:
         #   - function_call.arguments  (Copilot bash, Codex exec_command, …)
         #   - local_shell_call.action  (native Responses shell; argv or string)
+        #   - custom_tool_call.input   (Codex code-mode `exec`: JavaScript calling
+        #                               tools.exec_command({"cmd": …}))
         # Content is gated per-output by _read_output_should_be_protected so
         # confidently non-code DATA reads (lockfiles, JSON, logs, search) stay
         # compressible, exactly like the chat path.
         from headroom.transforms.content_router import (
+            _custom_tool_call_commands,
             _is_read_command,
             _read_output_should_be_protected,
             _tool_call_command_text,
@@ -2180,6 +2196,17 @@ class OpenAIHandlerMixin:
                     command = _tool_call_command_text(item.get("arguments"))
                 elif item_type == "local_shell_call":
                     command = _tool_call_command_text(item.get("action"))
+                elif item_type == "custom_tool_call":
+                    # One script can run several commands; its single output is a
+                    # read when any of them is (over-protecting only costs savings).
+                    command = next(
+                        (
+                            c
+                            for c in _custom_tool_call_commands(item.get("input"))
+                            if _is_read_command(c)
+                        ),
+                        "",
+                    )
                 else:
                     continue
                 call_id = item.get("call_id")
@@ -3531,6 +3558,16 @@ class OpenAIHandlerMixin:
                 raise HTTPException(
                     status_code=429,
                     detail=f"Rate limited. Retry after {wait_seconds:.1f}s",
+                )
+
+        # Budget check
+        cost_tracker = self.cost_tracker
+        if cost_tracker:
+            allowed, remaining = cost_tracker.check_budget()
+            if not allowed:
+                raise HTTPException(
+                    status_code=429,
+                    detail=cost_tracker.budget_denial_detail(),
                 )
 
         # Snapshot cache-key fields ONCE here (pre-upstream), reused verbatim
@@ -5547,10 +5584,13 @@ class OpenAIHandlerMixin:
         # This handler also honors `x-headroom-base-url` (resolved further
         # below); resolve it here too so the secret headers are gated on the
         # real destination rather than merged before it is known.
+        # Resolve the client-supplied upstream once: the secret-header gate,
+        # the routing decision, and the CCR streaming decision all need it.
+        upstream_base_url = _resolve_openai_upstream_base(request.headers)
         headers = merge_extra_headers(
             headers,
             self.config.openai_extra_headers,
-            upstream_url=_resolve_openai_upstream_base(request.headers),
+            upstream_url=upstream_base_url,
             config=self.config,
         )
         # Mirror the WS handler: never forward Codex's client-only lite header
@@ -5643,6 +5683,16 @@ class OpenAIHandlerMixin:
                 raise HTTPException(
                     status_code=429,
                     detail=f"Rate limited. Retry after {wait_seconds:.1f}s",
+                )
+
+        # Budget check
+        cost_tracker = self.cost_tracker
+        if cost_tracker:
+            allowed, remaining = cost_tracker.check_budget()
+            if not allowed:
+                raise HTTPException(
+                    status_code=429,
+                    detail=cost_tracker.budget_denial_detail(),
                 )
 
         # Token counting on converted messages (offloaded off the event loop — GH #1701)
@@ -5854,7 +5904,6 @@ class OpenAIHandlerMixin:
         if is_chatgpt_auth:
             url = codex_responses_http_url()
         else:
-            upstream_base_url = _resolve_openai_upstream_base(request.headers)
             handler_path = (
                 _resolve_openai_handler_path(request.headers, handler_path=_OPENAI_RESPONSES_PATH)
                 if upstream_base_url is not None
@@ -6082,6 +6131,7 @@ class OpenAIHandlerMixin:
             ccr_response_handler_enabled=_ccr_response_handler_enabled,
             tools=body.get("tools"),
             is_chatgpt_auth=is_chatgpt_auth,
+            upstream_base_url=upstream_base_url,
         )
         if buffered_stream_ccr:
             if body.get("stream") is not False:
@@ -6790,6 +6840,22 @@ class OpenAIHandlerMixin:
             )
             await websocket.close(code=1008, reason="origin not allowed")
             return
+
+        # Budget check
+        cost_tracker = self.cost_tracker
+        if cost_tracker:
+            allowed, _ = cost_tracker.check_budget()
+            if not allowed:
+                logger.warning(
+                    "event=websocket_budget_exceeded request_id=%s session_id=%s",
+                    request_id,
+                    session_id,
+                )
+                await websocket.close(
+                    code=1008,
+                    reason=cost_tracker.budget_denial_detail()[:120],
+                )
+                return
         # WS sessions bypass the HTTP middleware that stamps X-Client: codex on
         # the Responses endpoint, so apply the same path-based stamp here before
         # classify_client runs (parallels server.py / should_stamp_codex_client).
@@ -7964,6 +8030,24 @@ class OpenAIHandlerMixin:
             )
 
             if ws_connected:
+                cost_tracker = self.cost_tracker
+                if cost_tracker:
+                    allowed, _ = cost_tracker.check_budget()
+                    if not allowed:
+                        logger.warning(
+                            "event=websocket_budget_exceeded request_id=%s session_id=%s frame=1",
+                            request_id,
+                            session_id,
+                        )
+                        termination_cause = "budget_exceeded"
+                        with contextlib.suppress(Exception):
+                            await websocket.close(
+                                code=1008,
+                                reason=cost_tracker.budget_denial_detail()[:120],
+                            )
+                        with contextlib.suppress(Exception):
+                            await upstream.close()
+                        return
                 async with upstream:
                     await upstream.send(_strip_codex_lite_metadata(first_msg_raw))
 
@@ -8287,6 +8371,7 @@ class OpenAIHandlerMixin:
                         nonlocal ws_last_client_frame_type, ws_client_disconnect_seen
                         nonlocal current_response_input
                         nonlocal current_response_template
+                        nonlocal termination_cause
                         client_frame_index = 1
                         try:
                             while True:
@@ -8338,6 +8423,25 @@ class OpenAIHandlerMixin:
                                     isinstance(_inbound_frame_body, dict)
                                     and _inbound_frame_body.get("type") == "response.create"
                                 ):
+                                    cost_tracker = self.cost_tracker
+                                    if cost_tracker:
+                                        allowed, _ = cost_tracker.check_budget()
+                                        if not allowed:
+                                            logger.warning(
+                                                "event=websocket_budget_exceeded request_id=%s session_id=%s frame=%d",
+                                                request_id,
+                                                session_id,
+                                                client_frame_index,
+                                            )
+                                            termination_cause = "budget_exceeded"
+                                            with contextlib.suppress(Exception):
+                                                await websocket.close(
+                                                    code=1008,
+                                                    reason=cost_tracker.budget_denial_detail()[
+                                                        :120
+                                                    ],
+                                                )
+                                            return
                                     ws_response_create_frames += 1
                                     inbound_response = _inbound_frame_body.get(
                                         "response", _inbound_frame_body
@@ -9002,7 +9106,9 @@ class OpenAIHandlerMixin:
                                     exc = t.exception()
                             task_name = t.get_name() or ""
                             if t is client_task:
-                                if client_relay_error is not None:
+                                if termination_cause == "budget_exceeded":
+                                    pass
+                                elif client_relay_error is not None:
                                     termination_cause = "client_error"
                                 elif exc is None:
                                     termination_cause = "client_disconnect"
@@ -9069,6 +9175,22 @@ class OpenAIHandlerMixin:
                         ws_last_upstream_frame_type,
                     )
             else:
+                cost_tracker = self.cost_tracker
+                if cost_tracker:
+                    allowed, _ = cost_tracker.check_budget()
+                    if not allowed:
+                        logger.warning(
+                            "event=websocket_budget_exceeded request_id=%s session_id=%s fallback=1",
+                            request_id,
+                            session_id,
+                        )
+                        termination_cause = "budget_exceeded"
+                        with contextlib.suppress(Exception):
+                            await websocket.close(
+                                code=1008,
+                                reason=cost_tracker.budget_denial_detail()[:120],
+                            )
+                        return
                 # WS upgrade failed (HTTP 500 from OpenAI is common).
                 # Fall back to HTTP POST streaming and relay SSE events
                 # back over the client WebSocket transparently.
@@ -9716,6 +9838,9 @@ class OpenAIHandlerMixin:
         # outcome (`commit`). With none claiming it — legacy mode — nothing
         # below this comment changes behaviour.
         from headroom.proxy.compress_turn import CompressTurnError, begin_compress_turn
+        from headroom.proxy.gateway_responses import build_view as build_responses_view
+        from headroom.proxy.gateway_responses import is_responses_body
+        from headroom.proxy.gateway_responses import mark_view as mark_responses_view
         from headroom.proxy.helpers import _read_request_json
 
         def _gateway_invalid(e: CompressTurnError) -> JSONResponse:
@@ -9774,6 +9899,15 @@ class OpenAIHandlerMixin:
                 },
             )
 
+        # A Responses body (Codex) carries `input`, not `messages`. Give the
+        # pipeline a chat-shaped view of its text slots and leave the original
+        # `input` in place: `build_provider_body` rebuilds the same view to put
+        # the compressed text back, so nothing outside these two points needs
+        # to know which wire shape arrived. See `gateway_responses`.
+        if is_responses_body(body):
+            body["messages"] = build_responses_view(body).messages
+            mark_responses_view(body)
+
         messages = body.get("messages")
         model = body.get("model")
 
@@ -9783,7 +9917,7 @@ class OpenAIHandlerMixin:
                 content={
                     "error": {
                         "type": "invalid_request",
-                        "message": "Missing required field: messages",
+                        "message": "Missing required field: messages or input",
                     }
                 },
             )
@@ -10102,7 +10236,17 @@ class OpenAIHandlerMixin:
                     # the pipeline introduced — byte-identical is the contract
                     # the caller forwards on.
                     turn = finalize_turn(result.messages, messages, prev_original, prev_returned)
-                    final = turn.messages
+                    # A replay can carry an earlier turn's cache_control marker
+                    # after the caller moved its breakpoint forward, and
+                    # Anthropic rejects more than four. Keep message markers at
+                    # the caller's current positions, as the /v1/messages
+                    # handler does after its own replay. The gateway's finish
+                    # step still enforces the hard budget on the whole body.
+                    from headroom.cache.prefix_tracker import normalize_message_cache_control
+
+                    final = normalize_message_cache_control(
+                        turn.messages, prev_returned, client_messages=messages
+                    )
                     if _turn is not None:
                         # AFTER the replay overlay, BEFORE update_from_result /
                         # record_returned: the turn's output is what the caller
