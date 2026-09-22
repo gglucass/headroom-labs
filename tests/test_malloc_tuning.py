@@ -276,16 +276,19 @@ async def test_slow_trim_does_not_stop_unrelated_async_work(monkeypatch):
 # --------------------------------------------------------------------------- #
 # ProxyConfig wiring
 # --------------------------------------------------------------------------- #
-def test_proxy_config_malloc_trim_default_is_darwin_scoped(monkeypatch):
-    # Default-on only on macOS (the platform with the documented RSS ratchet);
-    # elsewhere it is opt-in, so glibc deployments do not silently take on a
-    # once-a-minute allocator purge.
+def test_proxy_config_malloc_trim_default_is_scoped_to_platforms_with_a_trim_call(monkeypatch):
+    # Default-on on macOS and glibc Linux, the two platforms with a trim call
+    # and a documented RSS ratchet; elsewhere the periodic task is a no-op, so
+    # the default stays off rather than scheduling wakeups for nothing.
     from headroom.proxy import models
 
     monkeypatch.setattr(models.sys, "platform", "darwin")
     assert models.ProxyConfig().periodic_malloc_trim_enabled is True
 
     monkeypatch.setattr(models.sys, "platform", "linux")
+    assert models.ProxyConfig().periodic_malloc_trim_enabled is True
+
+    monkeypatch.setattr(models.sys, "platform", "win32")
     assert models.ProxyConfig().periodic_malloc_trim_enabled is False
 
     # The interval knob is platform-independent.

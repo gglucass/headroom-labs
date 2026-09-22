@@ -470,12 +470,15 @@ class ProxyConfig:
     # Periodic allocator trim. Long-lived proxies processing large concurrent
     # request bodies ratchet RSS through freed-but-retained allocator pages;
     # this returns them to the OS (malloc_zone_pressure_relief on macOS,
-    # malloc_trim on glibc). Default-on only on macOS, where the retained-page
-    # ratchet is the documented failure (#2820); an opt-in elsewhere via
-    # HEADROOM_MALLOC_TRIM=1 so glibc deployments do not silently take on a
-    # once-a-minute allocator purge they did not ask for. Envs:
-    # HEADROOM_MALLOC_TRIM=0/1, HEADROOM_MALLOC_TRIM_INTERVAL_SECONDS.
-    periodic_malloc_trim_enabled: bool = field(default_factory=lambda: sys.platform == "darwin")
+    # malloc_trim on glibc). Default-on where a trim call exists: macOS, where
+    # the retained-page ratchet was first documented (#2820), and glibc Linux,
+    # which ratchets the same way (a coding-agent session took one proxy to
+    # 100 GB RSS on a 128 GB host with the trim off). Platforms without a trim
+    # call disable the task themselves. Envs: HEADROOM_MALLOC_TRIM=0/1,
+    # HEADROOM_MALLOC_TRIM_INTERVAL_SECONDS.
+    periodic_malloc_trim_enabled: bool = field(
+        default_factory=lambda: sys.platform in ("darwin", "linux")
+    )
     malloc_trim_interval_seconds: int = 60
 
     # Stateless mode — disable all filesystem writes for read-only / container deployments
