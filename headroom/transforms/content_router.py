@@ -572,6 +572,24 @@ def _tool_call_command_text(raw: Any) -> str:
 
 _EXEC_COMMAND_CALL_RE = re.compile(r"\bexec_command\s*\(")
 
+# The `cmd` property of a JavaScript object literal, as Codex code-mode usually
+# writes it: `{cmd: "sed -n '1,80p' f.py", workdir: "/repo"}` or
+# `{cmd:"cat f","workdir":"/repo"}`. Matched from the opening brace; the key may
+# be bare or quoted and the value a "...", '...' or `...` string. A template
+# literal with `${...}` substitution is dynamic and does not match.
+_JS_CMD_PROPERTY_RE = re.compile(
+    r"""\{[^{}]*?(?<![\w$])(?:cmd|"cmd"|'cmd')\s*:\s*"""
+    r"""(?:"((?:[^"\\\n]|\\.)*)"|'((?:[^'\\\n]|\\.)*)'|`((?:[^`\\$]|\\.|\$(?!\{))*)`)"""
+)
+_JS_STRING_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "0": "\0"}
+
+
+def _js_string_value(body: str) -> str:
+    """Unescape the body of a JavaScript string literal (simple escapes only)."""
+    return re.sub(
+        r"\\(.)", lambda m: _JS_STRING_ESCAPES.get(m.group(1), m.group(1)), body, flags=re.S
+    )
+
 
 def _custom_tool_call_commands(raw: Any) -> list[str]:
     """Extract shell commands from a Codex code-mode ``exec`` custom tool call.
@@ -582,9 +600,13 @@ def _custom_tool_call_commands(raw: Any) -> list[str]:
         const r = await tools.exec_command({"cmd": "sed -n '1,80p' f.py", "workdir": "…"});
         text(r.output);
 
+    The argument is usually a JavaScript object literal rather than JSON
+    (``{cmd: "cat f.py"}``, unquoted key); when strict JSON decoding fails, the
+    ``cmd`` property is read from the literal instead.
+
     Returns every ``cmd`` passed to ``exec_command``, in order. Returns ``[]`` when
-    the input is not that shape; an argument object that is not strict JSON is
-    skipped, which leaves the output compressible exactly as before.
+    the input is not that shape; an argument whose ``cmd`` is not a plain string
+    literal is skipped, which leaves the output compressible exactly as before.
     """
     if not isinstance(raw, str) or "exec_command" not in raw:
         return []
@@ -597,7 +619,11 @@ def _custom_tool_call_commands(raw: Any) -> list[str]:
         try:
             args, _end = decoder.raw_decode(raw, start)
         except ValueError:
-            continue
+            literal = _JS_CMD_PROPERTY_RE.match(raw, start)
+            if literal is None:
+                continue
+            body = next(group for group in literal.groups() if group is not None)
+            args = {"cmd": _js_string_value(body)}
         command = _tool_call_command_text(args)
         if command:
             commands.append(command)

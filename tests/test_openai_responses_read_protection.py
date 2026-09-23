@@ -578,7 +578,51 @@ def test_custom_tool_call_commands_ignores_other_shapes():
     assert _custom_tool_call_commands({"cmd": "cat f"}) == []
     assert _custom_tool_call_commands("*** Begin Patch\n*** Update File: f.py\n") == []
     assert _custom_tool_call_commands("tools.exec_command(notJson)") == []
-    assert _custom_tool_call_commands("tools.exec_command({cmd: 'cat f'})") == []
+    # A template literal with substitution is dynamic: not a known command.
+    assert _custom_tool_call_commands("tools.exec_command({cmd: `cat ${f}`})") == []
+    assert _custom_tool_call_commands("tools.exec_command({cmd: someVariable})") == []
+
+
+def test_custom_tool_call_commands_parses_javascript_object_literals():
+    """Codex usually writes the argument as a JS literal, not JSON (bare `cmd` key)."""
+    from headroom.transforms.content_router import _custom_tool_call_commands
+
+    script = (
+        'const a = await tools.exec_command({cmd:"cat /tmp/app.js","workdir":"/tmp"});\n'
+        "const b = await tools.exec_command({cmd: 'sed -n \\'1,80p\\' f.py', workdir: '/repo'});\n"
+        "const c = await tools.exec_command({ workdir: '/repo', cmd: `nl -ba f.py` });\n"
+        'const d = await tools.exec_command({cmd: "rg -n \\"def f\\" src", yield_time_ms: 1000});\n'
+        "const e = await tools.exec_command({'cmd': 'head -n 5 f.py'});\n"
+    )
+    assert _custom_tool_call_commands(script) == [
+        "cat /tmp/app.js",
+        "sed -n '1,80p' f.py",
+        "nl -ba f.py",
+        'rg -n "def f" src',
+        "head -n 5 f.py",
+    ]
+
+
+def test_responses_codex_exec_javascript_literal_read_stays_verbatim(monkeypatch):
+    """The same read with Codex's usual bare-key argument must also stay verbatim."""
+    monkeypatch.setenv("HEADROOM_PROTECT_READS", "1")
+    handler = _handler_with_router(_lossy_router())
+    output = _codex_exec_output("call_exec", _NL_OUTPUT)
+    call = {
+        "type": "custom_tool_call",
+        "call_id": "call_exec",
+        "name": "exec",
+        "input": (
+            'const r = await tools.exec_command({cmd: "nl -ba tenacity/wait.py | '
+            'sed -n \'20,115p\'", workdir: "/repo", yield_time_ms: 10000});\n'
+            "text(r.output);\n"
+        ),
+    }
+    payload = {"model": "gpt-5", "input": [call, output]}
+
+    new_payload, _modified, _s, _t, _u, _c, _a = _run(handler, payload)
+
+    assert new_payload["input"][1] == output
 
 
 def test_responses_codex_exec_read_stays_verbatim(monkeypatch):
