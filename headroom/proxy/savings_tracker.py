@@ -208,6 +208,19 @@ def _normalize_provider(value: Any) -> str:
 MODEL_UNKNOWN = "unknown"
 
 
+def _empty_cache_delta() -> dict[str, Any]:
+    """Zeroed cache fields for a rollup bucket or one of its breakdowns.
+
+    ``cache_read_cost_usd_delta`` is None when any contributing checkpoint's
+    reads could not be priced (see ``_build_rollup``).
+    """
+    return {
+        "cache_read_tokens_delta": 0,
+        "cache_savings_usd_delta": 0.0,
+        "cache_read_cost_usd_delta": 0.0,
+    }
+
+
 def _normalize_model(value: Any) -> str:
     """Normalize a model label, falling back to a stable sentinel.
 
@@ -1918,6 +1931,45 @@ class SavingsTracker:
         prev_total_input_cost_usd = 0.0
         prev_output_tokens = 0
         prev_output_usd = 0.0
+        prev_cache_read_tokens = 0
+        prev_cache_savings_usd = 0.0
+        # What the bucket's cache reads actually COST, priced per checkpoint
+        # with the same function that put them into ``total_input_cost_usd``.
+        # Consumers need it to take reads out of the input bill, and cannot
+        # derive it from ``cache_savings_usd``: the read discount is not a
+        # fixed multiple of the read cost (reads bill at 0.1x on most models,
+        # 0.05x or 0.025x on others), so "discount / 9" misprices exactly the
+        # models with the steepest cache discount.
+        read_cost_per_token: dict[str, float] = {}
+
+        def _read_cost(model: str, reads: int) -> float | None:
+            if reads <= 0:
+                return 0.0
+            # Checkpoints written before per-model attribution carry no model,
+            # so their reads cannot be priced the way the request was. Report
+            # the bucket's read cost as unknown rather than guess.
+            if model == MODEL_UNKNOWN:
+                return None
+            if model not in read_cost_per_token:
+                read_cost_per_token[model] = (
+                    _estimate_input_cost_usd(model, 1_000_000, cache_read_tokens=1_000_000)
+                    / 1_000_000
+                )
+            return reads * read_cost_per_token[model]
+
+        def _add_cache(
+            target: dict[str, Any], reads: int, discount: float, cost: float | None
+        ) -> None:
+            target["cache_read_tokens_delta"] += reads
+            target["cache_savings_usd_delta"] = round(
+                target["cache_savings_usd_delta"] + discount, 6
+            )
+            if cost is None or target["cache_read_cost_usd_delta"] is None:
+                target["cache_read_cost_usd_delta"] = None
+            else:
+                target["cache_read_cost_usd_delta"] = round(
+                    target["cache_read_cost_usd_delta"] + cost, 6
+                )
 
         for point in history:
             timestamp = _parse_timestamp(point["timestamp"])
@@ -1944,6 +1996,15 @@ class SavingsTracker:
             delta_output_tokens = max(total_output_tokens - prev_output_tokens, 0)
             delta_output_usd = max(total_output_usd - prev_output_usd, 0.0)
 
+            total_cache_read_tokens = _coerce_int(point.get("cache_read_tokens"))
+            total_cache_savings_usd = _coerce_float(point.get("cache_savings_usd"))
+            delta_cache_read_tokens = max(total_cache_read_tokens - prev_cache_read_tokens, 0)
+            delta_cache_savings_usd = max(total_cache_savings_usd - prev_cache_savings_usd, 0.0)
+            prev_cache_read_tokens = total_cache_read_tokens
+            prev_cache_savings_usd = total_cache_savings_usd
+            model = _normalize_model(point.get("model"))
+            delta_cache_read_cost_usd = _read_cost(model, delta_cache_read_tokens)
+
             prev_total_tokens = total_tokens_saved
             prev_total_usd = total_usd
             prev_total_input_tokens = total_input_tokens
@@ -1965,6 +2026,7 @@ class SavingsTracker:
                     "total_input_cost_usd": total_input_cost_usd,
                     "output_tokens_saved_delta": 0,
                     "output_savings_usd_delta": 0.0,
+                    **_empty_cache_delta(),
                     "by_provider": {},
                     "by_model": {},
                 },
@@ -1988,12 +2050,21 @@ class SavingsTracker:
                 entry["output_savings_usd_delta"] + delta_output_usd,
                 6,
             )
+            _add_cache(
+                entry, delta_cache_read_tokens, delta_cache_savings_usd, delta_cache_read_cost_usd
+            )
 
             # Attribute this checkpoint's delta to the provider that produced
             # it. Each checkpoint comes from a single request, so its delta is
             # wholly owned by one provider. Skip no-op checkpoints so providers
             # only appear in a bucket where they actually moved a counter.
-            if delta_tokens or delta_usd or delta_input_tokens or delta_input_cost_usd:
+            if (
+                delta_tokens
+                or delta_usd
+                or delta_input_tokens
+                or delta_input_cost_usd
+                or delta_cache_read_tokens
+            ):
                 provider = _normalize_provider(point.get("provider"))
                 prov = entry["by_provider"].setdefault(
                     provider,
@@ -2002,7 +2073,14 @@ class SavingsTracker:
                         "compression_savings_usd_delta": 0.0,
                         "total_input_tokens_delta": 0,
                         "total_input_cost_usd_delta": 0.0,
+                        **_empty_cache_delta(),
                     },
+                )
+                _add_cache(
+                    prov,
+                    delta_cache_read_tokens,
+                    delta_cache_savings_usd,
+                    delta_cache_read_cost_usd,
                 )
                 prov["tokens_saved"] += delta_tokens
                 prov["compression_savings_usd_delta"] = round(
@@ -2015,7 +2093,6 @@ class SavingsTracker:
                     6,
                 )
 
-                model = _normalize_model(point.get("model"))
                 mod = entry["by_model"].setdefault(
                     model,
                     {
@@ -2023,7 +2100,11 @@ class SavingsTracker:
                         "compression_savings_usd_delta": 0.0,
                         "total_input_tokens_delta": 0,
                         "total_input_cost_usd_delta": 0.0,
+                        **_empty_cache_delta(),
                     },
+                )
+                _add_cache(
+                    mod, delta_cache_read_tokens, delta_cache_savings_usd, delta_cache_read_cost_usd
                 )
                 mod["tokens_saved"] += delta_tokens
                 mod["compression_savings_usd_delta"] = round(
