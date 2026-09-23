@@ -293,3 +293,54 @@ def test_proxy_config_malloc_trim_default_is_scoped_to_platforms_with_a_trim_cal
 
     # The interval knob is platform-independent.
     assert models.ProxyConfig().malloc_trim_interval_seconds == 60
+
+
+@pytest.mark.parametrize(
+    ("platform", "expected"),
+    [("darwin", True), ("linux", True), ("win32", False)],
+)
+def test_cli_proxy_uses_the_same_trim_default_as_the_dataclass(monkeypatch, platform, expected):
+    # `headroom proxy` builds its ProxyConfig field by field, so it can only
+    # inherit the platform scope by calling the shared default: a literal here
+    # (as `sys.platform == "darwin"` was) silently overrides the dataclass for
+    # every CLI-launched proxy. Covers the third entry point; the server's
+    # env factory and ProxyConfig() itself are covered above.
+    pytest.importorskip("click")
+    pytest.importorskip("fastapi")
+    from click.testing import CliRunner
+
+    from headroom.cli.main import main
+
+    monkeypatch.setattr(proxy_cli.sys, "platform", platform)
+    monkeypatch.delenv("HEADROOM_MALLOC_TRIM", raising=False)
+    captured: dict = {}
+
+    def fake_run_server(config, **kwargs):  # noqa: ANN001
+        captured["config"] = config
+
+    monkeypatch.setattr("headroom.proxy.server.run_server", fake_run_server)
+    result = CliRunner().invoke(main, ["proxy"], catch_exceptions=False)
+
+    assert result.exit_code == 0, result.output
+    assert captured["config"].periodic_malloc_trim_enabled is expected
+
+
+def test_cli_proxy_trim_env_opt_out_still_wins(monkeypatch):
+    pytest.importorskip("click")
+    pytest.importorskip("fastapi")
+    from click.testing import CliRunner
+
+    from headroom.cli.main import main
+
+    monkeypatch.setattr(proxy_cli.sys, "platform", "linux")
+    monkeypatch.setenv("HEADROOM_MALLOC_TRIM", "0")
+    captured: dict = {}
+
+    def fake_run_server(config, **kwargs):  # noqa: ANN001
+        captured["config"] = config
+
+    monkeypatch.setattr("headroom.proxy.server.run_server", fake_run_server)
+    result = CliRunner().invoke(main, ["proxy"], catch_exceptions=False)
+
+    assert result.exit_code == 0, result.output
+    assert captured["config"].periodic_malloc_trim_enabled is False

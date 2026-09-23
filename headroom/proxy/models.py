@@ -42,6 +42,16 @@ def _qdrant_env_port_or_default() -> int:
         return qdrant_env.DEFAULT_QDRANT_PORT
 
 
+def default_periodic_malloc_trim() -> bool:
+    """Platforms where the periodic allocator trim is on unless opted out.
+
+    Shared by ``ProxyConfig``'s default and by the two call sites that build a
+    config explicitly (``headroom proxy`` and ``_proxy_config_from_env``), so the
+    platform scope cannot drift between them.
+    """
+    return sys.platform in ("darwin", "linux")
+
+
 # =============================================================================
 # Data Models
 # =============================================================================
@@ -476,9 +486,7 @@ class ProxyConfig:
     # 100 GB RSS on a 128 GB host with the trim off). Platforms without a trim
     # call disable the task themselves. Envs: HEADROOM_MALLOC_TRIM=0/1,
     # HEADROOM_MALLOC_TRIM_INTERVAL_SECONDS.
-    periodic_malloc_trim_enabled: bool = field(
-        default_factory=lambda: sys.platform in ("darwin", "linux")
-    )
+    periodic_malloc_trim_enabled: bool = field(default_factory=default_periodic_malloc_trim)
     malloc_trim_interval_seconds: int = 60
 
     # Stateless mode — disable all filesystem writes for read-only / container deployments
