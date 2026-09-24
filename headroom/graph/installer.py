@@ -77,13 +77,17 @@ def download_cbm(version: str | None = None) -> Path:
     except Exception as e:
         raise RuntimeError(f"Failed to download codebase-memory-mcp from {url}: {e}") from e
 
+    from headroom.binaries import verify_download_bytes
+
+    verify_download_bytes(data, url=url, name="codebase-memory-mcp")
+
     # Extract binary from tar.gz
     try:
         with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
             for member in tar.getmembers():
                 if member.name.endswith(CBM_BIN_NAME) or member.name == CBM_BIN_NAME:
                     member.name = target_path.name
-                    tar.extract(member, CBM_BIN_DIR)
+                    tar.extract(member, CBM_BIN_DIR, filter="data")
                     break
             else:
                 raise RuntimeError("codebase-memory-mcp binary not found in archive")
@@ -122,8 +126,18 @@ def ensure_cbm() -> Path | None:
     if existing:
         return existing
 
+    # Local import to match this module's lazy-import style (see download_cbm).
+    from headroom.binaries import UnpinnedDownload
+
     try:
         return download_cbm()
     except RuntimeError as e:
         logger.warning("Failed to install codebase-memory-mcp: %s", e)
+        return None
+    except UnpinnedDownload as e:
+        # Documented contract is "path, or None if the download failed", and a
+        # refusal is a failure to install -- the feature is simply unavailable.
+        # Deliberately NOT widened to BinaryError: Sha256Mismatch is a tamper
+        # signal and must keep propagating rather than becoming a quiet None.
+        logger.warning("Refusing to install codebase-memory-mcp: %s", e)
         return None

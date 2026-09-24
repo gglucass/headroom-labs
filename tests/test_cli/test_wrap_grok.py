@@ -32,13 +32,10 @@ def test_wrap_grok_sets_proxy_env(
         captured.update(kwargs)
 
     with patch("headroom.cli.wrap.shutil.which", return_value="grok"):
-        with patch("headroom.cli.wrap._setup_context_tool_for_agent"):
-            with patch("headroom.cli.wrap._setup_headroom_mcp"):
-                with patch("headroom.cli.wrap._setup_coding_compressor"):
-                    with patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool):
-                        result = runner.invoke(
-                            main, ["wrap", "grok", "--no-rtk", "--no-mcp", "--", "-p", "hello"]
-                        )
+        with patch("headroom.cli.wrap._setup_headroom_mcp"):
+            with patch("headroom.cli.wrap._setup_coding_compressor"):
+                with patch("headroom.cli.wrap._launch_tool", side_effect=fake_launch_tool):
+                    result = runner.invoke(main, ["wrap", "grok", "--no-mcp", "--", "-p", "hello"])
 
     assert result.exit_code == 0, result.output
     env = captured["env"]
@@ -56,10 +53,9 @@ def test_wrap_grok_missing_binary_exits(
     monkeypatch.chdir(tmp_path)
 
     with patch("headroom.cli.wrap.shutil.which", return_value=None):
-        with patch("headroom.cli.wrap._setup_context_tool_for_agent"):
-            with patch("headroom.cli.wrap._setup_headroom_mcp"):
-                with patch("headroom.cli.wrap._setup_coding_compressor"):
-                    result = runner.invoke(main, ["wrap", "grok", "--no-rtk", "--no-mcp"])
+        with patch("headroom.cli.wrap._setup_headroom_mcp"):
+            with patch("headroom.cli.wrap._setup_coding_compressor"):
+                result = runner.invoke(main, ["wrap", "grok", "--no-mcp"])
 
     assert result.exit_code == 1
     assert "grok" in result.output.lower()

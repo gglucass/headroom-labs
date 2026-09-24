@@ -413,6 +413,59 @@ fn get_definition_name(node: Node, code: &str) -> Option<String> {
     None
 }
 
+/// Tokenize a relevance query for symbol-name matching (CJK-aware).
+/// Mirrors `_query_context_tokens`: returns (word set, lowercased query,
+/// has_cjk). Symbol names are ASCII identifiers; CJK relevance queries have
+/// no spaces and use CJK/full-width punctuation, so an ASCII-only delimiter
+/// class would collapse the whole query into one blob and never isolate an
+/// ASCII name the user asked to keep. CJK/full-width punctuation and the
+/// ideographic space are therefore delimiters too.
+fn query_context_tokens(context: &str) -> (BTreeSet<String>, String, bool) {
+    if context.is_empty() {
+        return (BTreeSet::new(), String::new(), false);
+    }
+    static DELIMS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let delims = DELIMS.get_or_init(|| {
+        // Same class as Python `_CONTEXT_DELIMS`.
+        regex::Regex::new(r#"[\s,;:.()\[\]{}"'，、；：。．！？（）【】「」『』《》〈〉·…—　]+"#)
+            .unwrap()
+    });
+    static CJK: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let cjk = CJK.get_or_init(|| {
+        // Same class as Python `_CJK_CHARS`:
+        // U+3000-U+9FFF, U+AC00-U+D7AF (Hangul), U+FF00-U+FFEF (full-width).
+        regex::Regex::new(r"[\u{3000}-\u{9FFF}\u{AC00}-\u{D7AF}\u{FF00}-\u{FFEF}]").unwrap()
+    });
+    let lowered = context.to_lowercase();
+    let words: BTreeSet<String> = delims
+        .split(&lowered)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+    let has_cjk = cjk.is_match(&lowered);
+    (words, lowered, has_cjk)
+}
+
+/// Whether the relevance query names this symbol. Mirrors `_symbol_in_context`:
+/// exact token match, or a substring fallback gated by len>3 (in characters,
+/// like Python's `len`) for ASCII queries but relaxed for CJK queries — a
+/// short ASCII name glued to CJK has no delimiter to isolate it, so the
+/// exact match can't fire and the guard would wrongly drop it.
+fn symbol_in_context(
+    name_lower: &str,
+    words: &BTreeSet<String>,
+    context_lower: &str,
+    has_cjk: bool,
+) -> bool {
+    if words.is_empty() || name_lower.is_empty() {
+        return false;
+    }
+    if words.contains(name_lower) {
+        return true;
+    }
+    context_lower.contains(name_lower) && (name_lower.chars().count() > 3 || has_cjk)
+}
+
 fn is_public_symbol(name: &str, language: CodeLanguage) -> bool {
     if name.is_empty() {
         return false;
@@ -1066,18 +1119,8 @@ impl CodeAwareCompressor {
             ref_counts.insert(qname.clone(), (count - def_count).max(0));
         }
 
-        // Context words (empty when context is "").
-        let context_lower = context.to_lowercase();
-        let context_words: BTreeSet<String> = if context.is_empty() {
-            BTreeSet::new()
-        } else {
-            static SPLIT: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-            let re = SPLIT.get_or_init(|| regex::Regex::new(r#"[\s,;:.()\[\]{}"']+"#).unwrap());
-            re.split(&context_lower)
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
-                .collect()
-        };
+        // Context words (empty when context is ""). Mirrors `_query_context_tokens`.
+        let (context_words, context_lower, context_has_cjk) = query_context_tokens(context);
 
         // Raw importance signals per symbol.
         let mut raw_signals: Vec<(String, f64)> = Vec::new();
@@ -1106,13 +1149,14 @@ impl CodeAwareCompressor {
                 raw += 1.0;
             }
 
-            if !context_words.is_empty() {
-                let name_lower = short.to_lowercase();
-                if context_words.contains(&name_lower)
-                    || (name_lower.chars().count() > 3 && context_lower.contains(&name_lower))
-                {
-                    raw += 3.0;
-                }
+            // Context boost: the relevance query named this symbol.
+            if symbol_in_context(
+                &short.to_lowercase(),
+                &context_words,
+                &context_lower,
+                context_has_cjk,
+            ) {
+                raw += 3.0;
             }
             raw_signals.push((qname.clone(), raw));
         }
@@ -1853,7 +1897,7 @@ mod tests {
     fn detect_language_basic() {
         let (lang, conf) = detect_language("import os\n\ndef f(x):\n    return x + 1\n");
         assert_eq!(lang, CodeLanguage::Python);
-        assert!(conf >= 0.3 && conf <= 1.0);
+        assert!((0.3..=1.0).contains(&conf));
 
         let (lang, _) = detect_language("package main\n\nfunc main() {}\n");
         assert_eq!(lang, CodeLanguage::Go);
@@ -1864,6 +1908,107 @@ mod tests {
 
         let (lang, _) = detect_language("just plain english prose with no code here at all");
         assert_eq!(lang, CodeLanguage::Unknown);
+    }
+
+    // CJK-aware relevance-query matching. Mirrors
+    // tests/test_transforms/test_code_compressor_cjk.py (Python reference).
+
+    #[test]
+    fn cjk_query_isolates_wrapped_ascii_symbol() {
+        // Full-width parens around the name must still tokenize parse_config out.
+        let (words, lowered, has_cjk) =
+            query_context_tokens("请重点保留（parse_config）的解析配置");
+        assert!(has_cjk);
+        assert!(words.contains("parse_config"));
+        assert!(symbol_in_context("parse_config", &words, &lowered, has_cjk));
+    }
+
+    #[test]
+    fn cjk_query_matches_short_ascii_name_glued_to_cjk() {
+        // 'db' (len 2) glued to CJK has no delimiter to isolate it; the len>3
+        // guard is relaxed for CJK so the substring fallback still matches.
+        let (words, lowered, has_cjk) = query_context_tokens("请保留db相关的逻辑");
+        assert!(has_cjk);
+        assert!(symbol_in_context("db", &words, &lowered, has_cjk));
+    }
+
+    #[test]
+    fn english_short_name_substring_still_gated() {
+        // ASCII query unchanged: a short name that is only a substring (not a
+        // token) of an English query must NOT match (avoids spurious boosts).
+        let (words, lowered, has_cjk) = query_context_tokens("keep the database helper");
+        assert!(!has_cjk);
+        assert!(!symbol_in_context("db", &words, &lowered, has_cjk));
+    }
+
+    #[test]
+    fn english_exact_token_match_unchanged() {
+        let (words, lowered, has_cjk) = query_context_tokens("keep parse_config and helper");
+        assert!(!has_cjk);
+        assert!(symbol_in_context("parse_config", &words, &lowered, has_cjk));
+        assert!(symbol_in_context("helper", &words, &lowered, has_cjk));
+    }
+
+    #[test]
+    fn english_long_name_substring_fallback_unchanged() {
+        // ASCII path, len>3 substring fallback: 'parse_config' is not a
+        // standalone token but is a substring of 'parse_configs' -> must match.
+        let (words, lowered, has_cjk) = query_context_tokens("parse_configs and related helpers");
+        assert!(!has_cjk);
+        assert!(!words.contains("parse_config"));
+        assert!(symbol_in_context("parse_config", &words, &lowered, has_cjk));
+    }
+
+    #[test]
+    fn empty_context_matches_nothing() {
+        let (words, lowered, has_cjk) = query_context_tokens("");
+        assert!(words.is_empty());
+        assert_eq!(lowered, "");
+        assert!(!has_cjk);
+        assert!(!symbol_in_context("foo", &words, &lowered, has_cjk));
+    }
+
+    #[test]
+    fn guard_counts_chars_not_bytes() {
+        // Python's len() counts characters. A 4-char name that is >3 in chars
+        // must take the substring fallback on an ASCII query even though a
+        // byte-length comparison would agree here; conversely a 3-char name
+        // must not, even when it is many bytes away from any CJK.
+        let (words, lowered, has_cjk) = query_context_tokens("prefer the runs_fast variant");
+        assert!(!has_cjk);
+        assert!(symbol_in_context("runs", &words, &lowered, has_cjk));
+        assert!(!symbol_in_context("run", &words, &lowered, has_cjk));
+    }
+
+    /// Symmetric pair of Python functions: identical raw importance signals,
+    /// so any score difference comes only from the context boost.
+    const CJK_BOOST_CODE: &str = "import os\n\n\
+def run(config):\n    value = config.get(\"alpha\")\n    result = value + 1\n    total = result * 2\n    scaled = total - value\n    merged = scaled + result\n    print(merged)\n    print(scaled)\n    print(total)\n    return merged\n\n\
+def keep(config):\n    value = config.get(\"beta\")\n    result = value + 2\n    total = result * 3\n    scaled = total - value\n    merged = scaled + result\n    print(merged)\n    print(scaled)\n    print(total)\n    return merged\n";
+
+    fn score_of(result: &CodeCompressionResult, name: &str) -> f64 {
+        result
+            .symbol_scores
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| *v)
+            .unwrap_or_else(|| panic!("no score for {name}: {:?}", result.symbol_scores))
+    }
+
+    #[test]
+    fn cjk_context_boosts_named_symbol_end_to_end() {
+        // Python reference: a CJK query with no spaces still boosts the ASCII
+        // symbol it names ("run" glued to CJK, len 3 <= guard, has_cjk relaxes it).
+        let c = CodeAwareCompressor::new(CodeCompressorConfig::default());
+        let r = c.compress_with(CJK_BOOST_CODE, Some("python"), "修复run函数的报错");
+        assert_eq!(score_of(&r, "run"), 1.0, "run must get the context boost");
+        assert_eq!(score_of(&r, "keep"), 0.0);
+
+        // ASCII query unchanged: "run" is only a substring of "runner" and the
+        // len>3 guard is NOT relaxed without CJK -> no boost, symmetric scores.
+        let r = c.compress_with(CJK_BOOST_CODE, Some("python"), "fix the runner");
+        assert_eq!(score_of(&r, "run"), 0.5);
+        assert_eq!(score_of(&r, "keep"), 0.5);
     }
 
     #[test]
