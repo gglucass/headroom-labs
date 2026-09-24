@@ -575,23 +575,33 @@ _EXEC_COMMAND_CALL_RE = re.compile(r"\bexec_command\s*\(")
 # The `cmd` property of a JavaScript object literal, as Codex code-mode usually
 # writes it: `{cmd: "sed -n '1,80p' f.py", workdir: "/repo"}` or
 # `{cmd:"cat f","workdir":"/repo"}`. Matched from the opening brace; the key may
-# be bare or quoted and the value a "...", '...' or `...` string. A template
-# literal with `${...}` substitution is dynamic and does not match.
+# be bare or quoted and the value a "...", '...' or `...` string that is the
+# WHOLE property value (the next token ends it: `,` or `}`). Anything else -
+# `"c" + "at f"`, `"cat f".trim()`, a template literal with `${...}` - is an
+# expression whose value is not the literal and does not match.
 _JS_CMD_PROPERTY_RE = re.compile(
     r"""\{[^{}]*?(?<![\w$])(?:cmd|"cmd"|'cmd')\s*:\s*"""
     r"""(?:"((?:[^"\\\n]|\\.)*)"|'((?:[^'\\\n]|\\.)*)'|`((?:[^`\\$]|\\.|\$(?!\{))*)`)"""
+    r"""(?=\s*[,}])"""
 )
-_JS_STRING_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "0": "\0"}
+_JS_STRING_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "b": "\b", "f": "\f", "v": "\v"}
 
 
-def _js_string_value(body: str) -> str:
-    """Unescape the body of a JavaScript string literal (simple escapes only)."""
+def _js_string_value(body: str) -> str | None:
+    """Unescape the body of a JavaScript string literal.
+
+    Returns None for an escape it does not decode (``\\x61``, ``\\u0061``, octal),
+    since guessing would misread ``c\\x61t f`` as something other than ``cat f``.
+    """
+    escaped = re.findall(r"\\(.)", body, flags=re.S)
+    if any(c.isalnum() and c not in _JS_STRING_ESCAPES for c in escaped):
+        return None
     return re.sub(
         r"\\(.)", lambda m: _JS_STRING_ESCAPES.get(m.group(1), m.group(1)), body, flags=re.S
     )
 
 
-def _custom_tool_call_commands(raw: Any) -> list[str]:
+def _custom_tool_call_commands(raw: Any) -> list[str | None]:
     """Extract shell commands from a Codex code-mode ``exec`` custom tool call.
 
     Codex sends shell commands as a Responses ``custom_tool_call`` named ``exec``
@@ -605,25 +615,30 @@ def _custom_tool_call_commands(raw: Any) -> list[str]:
     ``cmd`` property is read from the literal instead.
 
     Returns every ``cmd`` passed to ``exec_command``, in order. Returns ``[]`` when
-    the input is not that shape; an argument whose ``cmd`` is not a plain string
-    literal is skipped, which leaves the output compressible exactly as before.
+    the input is not that shape. A call whose ``cmd`` is not statically known (a
+    variable, a concatenation, a template with substitution, an escape this does
+    not decode) yields ``None``: the command may be a read, and callers must treat
+    it as one rather than let an incomplete parse release the output.
     """
     if not isinstance(raw, str) or "exec_command" not in raw:
         return []
     decoder = json.JSONDecoder()
-    commands: list[str] = []
+    commands: list[str | None] = []
     for match in _EXEC_COMMAND_CALL_RE.finditer(raw):
         start = raw.find("{", match.end())
         if start < 0 or raw[match.end() : start].strip():
+            commands.append(None)  # argument is not an object literal: dynamic
             continue
         try:
             args, _end = decoder.raw_decode(raw, start)
         except ValueError:
             literal = _JS_CMD_PROPERTY_RE.match(raw, start)
             if literal is None:
+                commands.append(None)
                 continue
             body = next(group for group in literal.groups() if group is not None)
-            args = {"cmd": _js_string_value(body)}
+            commands.append(_js_string_value(body) or None)
+            continue
         command = _tool_call_command_text(args)
         if command:
             commands.append(command)

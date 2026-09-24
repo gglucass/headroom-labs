@@ -2195,19 +2195,22 @@ class OpenAIHandlerMixin:
                     command = _tool_call_command_text(item.get("action"))
                 elif item_type == "custom_tool_call":
                     # One script can run several commands; its single output is a
-                    # read when any of them is (over-protecting only costs savings).
+                    # read when any of them is, or when one's cmd is not a string
+                    # literal and so might be (over-protecting only costs savings).
+                    commands = _custom_tool_call_commands(item.get("input"))
                     command = next(
-                        (
-                            c
-                            for c in _custom_tool_call_commands(item.get("input"))
-                            if _is_read_command(c)
-                        ),
-                        "",
+                        (c for c in commands if c is not None and _is_read_command(c)),
+                        "exec_command(<cmd not a string literal>)" if None in commands else "",
                     )
                 else:
                     continue
                 call_id = item.get("call_id")
-                if command and isinstance(call_id, str) and call_id and _is_read_command(command):
+                if (
+                    command
+                    and isinstance(call_id, str)
+                    and call_id
+                    and (item_type == "custom_tool_call" or _is_read_command(command))
+                ):
                     read_command_by_call_id[call_id] = command
         # Outputs protected by read-command detection. Also unioned into the
         # cross-turn dedup protection set below: a [↑…] fold of a read would
