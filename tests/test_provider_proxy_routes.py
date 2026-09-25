@@ -15,14 +15,14 @@ from headroom.proxy.project_context import get_current_project
 from headroom.proxy.server import HeadroomProxy, ProxyConfig, create_app
 
 
-def _app() -> Any:
+def _app(openai_api_url: str = "https://api.openai.test") -> Any:
     return create_app(
         ProxyConfig(
             optimize=False,
             cache_enabled=False,
             rate_limit_enabled=False,
             anthropic_api_url="https://api.anthropic.test",
-            openai_api_url="https://api.openai.test",
+            openai_api_url=openai_api_url,
             gemini_api_url="https://api.gemini.test",
             cloudcode_api_url="https://cloudcode.test",
             vertex_api_url="https://vertex.test",
@@ -614,7 +614,7 @@ def test_list_models_routes_grok_session_login_to_session_host(monkeypatch) -> N
         "x-xai-token-auth": "xai-grok-cli",
         "user-agent": "grok-shell/0.2.112 (macos; aarch64)",
     }
-    with TestClient(_app()) as client:
+    with TestClient(_app("https://api.x.ai")) as client:
         assert client.get("/v1/models", headers=grok_session).json() == {
             "provider_api_base_url": "https://cli-chat-proxy.grok.com"
         }
@@ -624,8 +624,13 @@ def test_list_models_routes_grok_session_login_to_session_host(monkeypatch) -> N
             headers={"authorization": "Bearer xai-abc", "user-agent": "grok-shell/0.2.112"},
         )
 
+    # A proxy fronting a non-xAI target never hands the bearer to grok.com.
+    with TestClient(_app()) as client:
+        client.get("/v1/models", headers=grok_session)
+
     assert captured[0] == "https://cli-chat-proxy.grok.com"
-    assert captured[1] != "https://cli-chat-proxy.grok.com"
+    assert captured[1] == "https://api.x.ai"
+    assert captured[2] == "https://api.openai.test"
 
 
 def test_openai_response_websocket_aliases_delegate_to_openai_ws_handler(monkeypatch) -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Mapping
+from urllib.parse import urlparse
 
 from headroom.proxy.project_context import with_project_prefix
 
@@ -75,7 +76,7 @@ def is_grok_cli_request(headers: Mapping[str, str]) -> bool:
     return any(token.startswith(_GROK_UA_PREFIXES) for token in user_agent.split())
 
 
-def session_upstream(headers: Mapping[str, str]) -> str | None:
+def session_upstream(headers: Mapping[str, str], configured_target: str | None) -> str | None:
     """Return the upstream a Grok CLI session-login request must go to.
 
     ``headroom wrap grok`` points the proxy at ``api.x.ai``, which is right for
@@ -85,11 +86,19 @@ def session_upstream(headers: Mapping[str, str]) -> str | None:
     succeeded. Session tokens are only valid at ``cli-chat-proxy.grok.com``,
     the CLI's own default for that mode, so route them there.
 
+    ``configured_target`` is the operator's OpenAI target. Only when it is
+    already xAI is the reroute allowed: the credential was bound for xAI
+    anyway and moves between two xAI hosts. Any other target (an internal
+    gateway, api.openai.com) keeps every request, since the headers and a
+    JWT-shaped bearer prove nothing about who issued the token.
+
     ``None`` for anything that is not a Grok CLI session request: other
     clients keep their configured target, and a Grok CLI carrying an ``xai-``
     key keeps ``api.x.ai``.
     """
     if os.environ.get(SESSION_ROUTING_ENV_KEY, "").strip() == "0":
+        return None
+    if not _is_xai_target(configured_target):
         return None
     if not _is_grok_session_client(headers) or _bearer_is_api_key(headers):
         return None
@@ -101,6 +110,16 @@ def session_upstream(headers: Mapping[str, str]) -> str | None:
     if not _bearer_is_session_jwt(headers):
         return None
     return SESSION_API_URL
+
+
+def _is_xai_target(url: str | None) -> bool:
+    """True when ``url`` is the canonical xAI API origin (any path)."""
+    parsed = urlparse((url or "").strip())
+    return (
+        parsed.scheme.lower() == "https"
+        and parsed.hostname == "api.x.ai"
+        and parsed.port in (None, 443)
+    )
 
 
 def _is_grok_session_client(headers: Mapping[str, str]) -> bool:

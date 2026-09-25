@@ -497,7 +497,7 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
             proxy,
             request,
             endpoint=MODEL_METADATA_LIST_ENDPOINT,
-            provider_api_base_url=_grok_session_upstream(headers)
+            provider_api_base_url=_grok_session_upstream(headers, _api_target(proxy, "openai"))
             or _api_target(proxy, provider_name),
             provider_name=provider_name,
         )

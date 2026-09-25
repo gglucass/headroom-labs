@@ -49,7 +49,7 @@ def select_passthrough_base_url(
         return CHATGPT_BACKEND_API_URL
     if headers.get("x-goog-api-key"):
         return api_target(proxy, "gemini")
-    grok_session = session_upstream(headers)
+    grok_session = session_upstream(headers, api_target(proxy, "openai"))
     if grok_session:
         return grok_session
     if headers.get("api-key"):

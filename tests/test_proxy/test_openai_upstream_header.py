@@ -128,3 +128,17 @@ def test_grok_session_login_request_routes_to_session_host_without_header() -> N
         }
     )
     assert proxy._resolve_openai_upstream(explicit) == "https://gateway.example"
+
+
+def test_grok_session_routing_never_bypasses_a_configured_internal_target() -> None:
+    """A JWT-shaped bearer plus spoofed Grok headers must not pull a request off
+    an operator's internal gateway and send its credential to grok.com."""
+    proxy = _stub_proxy("https://gateway.internal")
+    spoofed = _FakeRequest(
+        {
+            "Authorization": "Bearer eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJodHRwczovL3Nzby5jb3JwIn0.sig",
+            "X-Xai-Token-Auth": "xai-grok-cli",
+            "User-Agent": "grok-shell/0.2.112 (macos; aarch64)",
+        }
+    )
+    assert proxy._resolve_openai_upstream(spoofed) == "https://gateway.internal"

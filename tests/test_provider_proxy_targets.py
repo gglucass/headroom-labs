@@ -91,3 +91,8 @@ def test_select_passthrough_base_url_routes_grok_session_login_to_session_host()
 
     keyed = {"authorization": "Bearer xai-abc", "user-agent": "grok-shell/0.2.112"}
     assert select_passthrough_base_url(proxy, keyed) == "https://api.x.ai"
+
+    # A configured target that is not xAI (an internal gateway) is never
+    # bypassed, however Grok-like the request looks.
+    gateway = _proxy(OPENAI_API_URL="https://gateway.internal")
+    assert select_passthrough_base_url(gateway, session) == "https://gateway.internal"
