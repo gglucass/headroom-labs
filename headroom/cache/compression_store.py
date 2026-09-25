@@ -38,6 +38,7 @@ import os
 import re
 import threading
 import time
+from collections import deque
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
@@ -52,9 +53,14 @@ DEFAULT_CCR_TTL_SECONDS = 1800  # session-scale; override via HEADROOM_CCR_TTL_S
 CCR_TTL_SECONDS_ENV = "HEADROOM_CCR_TTL_SECONDS"
 
 _RETRIEVAL_LOG_PREVIEW_CHARS = 4096
-# Previews carry verbatim tool-result content (post-redaction), which makes
-# proxy.log too sensitive for users to share in bug reports. Set to
-# 0/false/no/off to log byte counts only.
+# Previews carry verbatim tool-result content (post-redaction) — source code,
+# credentials the redactor does not recognize, customer data. That is not
+# something the always-on runtime log should hold, so previews are OFF unless
+# an operator turns them on with 1/true/yes/on; the log then records byte
+# counts only. (The log file is created owner-only either way — see
+# ``headroom/proxy/helpers.py:_OwnerOnlyRotatingFileHandler`` — because other
+# switches put request content in the same file. That is a second line of
+# defence, not a reason to log the payload.)
 PAYLOAD_PREVIEW_ENV = "HEADROOM_LOG_PAYLOAD_PREVIEW"
 _SECRET_KEY_VALUE_RE = re.compile(
     r"(?i)\b([A-Z0-9_-]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH)[A-Z0-9_-]*)"
@@ -113,10 +119,11 @@ def _redact_retrieval_log_payload(payload: str) -> str:
 
 
 def _payload_preview_enabled() -> bool:
+    """True only when an operator has explicitly opted in. Default: off."""
     raw = os.environ.get(PAYLOAD_PREVIEW_ENV)
     if raw is None:
-        return True
-    return raw.strip().lower() not in ("0", "false", "no", "off")
+        return False
+    return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
 def _payload_for_retrieval_log(payload: str) -> dict[str, Any]:
@@ -250,9 +257,12 @@ class CompressionStore:
         self._default_ttl = default_ttl
         self._enable_feedback = enable_feedback
 
-        # Feedback tracking
-        self._retrieval_events: list[RetrievalEvent] = []
+        # Feedback tracking. maxlen caps the display history, replacing an
+        # append-then-reslice that re-copied 1000 pointers on every retrieval.
         self._max_events = 1000  # Keep last 1000 events
+        self._retrieval_events: deque[RetrievalEvent] = deque(maxlen=self._max_events)
+        # Deliberately NOT bounded: this is a drain-by-swap queue, and every
+        # event in it still owes a feedback notification.
         self._pending_feedback_events: list[RetrievalEvent] = []
 
         # MEDIUM FIX #16: Use a min-heap for O(log n) eviction instead of O(n)
@@ -764,6 +774,11 @@ class CompressionStore:
 
         CRITICAL FIX: Track stale heap entries when deleting to prevent memory leak.
         """
+        purge_expired = getattr(self._backend, "purge_expired", None)
+        if callable(purge_expired):
+            self._stale_heap_entries += purge_expired()
+            return
+
         expired_keys = [key for key, entry in self._backend.items() if entry.is_expired()]
         for key in expired_keys:
             self._backend.delete(key)
@@ -852,11 +867,8 @@ class CompressionStore:
             tool_signature_hash=tool_signature_hash,
         )
 
+        # maxlen keeps this bounded; no trim needed here.
         self._retrieval_events.append(event)
-
-        # Keep only recent events
-        if len(self._retrieval_events) > self._max_events:
-            self._retrieval_events = self._retrieval_events[-self._max_events :]
 
         # Queue event for feedback processing (will be processed after lock release)
         # This is safe because process_pending_feedback() uses the lock to atomically
