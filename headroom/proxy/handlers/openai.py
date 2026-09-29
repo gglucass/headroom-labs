@@ -9,10 +9,13 @@ import asyncio
 import contextlib
 import copy
 import hashlib
+import hmac
 import json
 import logging
 import os
 import re
+import secrets
+import ssl
 import threading
 import time
 import uuid
@@ -33,6 +36,7 @@ from headroom.proxy.helpers import (
 )
 from headroom.proxy.identity import resolve_memory_identity
 from headroom.proxy.loopback_guard import is_loopback_host
+from headroom.proxy.modes import is_cache_mode
 from headroom.proxy.stage_timer import StageTimer, emit_stage_timings_log
 from headroom.proxy.upstream_guard import is_safe_upstream_url
 from headroom.proxy.ws_headers import WS_HOP_BY_HOP_HEADERS
@@ -120,6 +124,30 @@ _CCR_HASH_RE = re.compile(
     r"(?:Retrieve (?:more|original): hash=|<<ccr:)([a-fA-F0-9]{12,24})(?=[^a-fA-F0-9]|$)"
 )
 _BARE_CCR_HASH_RE = re.compile(r"[a-fA-F0-9]{12,24}")
+_OPENAI_RATE_KEY_SECRET = secrets.token_bytes(32)
+
+
+def _openai_rate_limit_key(headers: dict[str, str]) -> str:
+    """Return the credential identity used by the OpenAI rate limiter.
+
+    OpenAI-compatible gateways may authenticate with either a bearer token or
+    an ``api-key`` header. Deriving an identity from the complete value keeps common
+    prefixes distinct without retaining recoverable credential material in
+    bucket keys. The secret is process-local, like the limiter state.
+    Requests without either retain the existing shared fallback bucket.
+    """
+    authorization = headers.get("authorization")
+    api_key = headers.get("api-key")
+    if authorization:
+        kind, credential = "authorization", authorization
+    elif api_key:
+        kind, credential = "api-key", api_key
+    else:
+        return "default"
+    # API credentials are identifiers, not passwords to verify. A process-keyed
+    # HMAC keeps bucket keys opaque without a password KDF on the request path.
+    digest = hmac.digest(_OPENAI_RATE_KEY_SECRET, f"{kind}:{credential}".encode(), "sha256").hex()
+    return f"{kind}:{digest}"
 
 
 def _response_ccr_hashes(messages: list[dict[str, Any]], markers: list[str]) -> list[str]:
@@ -259,6 +287,35 @@ RESPONSES_USAGE_KEYS = {
     "output_key": "output_tokens",
     "details_key": "input_tokens_details",
 }
+
+
+class CCRContinuationHTTPError(Exception):
+    """A CCR continuation call came back non-2xx.
+
+    ``_retry_request`` deliberately returns rather than raises for the statuses
+    it will not retry — any 4xx, an exhausted 429/529, an exhausted 5xx — so a
+    continuation failure is indistinguishable from success unless the status is
+    checked. Parsing such a body and returning it as the model's answer would
+    serialize an upstream *error* under the original call's ``200``.
+
+    Raising instead routes the turn into
+    ``CCRResponseHandler.handle_response``'s existing continuation-failure
+    path, which forwards the response it already had. That keeps one behaviour
+    for every way a continuation can fail: transport error, timeout, and now
+    an error status.
+
+    Carries the status and nothing else. An upstream error body is untrusted
+    content that routinely contains credential fragments, tenant identifiers
+    and excerpts of the request, and the status alone identifies the failure.
+    The message matters as much as any explicit log call: ``handle_response``
+    logs ``repr(e)`` when a continuation raises
+    (``ccr/response_handler.py:541``), so anything placed here reaches the log
+    whether or not this module logs it too.
+    """
+
+    def __init__(self, status_code: int) -> None:
+        super().__init__(f"CCR continuation returned HTTP {status_code}")
+        self.status_code = status_code
 
 
 class TurnHookUsage:
@@ -2103,13 +2160,14 @@ class OpenAIHandlerMixin:
         # excluded tools (HEADROOM_EXCLUDE_TOOLS) can be protected from
         # compression. The chat/Anthropic paths get this via
         # ContentRouter._build_tool_name_map; the Responses payload carries the
-        # name on the `function_call` item and the originating call_id on the
-        # matching `function_call_output`, so we correlate them here.
+        # name on the `function_call` (or Codex `custom_tool_call`) item and
+        # the originating call_id on the matching output, so we correlate
+        # them here.
         function_name_by_call_id: dict[str, str] = {}
         for item in items:
             if not isinstance(item, dict):
                 continue
-            if item.get("type") != "function_call":
+            if item.get("type") not in ("function_call", "custom_tool_call"):
                 continue
             name = item.get("name")
             call_id = item.get("call_id")
@@ -2195,19 +2253,22 @@ class OpenAIHandlerMixin:
                     command = _tool_call_command_text(item.get("action"))
                 elif item_type == "custom_tool_call":
                     # One script can run several commands; its single output is a
-                    # read when any of them is (over-protecting only costs savings).
+                    # read when any of them is, or when one's cmd is not a string
+                    # literal and so might be (over-protecting only costs savings).
+                    commands = _custom_tool_call_commands(item.get("input"))
                     command = next(
-                        (
-                            c
-                            for c in _custom_tool_call_commands(item.get("input"))
-                            if _is_read_command(c)
-                        ),
-                        "",
+                        (c for c in commands if c is not None and _is_read_command(c)),
+                        "exec_command(<cmd not a string literal>)" if None in commands else "",
                     )
                 else:
                     continue
                 call_id = item.get("call_id")
-                if command and isinstance(call_id, str) and call_id and _is_read_command(command):
+                if (
+                    command
+                    and isinstance(call_id, str)
+                    and call_id
+                    and (item_type == "custom_tool_call" or _is_read_command(command))
+                ):
                     read_command_by_call_id[call_id] = command
         # Outputs protected by read-command detection. Also unioned into the
         # cross-turn dedup protection set below: a [↑…] fold of a read would
@@ -2507,10 +2568,16 @@ class OpenAIHandlerMixin:
                 )
             else:
                 large_unit_indexes.append(unit_idx)
-        small_batches, small_batch_skipped = build_compression_batches(
-            small_batch_entries,
-            min_batch_bytes=self.OPENAI_RESPONSES_ROUTER_MIN_BYTES,
-        )
+        if is_cache_mode(getattr(getattr(self, "config", None), "mode", "token")):
+            # Appending outputs can push an old below-floor unit into a batch.
+            # Preserve its first-forwarded bytes instead of retroactively
+            # compressing it. Large units retain their per-unit result cache.
+            small_batches, small_batch_skipped = [], small_batch_entries
+        else:
+            small_batches, small_batch_skipped = build_compression_batches(
+                small_batch_entries,
+                min_batch_bytes=self.OPENAI_RESPONSES_ROUTER_MIN_BYTES,
+            )
         cache_misses: list[tuple[int, str, RoutedCompressionUnit]] = []
         cache_miss_followers: dict[str, list[int]] = {}
         for unit_idx in large_unit_indexes:
@@ -2938,12 +3005,19 @@ class OpenAIHandlerMixin:
                     for tool in _deferred_tools
                     if isinstance(tool, dict) and tool.get("defer_loading")
                 ]
+                # estimated, NOT realized — and the comment above this block
+                # already says so ("a transform tag but no tokens_saved claim").
+                # The deferred definitions still ride in the request body; the
+                # saving is provider-side context exclusion we cannot observe in
+                # any response field, so claiming it as realized overstates it.
                 record_savings(
                     savings_tags if savings_tags is not None else {},
                     "tool_search",
                     tokens=self.openai_provider.get_token_counter(model).count_text(
                         _json_debug_dumps(deferred)
                     ),
+                    realized=False,
+                    estimated=True,
                 )
             except Exception:
                 logger.debug("tool-search savings attribution skipped", exc_info=True)
@@ -3548,10 +3622,12 @@ class OpenAIHandlerMixin:
 
         # Rate limiting
         if self.rate_limiter:
-            rate_key = headers.get("authorization", "default")[:20]
+            rate_key = _openai_rate_limit_key(headers)
             allowed, wait_seconds = await self.rate_limiter.check_request(rate_key)
             if not allowed:
-                await self.metrics.record_rate_limited(provider=openai_chat_outcome_provider)
+                await self.metrics.record_rate_limited(
+                    provider=openai_chat_outcome_provider, source="headroom"
+                )
                 raise HTTPException(
                     status_code=429,
                     detail=f"Rate limited. Retry after {wait_seconds:.1f}s",
@@ -3578,6 +3654,10 @@ class OpenAIHandlerMixin:
         # review). Transport/metadata fields (stream, store, user, service_tier)
         # and the deprecated functions API are intentionally excluded.
         cache_key_fields = {
+            # The resolved upstream is request-local when x-headroom-base-url
+            # is present. Responses from separate gateways are not equivalent
+            # even when their model/messages fields match (#3346).
+            "upstream_base_url": upstream_base_url,
             "tools": body.get("tools"),
             "tool_choice": body.get("tool_choice"),
             "response_format": body.get("response_format"),
@@ -3676,15 +3756,29 @@ class OpenAIHandlerMixin:
         # Token counting (offloaded off the event loop — GH #1701)
         tokenizer, original_tokens = await self._count_tokens_offloaded(model, messages)
 
+        if self.rate_limiter:
+            allowed, wait_seconds = await self.rate_limiter.check_tokens(rate_key, original_tokens)
+            if not allowed:
+                await self.metrics.record_rate_limited(provider=openai_chat_outcome_provider)
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Token rate limited. Retry after {wait_seconds:.1f}s",
+                )
+
         # Hook: pre_compress
         _hook_biases = None
+        # Hard per-message veto. Separate from ``_hook_biases`` because a bias is
+        # a soft multiplier that several strategies clamp or ignore, so it cannot
+        # express "leave this one alone".
+        _hook_protect = None
         if self.config.hooks:
-            from headroom.hooks import CompressContext
+            from headroom.hooks import CompressContext, collect_protected
 
             _hook_ctx = CompressContext(model=model, provider="openai")
             try:
                 messages = self.config.hooks.pre_compress(messages, _hook_ctx)
                 _hook_biases = self.config.hooks.compute_biases(messages, _hook_ctx)
+                _hook_protect = collect_protected(self.config.hooks, messages, _hook_ctx)
             except Exception as e:
                 logger.debug(f"[{request_id}] Hook error: {e}")
 
@@ -3889,6 +3983,7 @@ class OpenAIHandlerMixin:
                             ),
                             prefix_replay_guaranteed=True,
                             biases=_hook_biases,
+                            protect=_hook_protect,
                             compression_policy=compression_policy,
                             cross_turn_dedup_recoverable=_dedup_pointers_recoverable,
                             # Thread the savings-profile knobs (e.g.
@@ -3931,6 +4026,7 @@ class OpenAIHandlerMixin:
                             frozen_message_count=apply_frozen_count,
                             prefix_replay_guaranteed=True,
                             biases=_hook_biases,
+                            protect=_hook_protect,
                             compression_policy=compression_policy,
                             cross_turn_dedup_recoverable=_dedup_pointers_recoverable,
                             # Same savings-profile threading as the token-mode
@@ -4136,6 +4232,9 @@ class OpenAIHandlerMixin:
                     existing_tools=tools,
                     has_compressed_content_this_turn=has_new_compressed_content,
                     history_has_ccr_reference=history_references_ccr_tool(optimized_messages),
+                    # Same rule as the Anthropic handler: only pre-arm the tool
+                    # for a request that can actually compress.
+                    allow_eager=bool(self.config.optimize) and not _bypass,
                 )
                 if ccr_tool_injected:
                     logger.debug(
@@ -4155,6 +4254,17 @@ class OpenAIHandlerMixin:
                     f"[{request_id}] Restored {restored_count} frozen prefix message(s) "
                     "to preserve cache stability (openai)"
                 )
+            # The restore writes raw client originals, but the provider cached
+            # what we forwarded last turn. Replay that over the restored result;
+            # the overlay's own checks keep the originals wherever replay is not
+            # provably safe. Token counts are recomputed from the final body below.
+            optimized_messages = finalize_turn(
+                optimized_messages,
+                original_client_messages,
+                openai_prefix_tracker.get_last_original_messages(),
+                openai_prefix_tracker.get_last_forwarded_messages(),
+                confirmed_frozen_count=_openai_confirmed_frozen,
+            ).messages
 
         # Memory: inject context and tools for OpenAI requests.
         #
@@ -4627,6 +4737,7 @@ class OpenAIHandlerMixin:
                         waste_signals=waste_signals_dict,
                         prefix_tracker=openai_prefix_tracker,
                         optimized_messages=optimized_messages,
+                        original_messages=original_client_messages,
                         backend=request_backend,
                     )
                 else:
@@ -4866,6 +4977,7 @@ class OpenAIHandlerMixin:
                         cache_read_tokens=cache_read_tokens,
                         cache_write_tokens=cache_write_tokens,
                         messages=optimized_messages,
+                        original_messages=original_client_messages,
                     )
 
                     await self._record_request_outcome(
@@ -4964,6 +5076,7 @@ class OpenAIHandlerMixin:
                     optimization_latency,
                     pipeline_timing=pipeline_timing,
                     prefix_tracker=openai_prefix_tracker,
+                    original_messages=original_client_messages,
                     outcome_provider=openai_chat_outcome_provider,
                 )
             else:
@@ -5175,12 +5288,130 @@ class OpenAIHandlerMixin:
                 _thinking = ThinkingTokens()
                 total_latency = (time.time() - start_time) * 1000
 
+                # ── CCR retrieval resolution (direct chat path) ──────────
+                # Every other path answers a `headroom_retrieve` call:
+                # gateway_turn.py, the Gemini and Anthropic handlers, the custom
+                # backend branch above, and Responses. This branch did not, so a
+                # tool the proxy itself injects (`ccr_inject_tool` defaults True)
+                # reached the client as a `tool_calls` entry for a function it
+                # never declared and cannot implement — stalling any agent loop
+                # driven off `finish_reason`.
+                #
+                # The continuation is a real, billed upstream call, so it is
+                # recorded into `_hook_usage` exactly like a turn-hook re-drive:
+                # `settle(final)` drops the one response the usage block below
+                # reads and totals the rest. Counting only the last call would
+                # let retrieval hide its own cost, which is the mistake the
+                # matching comment on the re-drive block below warns about.
+                _ccr_final_json: dict[str, Any] | None = None
+                _ccr_cont_error: int | None = None
+                if self.ccr_response_handler is not None and response.status_code == 200:
+                    try:
+                        _pre_ccr_json = response.json()
+                    except Exception:  # pragma: no cover - non-JSON upstream
+                        _pre_ccr_json = None
+                    if _pre_ccr_json and self.ccr_response_handler.has_ccr_tool_calls(
+                        _pre_ccr_json, "openai"
+                    ):
+                        logger.info(
+                            f"[{request_id}] CCR: retrieval tool call on the direct "
+                            "chat path, resolving before replying"
+                        )
+
+                        async def _ccr_api_call_fn(
+                            msgs: list[dict[str, Any]],
+                            tls: list[dict[str, Any]] | None,
+                        ) -> dict[str, Any]:
+                            continuation_body = {**body, "messages": msgs}
+                            if tls is not None:
+                                continuation_body["tools"] = tls
+                            # A continuation is always non-streaming, whatever
+                            # the client asked for.
+                            continuation_body.pop("stream", None)
+                            continuation_headers = {
+                                k: v
+                                for k, v in headers.items()
+                                if k.lower()
+                                not in (
+                                    "accept",
+                                    "content-type",
+                                    "content-length",
+                                    "content-encoding",
+                                )
+                            }
+                            continuation_headers["content-type"] = "application/json"
+                            continuation_headers["accept"] = "application/json"
+                            nonlocal _ccr_cont_error
+                            cont = await self._retry_request(
+                                "POST", url, continuation_headers, continuation_body
+                            )
+                            # `_retry_request` returns non-2xx verbatim for
+                            # everything it will not retry, so the status has to
+                            # be checked before the body is treated as an answer.
+                            # Without this an upstream 401, or an exhausted 429,
+                            # reaches the client as HTTP 200 carrying an error
+                            # object.
+                            if not 200 <= cont.status_code < 300:
+                                # Status only. The body is untrusted upstream
+                                # content and never leaves this branch.
+                                _ccr_cont_error = cont.status_code
+                                raise CCRContinuationHTTPError(cont.status_code)
+                            cont_json: dict[str, Any] = cont.json()
+                            _hook_usage.record(cont_json, **CHAT_USAGE_KEYS)
+                            return cont_json
+
+                        try:
+                            _hook_usage.record(_pre_ccr_json, **CHAT_USAGE_KEYS)
+                            _ccr_final_json = await self.ccr_response_handler.handle_response(
+                                _pre_ccr_json,
+                                optimized_messages,
+                                tools,
+                                _ccr_api_call_fn,
+                                provider="openai",
+                            )
+                            # `handle_response` swallows a continuation failure
+                            # and hands back the response it already had, so a
+                            # failed turn is only detectable here. Identity —
+                            # not equality — is the signal that nothing was
+                            # resolved, and it also covers max-rounds
+                            # exhaustion. Dropping back to `None` makes the
+                            # return below forward the upstream bytes verbatim
+                            # instead of re-serializing a dict that came from
+                            # them, which is what byte-faithful forwarding
+                            # means on a path that changed nothing.
+                            if _ccr_cont_error is not None or _ccr_final_json is _pre_ccr_json:
+                                if _ccr_cont_error is not None:
+                                    logger.warning(
+                                        f"[{request_id}] CCR: continuation returned HTTP "
+                                        f"{_ccr_cont_error}; forwarding the upstream reply "
+                                        "unchanged"
+                                    )
+                                else:
+                                    logger.warning(
+                                        f"[{request_id}] CCR: retrieval did not resolve; "
+                                        "forwarding the upstream reply unchanged"
+                                    )
+                                _ccr_final_json = None
+                                _hook_usage.settle(_pre_ccr_json)
+                            else:
+                                _hook_usage.settle(_ccr_final_json)
+                        except Exception as ccr_err:
+                            # Fail open to the model's own reply rather than 502 a
+                            # turn the client could still act on.
+                            logger.warning(
+                                f"[{request_id}] CCR: direct-path resolution failed "
+                                f"({type(ccr_err).__name__}: {ccr_err}); forwarding "
+                                "the upstream reply unchanged"
+                            )
+                            _ccr_final_json = None
+                            _hook_usage.settle(_pre_ccr_json)
+
                 total_input_tokens = optimized_tokens  # fallback
                 output_tokens = 0
                 cache_read_tokens = 0
                 resp_json = None
                 try:
-                    resp_json = response.json()
+                    resp_json = _ccr_final_json if _ccr_final_json is not None else response.json()
                     usage = resp_json.get("usage", {})
                     # Coerce present-but-null counts: the arithmetic below
                     # (`_infer_openai_cache_write_tokens`, `max(...)`) runs
@@ -5244,6 +5475,7 @@ class OpenAIHandlerMixin:
                     cache_read_tokens=cache_read_tokens,
                     cache_write_tokens=cache_write_tokens,
                     messages=optimized_messages,
+                    original_messages=original_client_messages,
                 )
 
                 # OpenAI has no write penalty — uncached = total - cached
@@ -5414,7 +5646,11 @@ class OpenAIHandlerMixin:
                     )
 
                 return Response(
-                    content=response.content,
+                    content=(
+                        json.dumps(_ccr_final_json).encode()
+                        if _ccr_final_json is not None
+                        else response.content
+                    ),
                     status_code=response.status_code,
                     headers=response_headers,
                 )
@@ -5673,10 +5909,10 @@ class OpenAIHandlerMixin:
 
         # Rate limiting
         if self.rate_limiter:
-            rate_key = headers.get("authorization", "default")[:20]
+            rate_key = _openai_rate_limit_key(headers)
             allowed, wait_seconds = await self.rate_limiter.check_request(rate_key)
             if not allowed:
-                await self.metrics.record_rate_limited(provider="openai")
+                await self.metrics.record_rate_limited(provider="openai", source="headroom")
                 raise HTTPException(
                     status_code=429,
                     detail=f"Rate limited. Retry after {wait_seconds:.1f}s",
@@ -5699,6 +5935,15 @@ class OpenAIHandlerMixin:
         # the tools schema after compression, and shaper strata must not
         # shift when it does.
         message_input_tokens = original_tokens
+
+        if self.rate_limiter:
+            allowed, wait_seconds = await self.rate_limiter.check_tokens(rate_key, original_tokens)
+            if not allowed:
+                await self.metrics.record_rate_limited(provider="openai")
+                raise HTTPException(
+                    status_code=429,
+                    detail=f"Token rate limited. Retry after {wait_seconds:.1f}s",
+                )
 
         # Defaults below feed downstream telemetry and memory injection.
         # If optimization remains enabled, the Responses payload is compressed
@@ -7134,10 +7379,15 @@ class OpenAIHandlerMixin:
             # --- Connect to upstream OpenAI WebSocket ---
             logger.info(f"[{request_id}] WS /v1/responses connecting to {upstream_url}")
 
-            # Use ssl=True to let the websockets library handle SSL natively.
-            # Manual ssl.create_default_context() + certifi doesn't load the
-            # Windows system cert store, causing HTTP 500 on wss:// connections.
-            use_ssl: bool | None = True if upstream_url.startswith("wss://") else None
+            # Same trust policy as the HTTP upstream client: the OS trust store
+            # (Windows machine store, macOS Keychain) plus any configured
+            # corporate bundle. Plain certifi misses both, causing HTTP 500 on
+            # wss:// connections behind TLS inspection.
+            from headroom.proxy.ssl_context import build_websocket_ssl
+
+            use_ssl: ssl.SSLContext | bool | None = (
+                build_websocket_ssl() if upstream_url.startswith("wss://") else None
+            )
 
             ws_connected = False
             ws_connect_attempts = max(1, getattr(self.config, "retry_max_attempts", 3))
@@ -9203,6 +9453,11 @@ class OpenAIHandlerMixin:
                     f"[{request_id}] WS upstream failed ({_ws_detail}), "
                     f"falling back to HTTP POST streaming"
                 )
+                # Logs the certificate issuer + fix once per host when the
+                # failure is an untrusted TLS-inspection root.
+                from headroom.proxy.tls_diagnostics import describe_upstream_failure_async
+
+                await describe_upstream_failure_async(ws_err, upstream_url)
                 (
                     fb_input_tokens,
                     fb_output_tokens,
@@ -10874,12 +11129,15 @@ class OpenAIHandlerMixin:
                 url,
                 e,
             )
+            from headroom.proxy.tls_diagnostics import describe_upstream_failure_async
+
+            tls_hint = await describe_upstream_failure_async(e, url)
             return Response(
                 content=json.dumps(
                     {
                         "error": {
                             "type": "connection_error",
-                            "message": f"Failed to connect to upstream API: {e}",
+                            "message": tls_hint or f"Failed to connect to upstream API: {e}",
                         }
                     }
                 ),
@@ -10936,6 +11194,12 @@ class OpenAIHandlerMixin:
                     separators=(",", ":"),
                     ensure_ascii=False,
                 ).encode("utf-8")
+                response_headers = _sanitize_forwarded_response_headers(
+                    response.headers,
+                    "etag",
+                    "last-modified",
+                    "cache-control",
+                )
                 response_headers["content-type"] = "application/json"
 
         # Passthrough request: forwarded upstream with no transforms.
@@ -11056,12 +11320,15 @@ class OpenAIHandlerMixin:
                 url,
                 e,
             )
+            from headroom.proxy.tls_diagnostics import describe_upstream_failure_async
+
+            tls_hint = await describe_upstream_failure_async(e, url)
             return Response(
                 content=json.dumps(
                     {
                         "error": {
                             "type": "connection_error",
-                            "message": f"Failed to connect to upstream API: {e}",
+                            "message": tls_hint or f"Failed to connect to upstream API: {e}",
                         }
                     }
                 ),
