@@ -519,7 +519,9 @@ def _run_verbosity(
     analyzed_count = 0
 
     for proj in targets:
-        session_paths = sorted(proj.data_path.glob("*.jsonl"))
+        session_paths = sorted(
+            f for d in (proj.data_path, *proj.extra_data_paths) for f in d.glob("*.jsonl")
+        )
         if not session_paths:
             continue
         profile, baseline = analyze(session_paths, str(proj.project_path), llm_judge=judge)

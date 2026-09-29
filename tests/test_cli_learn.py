@@ -231,8 +231,12 @@ def test_verbosity_all_apply_aggregates_baselines_across_projects(
     for d in (proj_a_dir, proj_b_dir):
         d.mkdir()
         (d / "s.jsonl").write_text("{}")
-    proj_a = SimpleNamespace(name="a", project_path=tmp_path / "src-a", data_path=proj_a_dir)
-    proj_b = SimpleNamespace(name="b", project_path=tmp_path / "src-b", data_path=proj_b_dir)
+    proj_a = SimpleNamespace(
+        name="a", project_path=tmp_path / "src-a", data_path=proj_a_dir, extra_data_paths=[]
+    )
+    proj_b = SimpleNamespace(
+        name="b", project_path=tmp_path / "src-b", data_path=proj_b_dir, extra_data_paths=[]
+    )
     plugin = FakePlugin("claude", "Claude Code", [proj_a, proj_b])
 
     # Per-project synthetic baselines. Project A has more samples, so its level
