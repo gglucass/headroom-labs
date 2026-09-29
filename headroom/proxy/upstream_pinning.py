@@ -60,38 +60,44 @@ they also accept ``x-headroom-base-url`` -- in which case the refusal is the
 honest answer, and ``HEADROOM_ALLOWED_BASE_URLS`` is the supported way to admit
 specific internal endpoints through a proxy.
 
-A single-user deployment whose ``x-headroom-base-url`` callers are local agent
+A deployment whose ``x-headroom-base-url`` callers are local agent
 integrations (OpenCode, Grok) cannot use that allowlist: it switches the guard
-to allow-only mode, and those callers target whatever provider the user
-configured. ``HEADROOM_ALLOW_PROXIED_GUARDED_UPSTREAMS=1`` opts such a
-deployment back into the pre-pinning behaviour on proxy routes only: the guard
-still judges the name and refuses internal answers, and the request then leaves
-through the proxy, which resolves the target itself. Direct routes stay pinned,
-and every other refusal below is unchanged. Off by default.
+to allow-only mode, and every provider those callers target would have to be
+listed there. ``HEADROOM_PROXIED_BASE_URLS`` (same syntax: bare hosts admit
+every port, URLs their exact origin) names the destinations whose resolution
+the operator is willing to leave to the proxy. A guarded request to one of
+them still has to pass the guard, and then leaves through the proxy by name;
+every other guarded destination is refused on a proxy route exactly as above,
+before the proxy is contacted, so the proxy never gets to resolve a name the
+operator did not choose. Direct routes stay pinned whether or not a host is
+listed. Unset, nothing changes.
 """
 
 from __future__ import annotations
 
-import os
 from collections.abc import Iterable, Iterator
 from typing import Any
 
 import httpcore
 import httpx
 
-from headroom.proxy.upstream_guard import guarded_pin
+from headroom.proxy.upstream_guard import (
+    allowlisted_destinations,
+    destination_listed,
+    guarded_pin,
+)
 
-PROXIED_GUARDED_UPSTREAMS_ENV = "HEADROOM_ALLOW_PROXIED_GUARDED_UPSTREAMS"
+PROXIED_BASE_URLS_ENV = "HEADROOM_PROXIED_BASE_URLS"
 
 
-def proxied_guarded_upstreams_allowed() -> bool:
-    """Whether a guarded upstream may leave through a proxy on its name verdict.
+def proxied_upstream_listed(url: httpx.URL) -> bool:
+    """Whether the operator listed ``url``'s destination in HEADROOM_PROXIED_BASE_URLS.
 
     Read per request, like the guard's own allowlist, so a test or an operator
-    flipping the environment does not need a new client.
+    changing the environment does not need a new client.
     """
-    raw = os.environ.get(PROXIED_GUARDED_UPSTREAMS_ENV, "")
-    return raw.strip().lower() in ("1", "true", "yes", "on")
+    allow = allowlisted_destinations(PROXIED_BASE_URLS_ENV)
+    return allow is not None and destination_listed(allow, url.scheme, url.host, url.port)
 
 
 class UnpinnableUpstreamError(RuntimeError):
@@ -111,7 +117,8 @@ def _refusal(host: str, reason: str) -> UnpinnableUpstreamError:
         "those addresses cannot be enforced on this connection, so the name "
         "would be resolved a second time and could answer differently (DNS "
         "rebinding). Retry the request, or allowlist the endpoint with "
-        "HEADROOM_ALLOWED_BASE_URLS — see headroom/proxy/upstream_pinning.py."
+        "HEADROOM_ALLOWED_BASE_URLS (HEADROOM_PROXIED_BASE_URLS for a proxy "
+        "route) — see headroom/proxy/upstream_pinning.py."
     )
 
 
@@ -213,7 +220,7 @@ class GuardedUpstreamRefusingTransport(httpx.AsyncBaseTransport):
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         host = request.url.host
         if guarded_pin(host) is not None and not (
-            self._via_proxy and proxied_guarded_upstreams_allowed()
+            self._via_proxy and proxied_upstream_listed(request.url)
         ):
             raise _refusal(host, self._reason)
         return await self._inner.handle_async_request(request)
