@@ -5505,6 +5505,7 @@ class ContentRouter(Transform):
         runtime_read_protection_window = kwargs.get("read_protection_window")
         if (
             runtime_read_protection_window is not None
+            and int(runtime_read_protection_window) > 0
             and self.config.protect_recent_reads_fraction > 0
         ):
             # A profile-derived window may only narrow protection when the
@@ -5513,7 +5514,11 @@ class ContentRouter(Transform):
             # See #1374's documented contract: protected tool output must never
             # lossy-compress "regardless of conversation depth" -- a per-request
             # savings-profile kwarg must not silently weaken that.
-            read_protection_window = max(0, int(runtime_read_protection_window))
+            # A window of 0 is "no override", not "protect nothing": it comes
+            # from a profile's protect_recent=0 (coding, general), a positional
+            # guard for cache mode, and would otherwise strip file reads of all
+            # protection in token mode, down to the newest message.
+            read_protection_window = int(runtime_read_protection_window)
 
         # Adaptive compression ratio: scale with context pressure
         if model_limit > 0:
