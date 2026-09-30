@@ -1157,6 +1157,41 @@ _RELEASABLE_READ_TYPES = frozenset(
 )
 
 
+def _codex_exec_envelope_outputs(text: str) -> list[str] | None:
+    """The file text inside a Codex ``exec`` result printed whole, else ``None``.
+
+    Codex code mode runs ``exec`` as JavaScript. A script that prints the whole
+    ``exec_command`` result, ``text(r)`` rather than ``text(r.output)``, sends
+    the JSON envelope ``{"chunk_id", "wall_time_seconds", "exit_code", ...,
+    "output": "<file>"}`` (or a list of them), possibly behind Codex's
+    ``Script completed / Wall time / Output:`` preamble. Judging the envelope
+    would judge a line of JSON-escaped code, whose verdict flips per file
+    between source and releasable JSON; the read is its ``output`` string(s).
+    Only a body that is nothing but envelope(s) is unwrapped.
+    """
+    if '"wall_time_seconds"' not in text:
+        return None
+    body = text.strip()
+    if not body.startswith(("{", "[")):
+        _, found, body = text.partition("\nOutput:\n")
+        body = body.strip()
+        if not found or not body.startswith(("{", "[")):
+            return None
+    try:
+        parsed = json.loads(body)
+    except (ValueError, RecursionError):
+        return None
+    envelopes = parsed if isinstance(parsed, list) else [parsed]
+    outputs = [
+        env["output"]
+        for env in envelopes
+        if isinstance(env, dict)
+        and "wall_time_seconds" in env
+        and isinstance(env.get("output"), str)
+    ]
+    return outputs if outputs and len(outputs) == len(envelopes) else None
+
+
 def _read_output_should_be_protected(text: Any) -> bool:
     """Finalize read-protection by CONTENT — protect by default, release only DATA.
 
@@ -1172,6 +1207,9 @@ def _read_output_should_be_protected(text: Any) -> bool:
     """
     if not isinstance(text, str) or not text:
         return False
+    outputs = _codex_exec_envelope_outputs(text)
+    if outputs is not None:
+        return any(_read_output_should_be_protected(output) for output in outputs)
     try:
         detection = _detect_content(text)
     except Exception:
