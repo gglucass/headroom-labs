@@ -18,7 +18,7 @@ from typing import Any
 from headroom import fsutil
 
 from .base import MCPRegistrar, RegisterResult, RegisterStatus, ServerSpec
-from .codex import _evict_foreign_tables
+from .codex import _evict_foreign_tables, _only_server_changed
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -106,7 +106,8 @@ class GrokRegistrar(MCPRegistrar):
             return False
         marker_start = _marker_start(server_name)
         marker_end = _marker_end(server_name)
-        content = _evict_foreign_tables(self._read_text(), server_name, marker_start, marker_end)
+        original = self._read_text()
+        content = _evict_foreign_tables(original, server_name, marker_start, marker_end)
         if marker_start not in content or marker_end not in content:
             return False
         try:
@@ -120,6 +121,14 @@ class GrokRegistrar(MCPRegistrar):
             new_content = before + "\n\n" + after
         else:
             new_content = (before or after).rstrip("\n") + ("\n" if (before or after) else "")
+        if not _only_server_changed(original, new_content, server_name):
+            logger.warning(
+                "Not removing the Headroom block for %s from %s: the file does not parse, "
+                "or the block holds entries Headroom could not move out safely.",
+                server_name,
+                self._config_file,
+            )
+            return False
         try:
             fsutil.write_text(self._config_file, new_content)
         except OSError:
@@ -144,7 +153,8 @@ class GrokRegistrar(MCPRegistrar):
             self._grok_dir.mkdir(parents=True, exist_ok=True)
             marker_start = _marker_start(spec.name)
             marker_end = _marker_end(spec.name)
-            content = _evict_foreign_tables(self._read_text(), spec.name, marker_start, marker_end)
+            original = self._read_text()
+            content = _evict_foreign_tables(original, spec.name, marker_start, marker_end)
             if marker_start in content and marker_end in content:
                 start = content.index(marker_start)
                 end = content.index(marker_end) + len(marker_end)
@@ -159,6 +169,12 @@ class GrokRegistrar(MCPRegistrar):
                 content = content.rstrip("\n") + "\n\n" + block + "\n"
             else:
                 content = block + "\n"
+            if not _only_server_changed(original, content, spec.name):
+                return RegisterResult(
+                    RegisterStatus.FAILED,
+                    f"{self._config_file} does not parse, or the Headroom block holds "
+                    "entries Headroom could not move out safely; refusing to rewrite it.",
+                )
             fsutil.write_text(self._config_file, content)
         except OSError as exc:
             return RegisterResult(

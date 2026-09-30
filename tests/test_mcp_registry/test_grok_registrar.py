@@ -56,3 +56,40 @@ def test_unregister_keeps_foreign_table_inside_span(tmp_path: Path) -> None:
     assert reg.unregister_server("headroom") is True
 
     assert tomllib.loads(cfg.read_text())["mcp_servers"] == {"other": {"command": "other"}}
+
+
+def _insert_before_end(cfg: Path, text: str) -> None:
+    end = "# --- end Headroom MCP server ---"
+    cfg.write_text(cfg.read_text().replace(end, text + end))
+
+
+def test_unregister_keeps_quoted_key_table_inside_span(tmp_path: Path) -> None:
+    import tomllib
+
+    reg = _make_registrar(tmp_path)
+    reg.register_server(_spec())
+    cfg = tmp_path / ".grok" / "config.toml"
+    _insert_before_end(cfg, '[mcp_servers."foo#bar"]\ncommand = "foreign"\n')
+
+    assert reg.unregister_server("headroom") is True
+
+    assert tomllib.loads(cfg.read_text())["mcp_servers"] == {"foo#bar": {"command": "foreign"}}
+
+
+@pytest.mark.parametrize(
+    "inside_span",
+    ['[notes]\ntext = """\n[mcp_servers.headroom.env]\n"""\n', "broken =\n"],
+)
+def test_refuses_span_rewrite_that_would_change_other_entries(
+    tmp_path: Path, inside_span: str
+) -> None:
+    reg = _make_registrar(tmp_path)
+    reg.register_server(_spec())
+    cfg = tmp_path / ".grok" / "config.toml"
+    _insert_before_end(cfg, inside_span)
+    before = cfg.read_text()
+
+    assert reg.unregister_server("headroom") is False
+    moved = ServerSpec(name="headroom", command="/opt/python", args=_spec().args)
+    assert reg.register_server(moved, force=True).status == RegisterStatus.FAILED
+    assert cfg.read_text() == before

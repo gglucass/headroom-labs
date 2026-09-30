@@ -456,9 +456,14 @@ _APP_TABLES = (
 )
 
 
-def _app_appends_inside_span(cfg: Path) -> None:
+def _app_appends_inside_span(cfg: Path, tables: str = _APP_TABLES.lstrip("\n")) -> None:
     end = "# --- end Headroom MCP server ---"
-    cfg.write_text(cfg.read_text().replace(end, _APP_TABLES.lstrip("\n") + end))
+    cfg.write_text(cfg.read_text().replace(end, tables + end))
+
+
+# A foreign multi-line string holding a line that reads as our header: the
+# line-level move splits the table wrongly, so the rewrite must be refused.
+_UNSPLITTABLE = '[notes]\ntext = """\n[mcp_servers.headroom.env]\n"""\n'
 
 
 def test_unregister_keeps_app_table_inside_span(tmp_path: Path) -> None:
@@ -491,3 +496,31 @@ def test_register_force_keeps_app_table_inside_span(tmp_path: Path) -> None:
     # The app's table now sits outside our span, so the next unregister keeps it too.
     assert reg.unregister_server("headroom") is True
     assert "node_repl" in tomllib.loads(cfg.read_text())["mcp_servers"]
+
+
+def test_unregister_keeps_quoted_key_table_inside_span(tmp_path: Path) -> None:
+    # The `#` in a quoted key is not a comment.
+    reg = _make_registrar(tmp_path)
+    cfg = _config_path(tmp_path)
+    reg.register_server(_spec())
+    _app_appends_inside_span(cfg, '[mcp_servers."foo#bar"]\ncommand = "foreign"\n')
+    assert set(tomllib.loads(cfg.read_text())["mcp_servers"]) == {"headroom", "foo#bar"}
+
+    assert reg.unregister_server("headroom") is True
+
+    assert tomllib.loads(cfg.read_text())["mcp_servers"] == {"foo#bar": {"command": "foreign"}}
+
+
+@pytest.mark.parametrize("inside_span", [_UNSPLITTABLE, "broken =\n"])
+def test_refuses_span_rewrite_that_would_change_other_entries(
+    tmp_path: Path, inside_span: str
+) -> None:
+    reg = _make_registrar(tmp_path)
+    cfg = _config_path(tmp_path)
+    reg.register_server(_spec(env={"HEADROOM_PROXY_URL": "http://127.0.0.1:9999"}))
+    _app_appends_inside_span(cfg, inside_span)
+    before = cfg.read_text()
+
+    assert reg.unregister_server("headroom") is False
+    assert reg.register_server(_spec(), force=True).status == RegisterStatus.FAILED
+    assert cfg.read_text() == before

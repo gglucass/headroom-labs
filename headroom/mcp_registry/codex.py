@@ -43,6 +43,26 @@ def _marker_end(server_name: str) -> str:
     return f"# --- end Headroom MCP server: {server_name} ---"
 
 
+def _table_path(line: str) -> list[str] | None:
+    """Key path of a ``[table]`` or ``[[array]]`` header line, else ``None``.
+
+    Parsed by tomllib so quoted keys (``[mcp_servers."foo#bar"]``) and trailing
+    comments are read as TOML reads them. Only a header line starts with ``[``
+    and parses on its own; a continuation line of a multi-line array does not.
+    """
+    if not line.lstrip().startswith("["):
+        return None
+    try:
+        node: Any = tomllib.loads(line)
+    except tomllib.TOMLDecodeError:
+        return None
+    path: list[str] = []
+    while isinstance(node, dict) and node:
+        key, node = next(iter(node.items()))
+        path.append(key)
+    return path
+
+
 def _evict_foreign_tables(content: str, server_name: str, start: str, end: str) -> str:
     """Move tables Headroom does not own out of its marker span.
 
@@ -50,9 +70,10 @@ def _evict_foreign_tables(content: str, server_name: str, start: str, end: str) 
     trailing comment, so when our span is last in the file (the ChatGPT app's
     ``[mcp_servers.node_repl]`` in ``~/.codex/config.toml``) the table lands
     between our markers and deleting the span would delete it too. Every table
-    other than ``[mcp_servers.<server_name>(.*)]`` is moved, byte for byte and
-    in order, to just after the end marker. The content is returned unchanged
-    if nothing needs moving or if the move would change what the file parses to.
+    other than ``mcp_servers.<server_name>`` and its subtables is moved, byte
+    for byte and in order, to just after the end marker. This is a line-level
+    move, so a header-like line inside a multi-line string can split a table
+    wrongly; callers must check the final result with ``_only_server_changed``.
     """
     lines = content.splitlines(keepends=True)
     try:
@@ -60,27 +81,41 @@ def _evict_foreign_tables(content: str, server_name: str, start: str, end: str) 
         j = next(n for n in range(i + 1, len(lines)) if lines[n].rstrip("\r\n") == end)
     except StopIteration:
         return content
-    owned_prefix = f"[mcp_servers.{server_name}."
     kept: list[str] = []
     foreign: list[str] = []
     in_foreign = False
     for line in lines[i + 1 : j]:
-        code = line.split("#", 1)[0].strip()
-        if code.startswith("[") and code.endswith("]"):
-            in_foreign = code != f"[mcp_servers.{server_name}]" and not code.startswith(
-                owned_prefix
-            )
+        path = _table_path(line)
+        if path is not None:
+            in_foreign = path[:2] != ["mcp_servers", server_name]
         (foreign if in_foreign else kept).append(line)
     if not foreign:
         return content
     end_line = lines[j] if lines[j].endswith("\n") else lines[j] + "\n"
-    moved = "".join(lines[: i + 1] + kept + [end_line] + foreign + lines[j + 1 :])
+    return "".join(lines[: i + 1] + kept + [end_line] + foreign + lines[j + 1 :])
+
+
+def _without_server(data: dict[str, Any], server_name: str) -> dict[str, Any]:
+    servers = data.get("mcp_servers")
+    if not isinstance(servers, dict):
+        return data
+    rest = {k: v for k, v in data.items() if k != "mcp_servers"}
+    others = {k: v for k, v in servers.items() if k != server_name}
+    return {**rest, "mcp_servers": others} if others else rest
+
+
+def _only_server_changed(old: str, new: str, server_name: str) -> bool:
+    """True when ``new`` parses to ``old`` apart from ``mcp_servers.<server_name>``.
+
+    The fail-closed guard for every rewrite of the marker span: a foreign table
+    that could not be moved out of the span, or a file that does not parse,
+    makes this False and the rewrite is refused instead of written.
+    """
     try:
-        if tomllib.loads(moved) != tomllib.loads(content):
-            return content
+        before, after = tomllib.loads(old), tomllib.loads(new)
     except tomllib.TOMLDecodeError:
-        return content
-    return moved
+        return False
+    return _without_server(before, server_name) == _without_server(after, server_name)
 
 
 class CodexRegistrar(MCPRegistrar):
@@ -174,7 +209,8 @@ class CodexRegistrar(MCPRegistrar):
             return False
         marker_start = _marker_start(server_name)
         marker_end = _marker_end(server_name)
-        content = _evict_foreign_tables(self._read_text(), server_name, marker_start, marker_end)
+        original = self._read_text()
+        content = _evict_foreign_tables(original, server_name, marker_start, marker_end)
         if marker_start not in content or marker_end not in content:
             return False
         try:
@@ -188,6 +224,14 @@ class CodexRegistrar(MCPRegistrar):
             new_content = before + "\n\n" + after
         else:
             new_content = (before or after).rstrip("\n") + ("\n" if (before or after) else "")
+        if not _only_server_changed(original, new_content, server_name):
+            logger.warning(
+                "Not removing the Headroom block for %s from %s: the file does not parse, "
+                "or the block holds entries Headroom could not move out safely.",
+                server_name,
+                self._config_file,
+            )
+            return False
         try:
             fsutil.write_text(self._config_file, new_content)
         except OSError:
@@ -249,7 +293,8 @@ class CodexRegistrar(MCPRegistrar):
             self._codex_dir.mkdir(parents=True, exist_ok=True)
             marker_start = _marker_start(spec.name)
             marker_end = _marker_end(spec.name)
-            content = _evict_foreign_tables(self._read_text(), spec.name, marker_start, marker_end)
+            original = self._read_text()
+            content = _evict_foreign_tables(original, spec.name, marker_start, marker_end)
             if marker_start in content and marker_end in content:
                 start = content.index(marker_start)
                 end = content.index(marker_end) + len(marker_end)
@@ -264,6 +309,12 @@ class CodexRegistrar(MCPRegistrar):
                 content = content.rstrip("\n") + "\n\n" + block + "\n"
             else:
                 content = block + "\n"
+            if not _only_server_changed(original, content, spec.name):
+                return RegisterResult(
+                    RegisterStatus.FAILED,
+                    f"{self._config_file} does not parse, or the Headroom block holds "
+                    "entries Headroom could not move out safely; refusing to rewrite it.",
+                )
             fsutil.write_text(self._config_file, content)
         except OSError as exc:
             return RegisterResult(
