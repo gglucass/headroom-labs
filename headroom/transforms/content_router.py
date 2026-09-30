@@ -3704,7 +3704,11 @@ class ContentRouter(Transform):
                         )
                         if output is not None and output.compressed:
                             compressed = output.content
-                            compressed_tokens = len(output.content.split())
+                            # Tokens, like ``original_tokens`` and every other
+                            # branch: a word count here (code runs ~2.2
+                            # tokens/word) made an unchanged block look like a
+                            # 55% compression and no fallback could beat it.
+                            compressed_tokens = _estimate_tokens(output.content)
                             decision_reason = "code_aware"
                 if compressed is None:
                     # Fallback to Kompress
@@ -3728,19 +3732,17 @@ class ContentRouter(Transform):
                     # lossless has no savings. Reads are protected upstream, so
                     # only NON-read code reaches here. Keep Kompress ONLY if it
                     # actually shrinks (never inflate).
-                    _k, _kt = self._try_ml_compressor(content, context, question)
-                    if (
-                        _k is not None
-                        and _kt is not None
-                        and _kt < original_tokens
-                        and len(_k) < len(content)
-                    ):
+                    # Recorded as tried even if it loses, so the no-savings
+                    # fallback below does not run the same inference again.
+                    strategy_chain.append(CompressionStrategy.KOMPRESS.value)
+                    _k, _ = self._try_ml_compressor(content, context, question)
+                    _kt = _estimate_tokens(_k)
+                    if _kt < original_tokens and len(_k) < len(content):
                         compressed, compressed_tokens = _k, _kt
                         strategy = CompressionStrategy.KOMPRESS
                         actual_strategy = strategy
                         compressor_name = "KompressCompressor"
                         decision_reason = "code_aware_no_shrink_fallback_kompress"
-                        strategy_chain.append(CompressionStrategy.KOMPRESS.value)
 
             elif strategy == CompressionStrategy.SMART_CRUSHER:
                 # SmartCrusher handles its own TOIN recording
@@ -3965,9 +3967,11 @@ class ContentRouter(Transform):
                 already_tried_kompress = CompressionStrategy.KOMPRESS.value in strategy_chain
                 if not already_tried_kompress:
                     strategy_chain.append(CompressionStrategy.KOMPRESS.value)
-                    fallback_compressed, fallback_tokens = self._try_ml_compressor(
-                        content, context, question
-                    )
+                    fallback_compressed, _ = self._try_ml_compressor(content, context, question)
+                    # Measure with the router's estimator, the unit of
+                    # ``compressed_tokens``. Kompress reports a passthrough in
+                    # WORDS, which would let an unchanged block "win".
+                    fallback_tokens = _estimate_tokens(fallback_compressed)
                 else:
                     fallback_compressed = compressed
                     fallback_tokens = compressed_tokens
@@ -5505,6 +5509,7 @@ class ContentRouter(Transform):
         runtime_read_protection_window = kwargs.get("read_protection_window")
         if (
             runtime_read_protection_window is not None
+            and int(runtime_read_protection_window) > 0
             and self.config.protect_recent_reads_fraction > 0
         ):
             # A profile-derived window may only narrow protection when the
@@ -5513,7 +5518,11 @@ class ContentRouter(Transform):
             # See #1374's documented contract: protected tool output must never
             # lossy-compress "regardless of conversation depth" -- a per-request
             # savings-profile kwarg must not silently weaken that.
-            read_protection_window = max(0, int(runtime_read_protection_window))
+            # A window of 0 is "no override", not "protect nothing": it comes
+            # from a profile's protect_recent=0 (coding, general), a positional
+            # guard for cache mode, and would otherwise strip file reads of all
+            # protection in token mode, down to the newest message.
+            read_protection_window = int(runtime_read_protection_window)
 
         # Adaptive compression ratio: scale with context pressure
         if model_limit > 0:
