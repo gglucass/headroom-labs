@@ -60,7 +60,7 @@ from ..config import (
     RelevanceScorerConfig,
     TransformResult,
     is_tool_excluded,
-    unwrap_tool_call_name,
+    unwrap_tool_call,
 )
 from ..parser import CCR_RETRIEVAL_MARKER_RE
 from ..tokenizer import Tokenizer
@@ -1173,10 +1173,16 @@ def _read_output_should_be_protected(text: Any) -> bool:
     if not isinstance(text, str) or not text:
         return False
     try:
-        return _detect_content(text).content_type not in _RELEASABLE_READ_TYPES
+        detection = _detect_content(text)
     except Exception:
         # Detection failure → protect (preserve the byte-exact default).
         return True
+    if detection.metadata.get("format") == "fixed_width":
+        # Space-aligned columns are also what hand-aligned files look like
+        # (/etc/fstab, a block of C #defines), so a READ of one stays
+        # byte-exact. Only delimited and markdown tables are released.
+        return True
+    return detection.content_type not in _RELEASABLE_READ_TYPES
 
 
 def _create_content_signature(
@@ -1959,14 +1965,14 @@ class ContentRouter(Transform):
 
     name: str = "content_router"
 
-    # Lossy summarizers that emit a CCR retrieve marker only when they store the
-    # original — a marker-less result from one of these is unrecoverable. Tool
-    # ground truth (role="tool") must not be replaced by such a result (#1307).
+    # Lossy transforms that discard source data need a CCR retrieval marker;
+    # without one, tool ground truth must remain unchanged (#1307).
     LOSSY_UNMARKED_STRATEGIES = frozenset(
         {
             CompressionStrategy.KOMPRESS,
             CompressionStrategy.TEXT,
             CompressionStrategy.CODE_AWARE,
+            CompressionStrategy.HTML,
         }
     )
 
@@ -3941,10 +3947,13 @@ class ContentRouter(Transform):
 
         # If compression succeeded, record to TOIN
         if compressed is not None and compressed_tokens is not None:
+            # TABULAR is deliberately absent: a table the tabular compressor
+            # declined (ragged rows, #1652) or could not shrink stays verbatim.
+            # Kompress drops words inside rows, so it would remove fields from
+            # some rows and not others with nothing marking which (#3652).
             fallback_eligible_strategy = strategy in {
                 CompressionStrategy.SMART_CRUSHER,
                 CompressionStrategy.CODE_AWARE,
-                CompressionStrategy.TABULAR,
                 CompressionStrategy.CONFIG,
             }
             fallback_no_savings = compressed == content or compressed_tokens >= original_tokens
@@ -4024,8 +4033,8 @@ class ContentRouter(Transform):
             # actually shorter — never inflating, never doing worse than the
             # strategy output. DIFF is excluded (Kompress corrupts ``git
             # apply``); TEXT/KOMPRESS already ran Kompress; CODE_AWARE has its
-            # own inline no-shrink fallback; SMART_CRUSHER/TABULAR use the
-            # zero-savings fallback above.
+            # own inline no-shrink fallback; SMART_CRUSHER uses the
+            # zero-savings fallback above; TABULAR never goes to Kompress.
             if (
                 self._lossless_then_lossy
                 and compressed is not None
@@ -5060,16 +5069,17 @@ class ContentRouter(Transform):
                     tc_id = tc.get("id", "")
                     fn = tc.get("function", {})
                     name = fn.get("name", "")
+                    call_args = fn.get("arguments")
                     if name:
                         # Hermes deferred tools arrive wrapped as `tool_call`
-                        # with the real name inside the arguments payload.
-                        name = unwrap_tool_call_name(name, fn.get("arguments"))
+                        # with the real name and arguments inside the payload.
+                        name, call_args = unwrap_tool_call(name, call_args)
                     if tc_id and name:
                         mapping[tc_id] = name
-                        args = _tool_call_args_text(fn.get("arguments"))
+                        args = _tool_call_args_text(call_args)
                         if args:
                             args_map[tc_id] = args
-                        command = _tool_call_command_text(fn.get("arguments"))
+                        command = _tool_call_command_text(call_args)
                         if command:
                             commands_map[tc_id] = command
 
@@ -5080,16 +5090,17 @@ class ContentRouter(Transform):
                     if isinstance(block, dict) and block.get("type") == "tool_use":
                         tc_id = block.get("id", "")
                         name = block.get("name", "")
+                        call_input = block.get("input")
                         if name:
                             # Hermes deferred tools arrive wrapped as `tool_call`
-                            # with the real name inside the input payload.
-                            name = unwrap_tool_call_name(name, block.get("input"))
+                            # with the real name and arguments inside the input.
+                            name, call_input = unwrap_tool_call(name, call_input)
                         if tc_id and name:
                             mapping[tc_id] = name
-                            args = _tool_call_args_text(block.get("input"))
+                            args = _tool_call_args_text(call_input)
                             if args:
                                 args_map[tc_id] = args
-                            command = _tool_call_command_text(block.get("input"))
+                            command = _tool_call_command_text(call_input)
                             if command:
                                 commands_map[tc_id] = command
 
@@ -6173,8 +6184,8 @@ class ContentRouter(Transform):
                 else:
                     accept_ratio = result.compression_ratio
                 if accept_ratio < min_ratio:
-                    # tool ground truth must stay reversible — a lossy summarizer
-                    # (kompress/text/code) that emitted no CCR retrieve marker is
+                    # tool ground truth must stay reversible — a lossy transform
+                    # (kompress/text/code/html) that emitted no CCR retrieve marker is
                     # unrecoverable, so the agent would act on a fabricated summary
                     # (#1307). Keep the original verbatim instead.
                     if (
@@ -7206,8 +7217,8 @@ class ContentRouter(Transform):
                 self._record_frozen_verdict(content_key, True)
             return result.compressed, True
         if result.compression_ratio < min_ratio:
-            # Tool ground truth must stay reversible: a lossy summarizer
-            # (kompress/text/code) that emitted no CCR retrieve marker is
+            # Tool ground truth must stay reversible: a lossy transform
+            # (kompress/text/code/html) that emitted no CCR retrieve marker is
             # unrecoverable, so the agent would act on a fabricated summary
             # (#1307). The string/`role=="tool"` path guards this; mirror it
             # here for tool_result blocks (never cached, so the Tier-2 path

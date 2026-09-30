@@ -19,6 +19,29 @@ import pytest
 from tests._skip_helpers import external_model_skip_reason
 
 
+@pytest.fixture(autouse=True)
+def _undo_process_trust_injection():
+    """Undo ``truststore.inject_into_ssl()`` after any test that triggered it.
+
+    Invoking the CLI (``CliRunner`` on ``main``) or starting the proxy calls
+    ``ensure_process_trust()``, which swaps ``ssl.SSLContext`` process-wide.
+    Left in place it leaks into later tests (server-side test contexts, OpenSSL
+    store stats), so restore the stdlib class after each test.
+    """
+    yield
+    try:
+        from headroom.proxy import ssl_context
+    except Exception:
+        return
+    os.environ.pop(ssl_context.PROCESS_TRUST_ENV, None)
+    ssl_context._system_ctx_cache.clear()
+    if ssl_context._process_trust_injected:
+        import truststore
+
+        truststore.extract_from_ssl()
+        ssl_context._process_trust_injected = False
+
+
 # A live `headroom` dev session exports HEADROOM_* into the shell (and the
 # Claude wrap adds ANTHROPIC_CUSTOM_HEADERS). Click `envvar=` options pick
 # those up inside CliRunner, so assertions would see the developer's proxy
@@ -65,6 +88,17 @@ def _scrub_developer_headroom_env(monkeypatch, tmp_path):
 @pytest.fixture(autouse=True)
 def _disable_telemetry_beacon(monkeypatch, _scrub_developer_headroom_env):
     monkeypatch.setenv("HEADROOM_BEACON", "off")
+
+
+# `wrap`/`init`/`doctor` probe loopback ports (and read deployment manifests)
+# to find a live Headroom proxy when --port is left at its default. A
+# developer's running proxy would make CLI tests non-deterministic, so
+# discovery is off unless a test turns it back on. A developer's CODEX_HOME
+# would likewise redirect every Codex path helper away from the test's tmp home.
+@pytest.fixture(autouse=True)
+def _disable_live_proxy_discovery(monkeypatch, _scrub_developer_headroom_env):
+    monkeypatch.setenv("HEADROOM_PORT_DISCOVERY", "0")
+    monkeypatch.delenv("CODEX_HOME", raising=False)
 
 
 # The MCP install ledger defaults to ``~/.headroom/mcp_installs.json``, so any

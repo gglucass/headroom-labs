@@ -93,7 +93,11 @@ from headroom.proxy.tool_definition_serialization import (
     serialize_tool_definition_canonical as _serialize_tool_definition_canonical,
 )
 from headroom.proxy.tool_injection_config import (
+    CcrToolInjectionMode,
     ToolInjectionStickyMode,
+)
+from headroom.proxy.tool_injection_config import (
+    get_ccr_tool_injection_mode as _get_ccr_tool_injection_mode,
 )
 from headroom.proxy.tool_injection_config import (
     get_tool_injection_sticky_mode as _get_tool_injection_sticky_mode,
@@ -2287,6 +2291,15 @@ def get_tool_injection_sticky_mode() -> ToolInjectionStickyMode:
     return _get_tool_injection_sticky_mode()
 
 
+def get_ccr_tool_injection_mode() -> CcrToolInjectionMode:
+    """Return when the CCR retrieval tool enters the tools array.
+
+    Read at request time so operators can flip behaviour without a restart.
+    Unknown values raise loudly per the no-silent-fallback build constraint.
+    """
+    return _get_ccr_tool_injection_mode()
+
+
 def get_tool_tracker_max_sessions() -> int:
     """Return the LRU bound for `SessionToolTracker` (sessions cap)."""
     return _get_tool_tracker_max_sessions()
@@ -2390,6 +2403,7 @@ def apply_session_sticky_memory_tools(
     existing_tools: list[dict[str, Any]] | None,
     memory_tools_to_inject: list[dict[str, Any]],
     inject_this_turn: bool,
+    client_declared_tools: bool = True,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Apply sticky-on memory tool injection per `SessionToolTracker`.
 
@@ -2418,6 +2432,11 @@ def apply_session_sticky_memory_tools(
     ``inject_this_turn`` flag drives the decision verbatim. We log the
     bypass once so operators can see it.
 
+    ``client_declared_tools`` is False when the inbound request omitted
+    tools or explicitly sent an empty list. In that case memory tools are
+    never added, including sticky replay, because the client cannot service
+    them.
+
     Returns ``(updated_tools, was_injected)``. The returned list is a
     fresh list (caller-safe). ``was_injected`` is True iff at least one
     memory tool was added to the list.
@@ -2426,6 +2445,16 @@ def apply_session_sticky_memory_tools(
         raise ValueError(f"unsupported provider: {provider!r}")
 
     tools_out: list[dict[str, Any]] = list(existing_tools) if existing_tools else []
+    if not client_declared_tools:
+        log_tool_injection_decision(
+            provider=provider,
+            session_id=session_id,
+            decision="skip_no_client_tools",
+            tool_definition_bytes_count=0,
+            request_id=request_id,
+        )
+        return tools_out, False
+
     existing_names: set[str] = set()
     for t in tools_out:
         n = _extract_tool_name(t)
@@ -2686,6 +2715,7 @@ def apply_session_sticky_ccr_tool(
     existing_tools: list[dict[str, Any]] | None,
     has_compressed_content_this_turn: bool,
     history_has_ccr_reference: bool = False,
+    allow_eager: bool = False,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Apply sticky-on CCR retrieval-tool injection per :class:`SessionCcrTracker`.
 
@@ -2741,7 +2771,9 @@ def apply_session_sticky_ccr_tool(
     # definition and the provider rejects the request because history still
     # references it (#2440).
     if not session_id:
-        if not (has_compressed_content_this_turn or history_has_ccr_reference):
+        # See the fresh-session branch below for what gates eager injection.
+        eager = allow_eager and bool(tools_out) and get_ccr_tool_injection_mode() == "eager"
+        if not (eager or has_compressed_content_this_turn or history_has_ccr_reference):
             log_tool_injection_decision(
                 provider=provider,
                 session_id=None,
@@ -2757,7 +2789,7 @@ def apply_session_sticky_ccr_tool(
             session_id=None,
             decision="inject_first_time"
             if has_compressed_content_this_turn
-            else "inject_history_reference",
+            else ("inject_history_reference" if history_has_ccr_reference else "inject_eager"),
             tool_definition_bytes_count=len(replay.canonical_bytes),
             request_id=request_id,
         )
@@ -2807,8 +2839,37 @@ def apply_session_sticky_ccr_tool(
         )
         return tools_out, True
 
-    # Fresh session — only inject when this turn produced compressed content.
-    if not has_compressed_content_this_turn:
+    # Fresh session. `tools` is the head of Anthropic's cache key, so the
+    # moment this tool enters the array decides what it costs. Waiting for the
+    # first compression means entering against a fully warm prefix and
+    # invalidating all of it — measured on a customer session at 113,888 tokens
+    # of cache write to save 2,205 tokens of content, a ~594-turn payback that
+    # no session reaches. The definition is ~119 tokens; injecting it on the
+    # first request instead folds that cost into the cache write the session
+    # was always going to pay, and the array never changes again.
+    #
+    # The historical gate is still reachable via HEADROOM_CCR_TOOL_INJECTION=lazy
+    # for operators who would rather keep the tool out of conversations that
+    # never compress. A spurious call costs a round trip, not an error: an
+    # unknown hash resolves to a structured {"status": "missing"} tool result
+    # (see CCRResponseHandler._execute_retrieval), not an exception or a 400.
+    #
+    # Eager injection needs three things to be true, because it is the one path
+    # that touches the tools array before anything has been compressed:
+    #
+    #   allow_eager -- the caller confirms it may rewrite this request's tools
+    #     at all. Under `--no-optimize` or a bypass header nothing will ever be
+    #     compressed, so the tool would be permanently unredeemable; the old
+    #     gate got this for free because no compression meant no injection.
+    #   a non-empty client tools array -- adding the first entry would turn a
+    #     no-tools request into a tools request and let the model emit tool_use
+    #     blocks the client never expected (#728). Such a client also has no
+    #     tool results to compress, so there is no warm tools segment to
+    #     protect. The cache problem is a harness problem, and harnesses always
+    #     send tools.
+    #   the eager mode -- operators can restore the historical gate.
+    eager = allow_eager and bool(tools_out) and get_ccr_tool_injection_mode() == "eager"
+    if not (eager or has_compressed_content_this_turn):
         log_tool_injection_decision(
             provider=provider,
             session_id=session_id,
@@ -2824,7 +2885,7 @@ def apply_session_sticky_ccr_tool(
     log_tool_injection_decision(
         provider=provider,
         session_id=session_id,
-        decision="inject_first_time",
+        decision="inject_first_time" if has_compressed_content_this_turn else "inject_eager",
         tool_definition_bytes_count=len(replay.canonical_bytes),
         request_id=request_id,
     )
@@ -2832,7 +2893,7 @@ def apply_session_sticky_ccr_tool(
 
 
 class RequestBodyTooLarge(ValueError):
-    """A decompressed request body exceeded :data:`MAX_DECOMPRESSED_BODY_SIZE`.
+    """A raw or decompressed request body exceeded its size ceiling.
 
     Subclasses ``ValueError`` so every existing ``except ValueError`` call site
     keeps answering 400 unchanged, while giving a caller that would rather
@@ -2963,8 +3024,9 @@ async def _read_request_body_bytes(request: Request) -> bytes:
     encoding = (request.headers.get("content-encoding") or "").lower().strip()
 
     # Content-Length is an optimization only, not the enforcement boundary: it
-    # can be absent, understated, or belong to a chunked transfer. The
-    # streaming loop below is what actually bounds every case (#3479).
+    # can be absent, understated, or belong to a chunked transfer (the
+    # original gap this fixes, #3326). The streaming loop below is what
+    # actually bounds every case, chunked or not (#3479).
     content_length = request.headers.get("content-length")
     if content_length is not None:
         try:
@@ -2986,8 +3048,9 @@ async def _read_request_body_bytes(request: Request) -> bytes:
             )
     raw: bytes = bytes(chunks)
     # Cache like Starlette's own body() would, so any other .body() caller on
-    # this request (there is none today, but future callers get the same
-    # semantics) sees the bytes already read rather than a consumed stream.
+    # this request (e.g. a handler's except-branch falling open to a verbatim
+    # forward after a decode failure) sees the bytes already read rather than
+    # a consumed stream.
     request._body = raw
 
     # Every branch below decompresses incrementally against
