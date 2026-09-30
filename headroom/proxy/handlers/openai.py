@@ -56,7 +56,7 @@ import httpx
 
 from headroom.agent_savings import proxy_pipeline_kwargs
 from headroom.ccr.marker_resolution import resolve_markers_in_response
-from headroom.config import unwrap_tool_call_name
+from headroom.config import is_tool_excluded, unwrap_tool_call_name
 from headroom.copilot_auth import (
     apply_copilot_api_auth,
     build_copilot_upstream_url,
@@ -192,6 +192,17 @@ def _codex_ws_compression_timeout_seconds() -> float:
 _WS_ALLOWED_ORIGINS_ENV = "HEADROOM_WS_ORIGINS"
 _CORS_ALLOWED_ORIGINS_ENV = "HEADROOM_CORS_ORIGINS"
 _CODEX_RESPONSES_LITE_HEADER = "x-openai-internal-codex-responses-lite"
+# Memory-tool injection needs affirmative protocol evidence. A caller that
+# explicitly supplies tools is handled separately at each endpoint; when the
+# caller omits them, only a real client known to support Headroom's memory
+# tools may opt in.
+_KNOWN_TOOL_CAPABLE_CLIENTS = frozenset({"codex"})
+
+
+def _client_can_receive_memory_tools(client: str | None) -> bool:
+    return client in _KNOWN_TOOL_CAPABLE_CLIENTS
+
+
 # Codex mirrors the responses-lite request header into the response.create
 # frame body under client_metadata; upstream rejects gpt-5.x when it is
 # truthy. Stripping the WS handshake header alone is insufficient
@@ -2177,9 +2188,10 @@ class OpenAIHandlerMixin:
                 name = unwrap_tool_call_name(name, item.get("arguments") or item.get("input"))
             if isinstance(name, str) and isinstance(call_id, str) and call_id:
                 function_name_by_call_id[call_id] = name
-            if isinstance(name, str) and (
-                name == "headroom_retrieve" or name.endswith("__headroom_retrieve")
-            ):
+            # Same matcher ContentRouter uses for its ccr_retrieve guard, so the
+            # MCP alias forms (mcp__srv__x, Hermes' mcp_srv_x, OpenCode's
+            # headroom_headroom_retrieve) are recognized here too.
+            if isinstance(name, str) and is_tool_excluded(name, ("headroom_retrieve",)):
                 if isinstance(call_id, str) and call_id:
                     headroom_retrieve_call_ids.add(call_id)
 
@@ -2191,7 +2203,6 @@ class OpenAIHandlerMixin:
             DEFAULT_BYTE_EXACT_EXCLUDE_TOOLS,
             DEFAULT_EXCLUDE_TOOLS,
             DEFAULT_VERBATIM_EXCLUDE_TOOLS,
-            is_tool_excluded,
         )
 
         router_exclude_tools = getattr(router.config, "exclude_tools", None)
@@ -4352,6 +4363,7 @@ class OpenAIHandlerMixin:
                     existing_tools=tools,
                     memory_tools_to_inject=memory_tool_defs,
                     inject_this_turn=bool(self.memory_handler.config.inject_tools),
+                    client_declared_tools=bool(_original_tools),
                 )
                 if mem_tools_injected:
                     memory_tools_injected = True
@@ -5842,6 +5854,14 @@ class OpenAIHandlerMixin:
         headers, is_chatgpt_auth = _resolve_codex_routing_headers(headers)
         if is_chatgpt_auth:
             client = "codex"
+        memory_client = (
+            "codex"
+            if is_chatgpt_auth
+            else (None if request.scope.get("headroom_codex_client_stamped") else client)
+        )
+        client_declared_response_tools = bool(
+            body.get("tools")
+        ) or _client_can_receive_memory_tools(memory_client)
         if _ensure_chatgpt_responses_store_false(body, is_chatgpt_auth=is_chatgpt_auth):
             logger.info(f"[{request_id}] Responses: forced store=false for ChatGPT auth")
         responses_memory_tools_allowed = _allow_responses_memory_tools(is_chatgpt_auth)
@@ -6112,6 +6132,7 @@ class OpenAIHandlerMixin:
                         existing_tools=resp_tools,
                         memory_tools_to_inject=memory_tool_defs_responses,
                         inject_this_turn=bool(self.memory_handler.config.inject_tools),
+                        client_declared_tools=client_declared_response_tools,
                     )
                     if mem_tools_injected:
                         body["tools"] = resp_tools
@@ -7101,7 +7122,9 @@ class OpenAIHandlerMixin:
         # WS sessions bypass the HTTP middleware that stamps X-Client: codex on
         # the Responses endpoint, so apply the same path-based stamp here before
         # classify_client runs (parallels server.py / should_stamp_codex_client).
-        if should_stamp_codex_client(_ws_path, ws_headers):
+        codex_client_was_stamped = should_stamp_codex_client(_ws_path, ws_headers)
+        raw_client = classify_client(ws_headers)
+        if codex_client_was_stamped:
             ws_headers["x-client"] = "codex"
         # Identify the WS harness before downstream auth/header rewrites.
         # Captured in closure so per-turn RequestOutcome can stamp it.
@@ -7186,6 +7209,9 @@ class OpenAIHandlerMixin:
         )
 
         upstream_headers, is_chatgpt_auth = _resolve_codex_routing_headers(upstream_headers)
+        memory_client = (
+            "codex" if is_chatgpt_auth else (None if codex_client_was_stamped else raw_client)
+        )
         # OpenAI rejects newer Codex models when this client-only lite header leaks upstream.
         upstream_headers = {
             key: value
@@ -7807,6 +7833,9 @@ class OpenAIHandlerMixin:
                         t.get("name") or t.get("function", {}).get("name", "?")
                         for t in (ws_response_body.get("tools") or [])
                     ]
+                    client_declared_ws_tools = bool(
+                        ws_response_body.get("tools")
+                    ) or _client_can_receive_memory_tools(memory_client)
                     instr_preview = (ws_response_body.get("instructions") or "")[:200]
                     logger.info(
                         f"[{request_id}] WS Memory: Codex tools={existing_tool_names}, "
@@ -7927,6 +7956,7 @@ class OpenAIHandlerMixin:
                         inject_this_turn=bool(
                             self.memory_handler.config.inject_tools and ws_memory_tools_allowed
                         ),
+                        client_declared_tools=client_declared_ws_tools,
                     )
                     if mem_injected:
                         ws_response_body["tools"] = ws_tools

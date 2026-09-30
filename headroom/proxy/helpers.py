@@ -2403,6 +2403,7 @@ def apply_session_sticky_memory_tools(
     existing_tools: list[dict[str, Any]] | None,
     memory_tools_to_inject: list[dict[str, Any]],
     inject_this_turn: bool,
+    client_declared_tools: bool = True,
 ) -> tuple[list[dict[str, Any]], bool]:
     """Apply sticky-on memory tool injection per `SessionToolTracker`.
 
@@ -2431,6 +2432,11 @@ def apply_session_sticky_memory_tools(
     ``inject_this_turn`` flag drives the decision verbatim. We log the
     bypass once so operators can see it.
 
+    ``client_declared_tools`` is False when the inbound request omitted
+    tools or explicitly sent an empty list. In that case memory tools are
+    never added, including sticky replay, because the client cannot service
+    them.
+
     Returns ``(updated_tools, was_injected)``. The returned list is a
     fresh list (caller-safe). ``was_injected`` is True iff at least one
     memory tool was added to the list.
@@ -2439,6 +2445,16 @@ def apply_session_sticky_memory_tools(
         raise ValueError(f"unsupported provider: {provider!r}")
 
     tools_out: list[dict[str, Any]] = list(existing_tools) if existing_tools else []
+    if not client_declared_tools:
+        log_tool_injection_decision(
+            provider=provider,
+            session_id=session_id,
+            decision="skip_no_client_tools",
+            tool_definition_bytes_count=0,
+            request_id=request_id,
+        )
+        return tools_out, False
+
     existing_names: set[str] = set()
     for t in tools_out:
         n = _extract_tool_name(t)
@@ -2877,7 +2893,7 @@ def apply_session_sticky_ccr_tool(
 
 
 class RequestBodyTooLarge(ValueError):
-    """A decompressed request body exceeded :data:`MAX_DECOMPRESSED_BODY_SIZE`.
+    """A raw or decompressed request body exceeded its size ceiling.
 
     Subclasses ``ValueError`` so every existing ``except ValueError`` call site
     keeps answering 400 unchanged, while giving a caller that would rather
@@ -3008,8 +3024,9 @@ async def _read_request_body_bytes(request: Request) -> bytes:
     encoding = (request.headers.get("content-encoding") or "").lower().strip()
 
     # Content-Length is an optimization only, not the enforcement boundary: it
-    # can be absent, understated, or belong to a chunked transfer. The
-    # streaming loop below is what actually bounds every case (#3479).
+    # can be absent, understated, or belong to a chunked transfer (the
+    # original gap this fixes, #3326). The streaming loop below is what
+    # actually bounds every case, chunked or not (#3479).
     content_length = request.headers.get("content-length")
     if content_length is not None:
         try:
@@ -3031,8 +3048,9 @@ async def _read_request_body_bytes(request: Request) -> bytes:
             )
     raw: bytes = bytes(chunks)
     # Cache like Starlette's own body() would, so any other .body() caller on
-    # this request (there is none today, but future callers get the same
-    # semantics) sees the bytes already read rather than a consumed stream.
+    # this request (e.g. a handler's except-branch falling open to a verbatim
+    # forward after a decode failure) sees the bytes already read rather than
+    # a consumed stream.
     request._body = raw
 
     # Every branch below decompresses incrementally against

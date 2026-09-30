@@ -90,6 +90,17 @@ def _disable_telemetry_beacon(monkeypatch, _scrub_developer_headroom_env):
     monkeypatch.setenv("HEADROOM_BEACON", "off")
 
 
+# `wrap`/`init`/`doctor` probe loopback ports (and read deployment manifests)
+# to find a live Headroom proxy when --port is left at its default. A
+# developer's running proxy would make CLI tests non-deterministic, so
+# discovery is off unless a test turns it back on. A developer's CODEX_HOME
+# would likewise redirect every Codex path helper away from the test's tmp home.
+@pytest.fixture(autouse=True)
+def _disable_live_proxy_discovery(monkeypatch, _scrub_developer_headroom_env):
+    monkeypatch.setenv("HEADROOM_PORT_DISCOVERY", "0")
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+
+
 # The MCP install ledger defaults to ``~/.headroom/mcp_installs.json``, so any
 # test that registers a server (directly or through `wrap`) writes into the
 # developer's REAL ledger — observed adding a live `claude/serena` entry during a
