@@ -219,15 +219,24 @@ def test_protect_tool_results_survives_runtime_read_protection_window_kwarg() ->
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("trailing_turns", [0, 20])
+@pytest.mark.parametrize(
+    ("trailing_turns", "window", "protected"),
+    [
+        (0, None, True),  # newest Read, the profile's window of 0
+        (1, None, True),  # 3 from the end, inside max(4, 0.3*n)
+        (1, 2, False),  # a positive profile window still narrows it
+        (20, None, False),  # past the 0.3 window: ages out
+    ],
+)
 def test_token_mode_coding_profile_keeps_recent_read_byte_exact(
-    trailing_turns: int, monkeypatch: pytest.MonkeyPatch
+    trailing_turns: int, window: int | None, protected: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The coding profile's protect_recent=0 reaches the router as
     read_protection_window=0. In token mode (fraction 0.3) that used to replace
     the max(4, 0.3*n) window with 0, so a `Read` result lossy-compressed even
     as the newest message. Recent reads must stay byte-exact; reads past the
-    fraction window still age out to compression."""
+    fraction window still age out to compression, and a positive profile
+    window still narrows the fraction window."""
     pytest.importorskip("tiktoken")
 
     from types import SimpleNamespace
@@ -284,14 +293,16 @@ def test_token_mode_coding_profile_keeps_recent_read_byte_exact(
 
     kwargs = proxy_pipeline_kwargs(proxy.config)
     assert kwargs["read_protection_window"] == 0
+    if window is not None:
+        kwargs["read_protection_window"] = window
     result = router.apply(messages, tokenizer, **kwargs)
 
     content = result.messages[2]["content"][0]["content"]
-    if trailing_turns == 0:
-        assert content == read_output, "newest Read must stay byte-exact in token mode"
+    if protected:
+        assert content == read_output, "a recent Read must stay byte-exact in token mode"
         assert "router:excluded:tool" in result.transforms_applied
     else:
-        assert content != read_output, "a Read past the 0.3 window still ages out"
+        assert content != read_output, "a Read outside the window still ages out"
 
 
 # ---------------------------------------------------------------------------
