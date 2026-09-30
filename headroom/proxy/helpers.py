@@ -4286,7 +4286,19 @@ def strip_unsupported_ccr_retrieve_blocks(messages: Any, tools: Any) -> tuple[An
         if touched:
             changed = True
             repaired = dict(message)
-            repaired["content"] = new_content
+            # Anthropic requires a user turn's tool_result blocks to lead its
+            # content. When headroom_retrieve ran in parallel with another tool,
+            # neutralizing its result in place leaves [text, tool_result(sibling)]
+            # and the request 400s ("tool_use ids were found without tool_result
+            # blocks immediately after"). Stable-partition so surviving
+            # tool_results stay first; a no-op for assistant turns, which carry none.
+            repaired["content"] = [
+                b for b in new_content if isinstance(b, dict) and b.get("type") == "tool_result"
+            ] + [
+                b
+                for b in new_content
+                if not (isinstance(b, dict) and b.get("type") == "tool_result")
+            ]
             out.append(repaired)
         else:
             out.append(message)
