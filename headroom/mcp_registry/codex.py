@@ -43,6 +43,46 @@ def _marker_end(server_name: str) -> str:
     return f"# --- end Headroom MCP server: {server_name} ---"
 
 
+def _evict_foreign_tables(content: str, server_name: str, start: str, end: str) -> str:
+    """Move tables Headroom does not own out of its marker span.
+
+    Another app's TOML writer appends a new table before the document's
+    trailing comment, so when our span is last in the file (the ChatGPT app's
+    ``[mcp_servers.node_repl]`` in ``~/.codex/config.toml``) the table lands
+    between our markers and deleting the span would delete it too. Every table
+    other than ``[mcp_servers.<server_name>(.*)]`` is moved, byte for byte and
+    in order, to just after the end marker. The content is returned unchanged
+    if nothing needs moving or if the move would change what the file parses to.
+    """
+    lines = content.splitlines(keepends=True)
+    try:
+        i = next(n for n, line in enumerate(lines) if line.rstrip("\r\n") == start)
+        j = next(n for n in range(i + 1, len(lines)) if lines[n].rstrip("\r\n") == end)
+    except StopIteration:
+        return content
+    owned_prefix = f"[mcp_servers.{server_name}."
+    kept: list[str] = []
+    foreign: list[str] = []
+    in_foreign = False
+    for line in lines[i + 1 : j]:
+        code = line.split("#", 1)[0].strip()
+        if code.startswith("[") and code.endswith("]"):
+            in_foreign = code != f"[mcp_servers.{server_name}]" and not code.startswith(
+                owned_prefix
+            )
+        (foreign if in_foreign else kept).append(line)
+    if not foreign:
+        return content
+    end_line = lines[j] if lines[j].endswith("\n") else lines[j] + "\n"
+    moved = "".join(lines[: i + 1] + kept + [end_line] + foreign + lines[j + 1 :])
+    try:
+        if tomllib.loads(moved) != tomllib.loads(content):
+            return content
+    except tomllib.TOMLDecodeError:
+        return content
+    return moved
+
+
 class CodexRegistrar(MCPRegistrar):
     """Register MCP servers with the OpenAI Codex CLI."""
 
@@ -132,9 +172,9 @@ class CodexRegistrar(MCPRegistrar):
         # outside markers are intentionally preserved.
         if not self._config_file.exists():
             return False
-        content = self._read_text()
         marker_start = _marker_start(server_name)
         marker_end = _marker_end(server_name)
+        content = _evict_foreign_tables(self._read_text(), server_name, marker_start, marker_end)
         if marker_start not in content or marker_end not in content:
             return False
         try:
@@ -207,9 +247,9 @@ class CodexRegistrar(MCPRegistrar):
         block = _render_block(spec)
         try:
             self._codex_dir.mkdir(parents=True, exist_ok=True)
-            content = self._read_text()
             marker_start = _marker_start(spec.name)
             marker_end = _marker_end(spec.name)
+            content = _evict_foreign_tables(self._read_text(), spec.name, marker_start, marker_end)
             if marker_start in content and marker_end in content:
                 start = content.index(marker_start)
                 end = content.index(marker_end) + len(marker_end)

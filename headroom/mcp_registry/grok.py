@@ -18,6 +18,7 @@ from typing import Any
 from headroom import fsutil
 
 from .base import MCPRegistrar, RegisterResult, RegisterStatus, ServerSpec
+from .codex import _evict_foreign_tables
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -103,9 +104,9 @@ class GrokRegistrar(MCPRegistrar):
     def unregister_server(self, server_name: str) -> bool:
         if not self._config_file.exists():
             return False
-        content = self._read_text()
         marker_start = _marker_start(server_name)
         marker_end = _marker_end(server_name)
+        content = _evict_foreign_tables(self._read_text(), server_name, marker_start, marker_end)
         if marker_start not in content or marker_end not in content:
             return False
         try:
@@ -141,9 +142,9 @@ class GrokRegistrar(MCPRegistrar):
         block = _render_block(spec)
         try:
             self._grok_dir.mkdir(parents=True, exist_ok=True)
-            content = self._read_text()
             marker_start = _marker_start(spec.name)
             marker_end = _marker_end(spec.name)
+            content = _evict_foreign_tables(self._read_text(), spec.name, marker_start, marker_end)
             if marker_start in content and marker_end in content:
                 start = content.index(marker_start)
                 end = content.index(marker_end) + len(marker_end)
