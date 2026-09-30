@@ -122,7 +122,7 @@ def test_openai_different_custom_upstream_not_served_from_cache(monkeypatch) -> 
 
     monkeypatch.setattr(
         "headroom.proxy.handlers.openai._resolve_openai_upstream_base",
-        lambda headers: headers.get("x-headroom-base-url"),
+        lambda headers, configured_target: headers.get("x-headroom-base-url"),
     )
 
     with _make_cached_proxy_client() as client:
