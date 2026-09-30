@@ -2341,3 +2341,33 @@ def test_code_aware_noop_runs_kompress_once_when_it_passes_through(
     assert compressed == _NUMBERED_RUST
     assert compressed_tokens == _estimate_tokens(_NUMBERED_RUST)
     assert len(calls) == 1
+
+
+def test_code_aware_noop_keeps_a_smaller_inline_kompress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Lossless-then-lossy's inline attempt keeps a Kompress result that wins.
+
+    Measured in tokens, a code_aware no-op no longer looks like a shrink, so the
+    inline attempt fires and its smaller result is kept without a second call.
+    """
+    kompressed = "\n".join(f"{i}\tvalue_{i} compute(&items[{i}..])" for i in range(1, 121))
+    router = _noop_code_aware_router(monkeypatch, kompressed)
+    router._lossless_then_lossy = True
+    calls: list[str] = []
+    kompress = router._try_ml_compressor
+
+    def counting(content: str, *args: object, **kwargs: object) -> tuple[str, int]:
+        calls.append(content)
+        return kompress(content, *args, **kwargs)
+
+    monkeypatch.setattr(router, "_try_ml_compressor", counting)
+
+    compressed, compressed_tokens, strategy_chain = router._apply_strategy_to_content(
+        _NUMBERED_RUST, CompressionStrategy.CODE_AWARE, context=""
+    )
+
+    assert compressed == kompressed
+    assert compressed_tokens == _estimate_tokens(kompressed)
+    assert strategy_chain == ["code_aware", "kompress"]
+    assert len(calls) == 1
