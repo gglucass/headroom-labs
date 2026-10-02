@@ -838,6 +838,20 @@ def test_stream_finalizer_derives_anthropic_uncached_input_without_usage() -> No
     assert outcome.uncached_input_tokens == 400_000 - 360_949 - 840
 
 
+def test_sse_parser_leaves_absent_anthropic_input_tokens_absent() -> None:
+    # A message_start usage without input_tokens must not read as a provider
+    # count of 0, or the finalizer books 0 uncached instead of deriving it.
+    proxy = object.__new__(HeadroomProxy)
+    event = {"type": "message_start", "message": {"usage": {"cache_read_input_tokens": 9}}}
+    state = {"sse_buffer": bytearray(f"data: {json.dumps(event)}\n\n".encode())}
+
+    usage = proxy._parse_sse_usage_from_buffer(state, "anthropic")
+
+    assert usage is not None
+    assert "input_tokens" not in usage
+    assert usage["cache_read_input_tokens"] == 9
+
+
 def test_vertex_gemini_non_text_generate_records_dashboard_outcome() -> None:
     handler = object.__new__(HeadroomProxy)
     handler.memory_handler = None

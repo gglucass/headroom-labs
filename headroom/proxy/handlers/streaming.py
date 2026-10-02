@@ -304,7 +304,10 @@ class StreamingMixin:
                     msg = data.get("message", {})
                     msg_usage = msg.get("usage", {})
                     if msg_usage:
-                        usage_found["input_tokens"] = msg_usage.get("input_tokens", 0)
+                        # Absent stays absent: the finalizer falls back to the
+                        # tokenizer derivation only when input_tokens is None.
+                        if "input_tokens" in msg_usage:
+                            usage_found["input_tokens"] = msg_usage["input_tokens"]
                         usage_found["cache_read_input_tokens"] = msg_usage.get(
                             "cache_read_input_tokens", 0
                         )
