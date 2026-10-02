@@ -291,6 +291,26 @@ class TestCLIProxyEnvVars:
         assert result.exit_code == 0, result.output
         assert captured_config["config"].min_tokens_to_crush == 120
 
+    @pytest.mark.parametrize(
+        ("env", "expected"), [({"HEADROOM_COMPRESS_USER_MESSAGES": "0"}, False), ({}, True)]
+    )
+    def test_compress_user_messages_env_off_overrides_profile(self, runner, env, expected):
+        """HEADROOM_COMPRESS_USER_MESSAGES=0 must turn off the coding profile's
+        user-message compression; unset keeps the profile default (on)."""
+        from headroom.agent_savings import proxy_pipeline_kwargs
+
+        captured_config = {}
+
+        def mock_run_server(config, **kwargs):
+            captured_config["config"] = config
+
+        with patch("headroom.proxy.server.run_server", mock_run_server):
+            result = runner.invoke(main, ["proxy"], env=env, catch_exceptions=False)
+
+        assert result.exit_code == 0, result.output
+        kwargs = proxy_pipeline_kwargs(captured_config["config"])
+        assert kwargs["compress_user_messages"] is expected
+
     def test_headroom_min_tokens_zero_is_preserved(self, runner):
         """HEADROOM_MIN_TOKENS=0 is a legitimate value ("crush everything") and
         must not be discarded by an `or 500` fallback (regression)."""
