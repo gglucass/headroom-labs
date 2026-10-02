@@ -15,12 +15,13 @@ import io
 import logging
 import math
 import os
+from functools import partial
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-from headroom.image.image_types import ImageSignals, RouteDecision, Technique
+from headroom.image.image_types import ImageMemo, ImageSignals, RouteDecision, Technique
 from headroom.onnx_runtime import create_cpu_session_options, hf_hub_download_local_first
 
 logger = logging.getLogger(__name__)
@@ -85,6 +86,7 @@ class OnnxTechniqueRouter:
         self._siglip_session: Any = None
         self._text_embeddings: dict[str, np.ndarray] = {}
         self._siglip_processor: Any = None
+        self._signals_memo: ImageMemo[ImageSignals | None] = ImageMemo()
 
     def _load_classifier(self) -> None:
         """Lazy-load the technique router ONNX model."""
@@ -220,7 +222,7 @@ class OnnxTechniqueRouter:
     def classify(self, image_data: bytes, query: str) -> RouteDecision:
         """Combined query + image classification."""
         technique, query_confidence = self.classify_query(query)
-        image_signals = self.analyze_image(image_data)
+        image_signals = self._signals_memo.get(image_data, partial(self.analyze_image, image_data))
 
         confidence = query_confidence
         reason = f"Query → '{technique.value}' ({query_confidence:.0%})"

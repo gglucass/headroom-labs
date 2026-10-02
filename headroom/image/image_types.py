@@ -10,8 +10,42 @@ initializing inside the proxy process (#2513).
 
 from __future__ import annotations
 
+import hashlib
+from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
+from typing import Generic, TypeVar
+
+_T = TypeVar("_T")
+
+
+class ImageMemo(Generic[_T]):
+    """Bounded LRU of per-image results, keyed on the image bytes' sha256.
+
+    Every turn resends the whole conversation, so the same screenshots reach
+    the image stack on every request; OCR and the SigLIP encoder are pure
+    functions of the bytes, so each image pays for them once. A ``None`` (no
+    confident text, or a failed call) is cached like any result.
+    """
+
+    def __init__(self, max_entries: int = 256) -> None:
+        self._max_entries = max_entries
+        self._entries: OrderedDict[bytes, _T] = OrderedDict()
+
+    def __contains__(self, image_data: bytes) -> bool:
+        return hashlib.sha256(image_data).digest() in self._entries
+
+    def get(self, image_data: bytes, compute: Callable[[], _T]) -> _T:
+        key = hashlib.sha256(image_data).digest()
+        try:
+            value = self._entries.pop(key)
+        except KeyError:
+            value = compute()
+        self._entries[key] = value  # (re)inserted last: most recently used
+        if len(self._entries) > self._max_entries:
+            self._entries.popitem(last=False)
+        return value
 
 
 class Technique(Enum):
