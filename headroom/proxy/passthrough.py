@@ -5,7 +5,21 @@ from __future__ import annotations
 from urllib.parse import urlparse
 
 OPENCODE_ZEN_HOSTS = {"opencode.ai", "www.opencode.ai"}
-XAI_HOSTS = {"api.x.ai"}
+
+# Chat upstreams we can name, keyed by exact host. Bounded by design: the
+# request-controlled ``x-headroom-base-url`` must never become a telemetry
+# label, or a client sending a fresh hostname per request grows the
+# per-provider stores and exported series without limit (review on #3759).
+CUSTOM_BASE_CHAT_PROVIDERS = {
+    "api.openai.com": "openai",
+    "api.z.ai": "zai",
+    "api.meta.ai": "meta",
+    # Grok Build: kept apart from OpenAI so savings rollups get their own row.
+    "api.x.ai": "xai",
+}
+
+# Fixed label for chat traffic on any other custom base.
+CUSTOM_BASE_PROVIDER = "custom"
 
 
 def is_opencode_zen_base(base_url: str | None) -> bool:
@@ -27,14 +41,9 @@ def is_opencode_zen_base(base_url: str | None) -> bool:
 
 def custom_base_passthrough_telemetry(method: str, path: str, base_url: str) -> tuple[str, str]:
     """Return passthrough telemetry metadata for narrow custom-base exceptions."""
-    # Known OpenAI-compatible vendors reached via custom-base routing. Kept as
-    # exact host allowlists to avoid labeling arbitrary custom-base tool
-    # traffic as LLM provider telemetry.
-    #
-    # - OpenCode Zen sends provider-prefixed traffic (zen/v1/...).
-    # - Grok Build (x.ai) sends plain OpenAI chat completions; attributing it
-    #   as "xai" lets savings rollups distinguish grok traffic from OpenAI's,
-    #   which downstream dashboards display as separate rows.
+    # OpenCode Zen sends provider-prefixed OpenAI-compatible traffic through
+    # custom-base routing. Keep this exact to avoid labeling arbitrary
+    # custom-base tool traffic as LLM provider telemetry.
     if method.upper() != "POST":
         return "", ""
     try:
@@ -42,8 +51,18 @@ def custom_base_passthrough_telemetry(method: str, path: str, base_url: str) -> 
     except ValueError:
         return "", ""
     normalized_path = path[1:] if path.startswith("/") else path
-    if host in OPENCODE_ZEN_HOSTS and normalized_path == "zen/v1/chat/completions":
-        return "chat/completions", "zen"
-    if host in XAI_HOSTS and normalized_path == "v1/chat/completions":
-        return "chat/completions", "xai"
+    if host in OPENCODE_ZEN_HOSTS:
+        if normalized_path == "zen/v1/chat/completions":
+            return "chat/completions", "zen"
+        return "", ""
+    # Known OpenAI-compatible chat hosts get a fixed name; chat-completions
+    # traffic on any other custom base is the shared "custom" bucket and
+    # everything else stays unnamed so tool traffic is not LLM telemetry.
+    # Match whole path segments so ``/v1/notchat/completions`` stays unnamed.
+    provider = CUSTOM_BASE_CHAT_PROVIDERS.get(host)
+    is_chat_path = normalized_path == "chat/completions" or normalized_path.endswith(
+        "/chat/completions"
+    )
+    if provider is not None and is_chat_path:
+        return "chat/completions", provider
     return "", ""

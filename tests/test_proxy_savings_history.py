@@ -84,6 +84,9 @@ def test_savings_tracker_helpers_normalize_inputs_and_paths(tmp_path, monkeypatc
         "total_input_cost_usd": 0.0,
         "output_tokens_saved": 0,
         "output_savings_usd": 0.0,
+        "tool_tokens_saved": 0,
+        "tool_schema_savings_usd": 0.0,
+        "total_output_cost_usd": 0.0,
     }
     assert savings_tracker_module._normalize_history_entry({"timestamp": "bad"}) is None
     assert savings_tracker_module._normalize_history_entry(object()) is None
@@ -138,10 +141,15 @@ def test_savings_tracker_sanitizes_legacy_state_and_applies_retention(tmp_path):
         "compression_savings_usd": pytest.approx(0.03),
         "compression_savings_list_usd": pytest.approx(0.03),
         "savings_basis": "list",
+        "tool_tokens_saved": 0,
+        "tool_schema_savings_usd": 0.0,
         "cache_read_tokens": 0,
         "cache_savings_usd": 0.0,
         "total_input_tokens": 0,
         "total_input_cost_usd": 0.0,
+        "output_tokens_saved": 0,
+        "output_savings_usd": 0.0,
+        "total_output_cost_usd": 0.0,
     }
     assert snapshot["display_session"] == savings_tracker_module._empty_display_session()
     assert snapshot["history"] == [
@@ -157,6 +165,9 @@ def test_savings_tracker_sanitizes_legacy_state_and_applies_retention(tmp_path):
             "total_input_cost_usd": 0.0,
             "output_tokens_saved": 0,
             "output_savings_usd": 0.0,
+            "tool_tokens_saved": 0,
+            "tool_schema_savings_usd": 0.0,
+            "total_output_cost_usd": 0.0,
         }
     ]
     assert snapshot["retention"] == {
@@ -181,10 +192,15 @@ def test_non_dict_savings_state_resets_to_default(tmp_path):
         # Nothing priced yet, so there is no basis to report and nothing to
         # migrate -- a fresh default, not a migrated pre-v6 state.
         "savings_basis": "unknown",
+        "tool_tokens_saved": 0,
+        "tool_schema_savings_usd": 0.0,
         "cache_read_tokens": 0,
         "cache_savings_usd": 0.0,
         "total_input_tokens": 0,
         "total_input_cost_usd": 0.0,
+        "output_tokens_saved": 0,
+        "output_savings_usd": 0.0,
+        "total_output_cost_usd": 0.0,
     }
     assert snapshot["display_session"] == savings_tracker_module._empty_display_session()
     assert snapshot["history"] == []
@@ -651,6 +667,8 @@ def test_display_session_rolls_after_inactivity_and_counts_zero_savings_requests
         "compression_savings_usd": pytest.approx(0.02),
         "compression_savings_list_usd": pytest.approx(0.02),
         "savings_basis": "list",
+        "tool_tokens_saved": 0,
+        "tool_schema_savings_usd": 0.0,
         "cache_read_tokens": 0,
         "cache_savings_usd": 0.0,
         "total_input_tokens": 200,
@@ -687,6 +705,8 @@ def test_display_session_rolls_after_inactivity_and_counts_zero_savings_requests
         "compression_savings_usd": pytest.approx(0.005),
         "compression_savings_list_usd": pytest.approx(0.005),
         "savings_basis": "list",
+        "tool_tokens_saved": 0,
+        "tool_schema_savings_usd": 0.0,
         "cache_read_tokens": 0,
         "cache_savings_usd": 0.0,
         "total_input_tokens": 50,
@@ -915,6 +935,106 @@ def test_savings_tracker_rollup_attributes_savings_per_provider(tmp_path, monkey
     third = hourly[2]
     assert set(third["by_provider"]) == {"unknown"}
     assert third["by_provider"]["unknown"]["tokens_saved"] == 15
+
+
+def test_savings_tracker_rollup_carries_exact_cache_read_cost_per_provider(tmp_path, monkeypatch):
+    # Reads on "steep-model" bill at 0.025x list (Fable-5.1-shaped pricing),
+    # on "flat-model" at the usual 0.1x. A consumer that backs the read cost
+    # out of the discount as "discount / 9" gets flat-model right and
+    # steep-model 4.3x too high, so the rollup has to carry the real figure.
+    fake_litellm = SimpleNamespace(
+        cost_per_token=lambda **_: (_ for _ in ()).throw(RuntimeError("unused")),
+        model_cost={
+            "steep-model": {
+                "input_cost_per_token": 1e-5,
+                "cache_read_input_token_cost": 2.5e-7,
+            },
+            "flat-model": {
+                "input_cost_per_token": 2e-6,
+                "cache_read_input_token_cost": 2e-7,
+            },
+        },
+    )
+    monkeypatch.setattr(savings_tracker_module, "LITELLM_AVAILABLE", True)
+    monkeypatch.setattr(savings_tracker_module, "litellm", fake_litellm)
+    tracker = SavingsTracker(
+        path=str(tmp_path / "proxy_savings.json"),
+        max_history_points=100,
+        max_history_age_days=30,
+    )
+
+    tracker.record_request(
+        model="steep-model",
+        provider="anthropic",
+        input_tokens=1_010_000,
+        tokens_saved=5_000,
+        cache_read_tokens=1_000_000,
+        uncached_input_tokens=10_000,
+        timestamp="2026-03-27T09:10:00Z",
+    )
+    tracker.record_request(
+        model="flat-model",
+        provider="openai",
+        input_tokens=150_000,
+        tokens_saved=2_000,
+        cache_read_tokens=100_000,
+        uncached_input_tokens=50_000,
+        timestamp="2026-03-27T09:20:00Z",
+    )
+
+    bucket = tracker.history_response()["series"]["hourly"][0]
+    anthropic = bucket["by_provider"]["anthropic"]
+    openai = bucket["by_provider"]["openai"]
+
+    assert anthropic["cache_read_tokens_delta"] == 1_000_000
+    assert anthropic["cache_read_cost_usd_delta"] == pytest.approx(0.25)
+    assert anthropic["cache_savings_usd_delta"] == pytest.approx(9.75)
+    # The read cost is exactly the read component of the recorded input cost,
+    # so input cost minus read cost is the uncached spend.
+    assert anthropic["total_input_cost_usd_delta"] - anthropic[
+        "cache_read_cost_usd_delta"
+    ] == pytest.approx(10_000 * 1e-5)
+
+    assert openai["cache_read_tokens_delta"] == 100_000
+    assert openai["cache_read_cost_usd_delta"] == pytest.approx(0.02)
+    assert openai["cache_savings_usd_delta"] == pytest.approx(0.18)
+
+    # Bucket totals are the sum of the providers.
+    assert bucket["cache_read_tokens_delta"] == 1_100_000
+    assert bucket["cache_read_cost_usd_delta"] == pytest.approx(0.27)
+    assert bucket["cache_savings_usd_delta"] == pytest.approx(9.93)
+    assert bucket["by_model"]["steep-model"]["cache_read_cost_usd_delta"] == pytest.approx(0.25)
+
+
+def test_savings_tracker_rollup_read_cost_unknown_for_model_less_checkpoints(tmp_path):
+    tracker = SavingsTracker(
+        path=str(tmp_path / "proxy_savings.json"),
+        max_history_points=100,
+        max_history_age_days=30,
+    )
+    history = [
+        {
+            "timestamp": "2026-03-27T09:00:00Z",
+            "provider": "anthropic",
+            "total_tokens_saved": 0,
+            "cache_read_tokens": 0,
+        },
+        # Written before per-model attribution: reads, but no model to price them.
+        {
+            "timestamp": "2026-03-27T09:30:00Z",
+            "provider": "anthropic",
+            "total_tokens_saved": 10,
+            "cache_read_tokens": 500,
+            "cache_savings_usd": 0.9,
+        },
+    ]
+
+    bucket = tracker._build_rollup(history, "hour")[0]
+
+    assert bucket["cache_read_tokens_delta"] == 500
+    assert bucket["cache_savings_usd_delta"] == pytest.approx(0.9)
+    assert bucket["cache_read_cost_usd_delta"] is None
+    assert bucket["by_provider"]["anthropic"]["cache_read_cost_usd_delta"] is None
 
 
 def test_savings_tracker_rollup_attributes_savings_per_model(tmp_path, monkeypatch):
@@ -1324,7 +1444,9 @@ def test_stats_history_csv_export_is_frontend_friendly(tmp_path, monkeypatch):
             "timestamp,tokens_saved,compression_savings_usd_delta,total_tokens_saved,"
             "compression_savings_usd,total_input_tokens_delta,total_input_tokens,"
             "total_input_cost_usd_delta,total_input_cost_usd,"
-            "output_tokens_saved_delta,output_savings_usd_delta"
+            "output_tokens_saved_delta,output_savings_usd_delta,"
+            "tool_tokens_saved_delta,tool_schema_savings_usd_delta,"
+            "total_output_cost_usd_delta"
         )
         assert len(lines) >= 2
         assert "total_tokens_saved" in lines[0]
@@ -1366,7 +1488,7 @@ def test_dashboard_includes_history_toggle_and_endpoint(tmp_path, monkeypatch):
         html = response.text
         assert "Session" in html
         assert "Historical" in html
-        assert "fetch('/stats-history')" in html
+        assert "this.fetchJson('/stats-history')" in html
         assert "Export CSV" in html
         assert "Weekly Savings" in html
         assert "Monthly Savings" in html
