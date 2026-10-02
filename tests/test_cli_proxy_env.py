@@ -292,11 +292,16 @@ class TestCLIProxyEnvVars:
         assert captured_config["config"].min_tokens_to_crush == 120
 
     @pytest.mark.parametrize(
-        ("env", "expected"), [({"HEADROOM_COMPRESS_USER_MESSAGES": "0"}, False), ({}, True)]
+        ("env", "expected"),
+        [
+            ({"HEADROOM_COMPRESS_USER_MESSAGES": "0"}, False),
+            ({"HEADROOM_COMPRESS_USER_MESSAGES": ""}, True),
+            ({}, True),
+        ],
     )
     def test_compress_user_messages_env_off_overrides_profile(self, runner, env, expected):
         """HEADROOM_COMPRESS_USER_MESSAGES=0 must turn off the coding profile's
-        user-message compression; unset keeps the profile default (on)."""
+        user-message compression; unset or empty keeps the profile default (on)."""
         from headroom.agent_savings import proxy_pipeline_kwargs
 
         captured_config = {}
@@ -796,6 +801,20 @@ class TestCLIProxyEnvVars:
         assert captured["kwargs"]["workers"] == 3
         assert captured["kwargs"]["limit_concurrency"] == 125
         assert captured["kwargs"].get("print_banner") is False
+
+
+@pytest.mark.parametrize(("value", "expected"), [("0", False), ("", True), (None, True)])
+def test_proxy_config_from_env_compress_user_messages(monkeypatch, value, expected):
+    """The uvicorn factory and `python -m headroom.proxy.server` read
+    HEADROOM_COMPRESS_USER_MESSAGES the same way `headroom proxy` does."""
+    from headroom.agent_savings import proxy_pipeline_kwargs
+    from headroom.proxy.server import _proxy_config_from_env
+
+    if value is not None:
+        monkeypatch.setenv("HEADROOM_COMPRESS_USER_MESSAGES", value)
+
+    kwargs = proxy_pipeline_kwargs(_proxy_config_from_env())
+    assert kwargs["compress_user_messages"] is expected
 
 
 class TestCLIProxyBackend:
