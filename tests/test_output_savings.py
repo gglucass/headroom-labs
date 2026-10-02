@@ -444,6 +444,17 @@ class TestEstimateFromHoldout:
             ledger.record("treatment", "opus|a|s|tools", 800, f"t{i}")
         assert ledger.best_estimate().kind == "measured"
 
+    def test_a_corner_holdout_does_not_set_the_headline_without_a_baseline(self):
+        ledger = SavingsLedger()
+        for i in range(MEASURED_MIN_CLUSTERS):
+            ledger.record("control", "opus|a|s|tools", 1000, f"c{i}")
+            ledger.record("treatment", "opus|a|s|tools", 100, f"t{i}")
+        # The rest of the traffic has no control to compare against.
+        for i in range(200):
+            ledger.record("treatment", "opus|b|xl|tools", 3000, f"b{i}")
+        assert ledger.estimate_from_holdout() is not None
+        assert ledger.best_estimate().kind != "measured"
+
     def test_measured_wins_without_a_baseline_to_fall_back_on(self):
         """A holdout-only deployment (no ``learn --verbosity`` run) still reports."""
         ledger = SavingsLedger()

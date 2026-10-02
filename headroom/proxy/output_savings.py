@@ -379,12 +379,17 @@ MEASURED_MIN_COVERAGE = 0.5
 MEASURED_MAX_CI_HALF_WIDTH_PCT = 10.0
 
 
+def _measured_covers(measured: SavingsEstimate, labelled_requests: int) -> bool:
+    """Whether the measured strata describe the traffic, not a corner of it."""
+    return measured.n_requests >= MEASURED_MIN_COVERAGE * labelled_requests
+
+
 def _measured_supersedes(measured: SavingsEstimate, labelled_requests: int) -> bool:
     """Whether the A/B measurement has outgrown the synthetic-control estimate."""
     half_width = (measured.ci_high_pct - measured.ci_low_pct) / 2.0
     if half_width > MEASURED_MAX_CI_HALF_WIDTH_PCT:
         return False
-    return measured.n_requests >= MEASURED_MIN_COVERAGE * labelled_requests
+    return _measured_covers(measured, labelled_requests)
 
 
 @dataclass
@@ -578,7 +583,8 @@ class SavingsLedger:
         strata cover :data:`MEASURED_MIN_COVERAGE` of the labelled treatment
         requests, and its band is tight enough to mean something. With no
         baseline to fall back on, the bare cluster gate's measurement is still
-        reported: it is weaker, but it is not displacing anything.
+        reported, since it displaces nothing, but only while it covers the
+        traffic: a corner of it is not a headline either way.
         """
         measured = self.estimate_from_holdout(min_clusters=MEASURED_SUPERSEDE_MIN_CLUSTERS)
         labelled = sum(t.qn for t in self.treatment.values())
@@ -588,7 +594,7 @@ class SavingsLedger:
         if estimated.n_requests > 0:
             return estimated
         measured = self.estimate_from_holdout()
-        if measured is not None:
+        if measured is not None and _measured_covers(measured, labelled):
             return measured
         if level is not None:
             modelled = self.estimate_from_model(level)
