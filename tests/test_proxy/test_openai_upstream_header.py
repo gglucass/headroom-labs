@@ -188,6 +188,16 @@ def test_grok_session_login_request_routes_to_session_host_without_header() -> N
     )
     assert proxy._resolve_openai_upstream(keyed) == "https://api.x.ai"
 
+    # A blank header names no destination; the session still routes.
+    blank = _FakeRequest(
+        {
+            "Authorization": "Bearer eyJ0eXAiOiJhdCtqd3QifQ.x.y",
+            "X-Xai-Token-Auth": "xai-grok-cli",
+            "x-headroom-base-url": "  ",
+        }
+    )
+    assert proxy._resolve_openai_upstream(blank) == "https://cli-chat-proxy.grok.com"
+
     # An explicit header still wins over the session default.
     explicit = _FakeRequest(
         {

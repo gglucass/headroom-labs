@@ -17,6 +17,9 @@ from headroom.providers.grok.runtime import DEFAULT_API_URL
         ("https://api.x.ai.evil.test", False),
         ("https://api.x.ai/v2", False),
         ("https://api.openai.com", False),
+        ("https://cli-chat-proxy.grok.com", True),
+        ("https://cli-chat-proxy.grok.com/v1", True),
+        ("https://cli-chat-proxy.grok.com.evil.test", False),
     ],
 )
 def test_xai_model_list_target_uses_exact_host_and_optional_v1_path(

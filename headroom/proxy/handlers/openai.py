@@ -455,9 +455,10 @@ def _resolve_openai_upstream_base(
     request_headers: dict[str, str], configured_target: str | None
 ) -> str | None:
     raw_base_url = _header_get(request_headers, _OPENAI_BASE_URL_HEADER)
-    if raw_base_url is None:
+    if raw_base_url is None or not raw_base_url.strip():
         # A `grok login` session token is only valid at the Grok CLI's own
-        # session host; the Grok CLI cannot set x-headroom-base-url itself.
+        # session host; the Grok CLI cannot set x-headroom-base-url itself. A
+        # blank header names no destination, so it routes the same way.
         return grok_session_upstream(request_headers, configured_target)
 
     normalized = _normalize_origin(raw_base_url)

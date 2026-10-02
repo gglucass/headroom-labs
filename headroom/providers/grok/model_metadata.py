@@ -6,9 +6,13 @@ from collections.abc import Mapping
 from typing import Any
 from urllib.parse import urlsplit
 
-from headroom.providers.grok.runtime import DEFAULT_API_URL
+from headroom.providers.grok.runtime import DEFAULT_API_URL, SESSION_API_URL
 
-_XAI_API_HOST = urlsplit(DEFAULT_API_URL).hostname
+# api.x.ai for API keys, and the session host `grok login` tokens are routed
+# to; both serve Grok's model list.
+_XAI_MODEL_LIST_HOSTS = {
+    host.lower() for url in (DEFAULT_API_URL, SESSION_API_URL) if (host := urlsplit(url).hostname)
+}
 
 
 def is_xai_model_list_target(base_url: str) -> bool:
@@ -16,8 +20,7 @@ def is_xai_model_list_target(base_url: str) -> bool:
     parsed = urlsplit(base_url)
     return (
         parsed.hostname is not None
-        and _XAI_API_HOST is not None
-        and parsed.hostname.lower() == _XAI_API_HOST.lower()
+        and parsed.hostname.lower() in _XAI_MODEL_LIST_HOSTS
         and parsed.path.rstrip("/") in {"", "/v1"}
     )
 
