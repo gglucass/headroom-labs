@@ -435,6 +435,15 @@ class TestEstimateFromHoldout:
         assert ledger.estimate_from_baseline().n_requests == 2030
         assert ledger.best_estimate().kind == "measured"
 
+    def test_a_young_holdout_still_reports_without_a_baseline(self):
+        """Below the supersede floor there is nothing to displace, so the
+        cluster-gated measurement is reported rather than nothing."""
+        ledger = SavingsLedger()
+        for i in range(MEASURED_MIN_CLUSTERS):
+            ledger.record("control", "opus|a|s|tools", 1000, f"c{i}")
+            ledger.record("treatment", "opus|a|s|tools", 800, f"t{i}")
+        assert ledger.best_estimate().kind == "measured"
+
     def test_measured_wins_without_a_baseline_to_fall_back_on(self):
         """A holdout-only deployment (no ``learn --verbosity`` run) still reports."""
         ledger = SavingsLedger()
