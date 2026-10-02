@@ -675,9 +675,12 @@ def _failure_detail(
     echo = prompt.replace("\r\n", "\n").replace("\r", "\n").strip() if prompt else ""
     if stderr and echo and echo in stderr:
         head, _, after = stderr.strip().partition(echo)
-        head += "[prompt omitted]\n"
+        marker = "[prompt omitted]\n"
         after = after.strip()
-        room = max(_MAX_SNIPPET_LEN - len(head), 0)
+        # At least half the cap goes to what follows the echo, so a long
+        # banner ahead of it cannot push the CLI's verdict out.
+        room = max(_MAX_SNIPPET_LEN - len(head) - len(marker), _MAX_SNIPPET_LEN // 2)
+        head = head[: _MAX_SNIPPET_LEN - room - len(marker)] + marker
         if len(after) > room:
             # Keep whole lines where possible: the CLI's verdict is the last one.
             cut = after[len(after) - room :]
