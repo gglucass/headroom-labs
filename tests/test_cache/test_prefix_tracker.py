@@ -13,6 +13,7 @@ from headroom.cache.prefix_tracker import (
     PrefixCacheTracker,
     PrefixFreezeConfig,
     SessionTrackerStore,
+    extract_cache_stable_delta,
     overlay_cached_prefix,
 )
 
@@ -894,6 +895,30 @@ class TestConversationLineageResolution:
         monkeypatch.delenv("HEADROOM_TRANSIENT_SYSTEM_LINEAGE")
         assert store.resolve_tracker("sid", "anthropic", current) not in (tracker, other)
         assert store.resolve_tracker("sid", "anthropic", sibling) is other
+
+    def test_cache_delta_replays_prefix_past_replaced_system_tail(self, monkeypatch):
+        """Cache mode's delta split leaves the replaced reminder out of the
+        replayed prefix, with or without the model reply the handlers record
+        after the request, and compresses everything after it as new."""
+        previous, current = self._reminder_turns()
+        reply = current[3]
+        forwarded = [*previous[:2], {**previous[2], "content": "compressed"}, previous[3], reply]
+        for recorded in ([*previous, reply], previous):
+            replay = forwarded[: len(recorded)]
+            prefix, delta = extract_cache_stable_delta(current, recorded, replay)
+            assert prefix == replay[:3] + replay[4:]
+            assert delta == current[len(prefix) :]
+
+        # A system message followed by a client turn is history, not a reminder.
+        changed = [*previous, {"role": "user", "content": "Continue."}]
+        dropped = [*previous[:3], changed[4], *current[3:]]
+        assert extract_cache_stable_delta(dropped, changed, changed) is None
+        # The client's copy of the reply must match the recorded one.
+        other = [*previous, {"role": "assistant", "content": "Something else."}]
+        assert extract_cache_stable_delta(current, other, other) is None
+
+        monkeypatch.setenv("HEADROOM_TRANSIENT_SYSTEM_LINEAGE", "0")
+        assert extract_cache_stable_delta(current, [*previous, reply], forwarded) is None
 
     def test_shared_session_id_is_not_rotated(self, store):
         """Composition guard: lineage resolution must not leak into session-id
