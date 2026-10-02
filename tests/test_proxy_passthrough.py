@@ -129,6 +129,11 @@ def test_custom_base_passthrough_telemetry_recognizes_xai_chat() -> None:
         "/v1/chat/completions",
         "https://api.x.ai",
     ) == ("chat/completions", "xai")
+    assert custom_base_passthrough_telemetry(
+        "POST",
+        "/v1/chat/completions",
+        "https://api.x.ai.",
+    ) == ("chat/completions", "xai")
     # Other xai paths and methods stay unlabelled.
     assert custom_base_passthrough_telemetry(
         "GET",

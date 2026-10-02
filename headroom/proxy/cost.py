@@ -285,6 +285,7 @@ def build_prefix_cache_stats(
                     (provider in ("anthropic", "vertex:anthropic") and "claude" in model_name)
                     or (provider == "openai" and any(p in model_name for p in _openai_prefixes))
                     or (provider == "gemini" and "gemini" in model_name)
+                    or (provider == "xai" and "grok" in model_name)
                     or (provider == "bedrock" and "claude" in model_name)
                 )
                 if is_match and tokens_sent > best_tokens:
