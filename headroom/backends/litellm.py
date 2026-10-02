@@ -21,6 +21,9 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
+from headroom.proxy.public_errors import client_message
+from headroom.utils import format_exception_message
+
 from .base import Backend, BackendResponse, StreamEvent
 
 logger = logging.getLogger(__name__)
@@ -995,9 +998,18 @@ class LiteLLMBackend(Backend):
                     for tr in tool_result_blocks:
                         tr_content = tr.get("content", "")
                         if isinstance(tr_content, list):
-                            tr_content = "\n".join(
-                                b.get("text", "") for b in tr_content if b.get("type") == "text"
-                            )
+                            # A tool_result content list is usually
+                            # ``{"type":"text",...}`` blocks, but a client may put
+                            # a bare string in the list. ``b.get`` on a str raised
+                            # AttributeError and 500'd the whole request; accept
+                            # bare strings and skip non-text/other blocks.
+                            text_pieces: list[str] = []
+                            for b in tr_content:
+                                if isinstance(b, str):
+                                    text_pieces.append(b)
+                                elif isinstance(b, dict) and b.get("type") == "text":
+                                    text_pieces.append(b.get("text", ""))
+                            tr_content = "\n".join(text_pieces)
                         tool_msg: dict[str, Any] = {
                             "role": "tool",
                             "tool_call_id": tr["tool_use_id"],
@@ -1261,7 +1273,11 @@ class LiteLLMBackend(Backend):
             )
 
         except Exception as e:
-            logger.error(f"LiteLLM error: {e}")
+            error_message = format_exception_message(e)
+            logger.error(f"LiteLLM error: {error_message}")
+            # Provider API errors keep their text; transport failures are
+            # reduced to the public vocabulary (see proxy/public_errors).
+            error_message = client_message(e, error_message)
 
             # Map to Anthropic error format
             error_type = "api_error"
@@ -1281,10 +1297,10 @@ class LiteLLMBackend(Backend):
             return BackendResponse(
                 body={
                     "type": "error",
-                    "error": {"type": error_type, "message": str(e)},
+                    "error": {"type": error_type, "message": error_message},
                 },
                 status_code=status_code,
-                error=str(e),
+                error=error_message,
             )
 
     async def stream_message(
@@ -1671,12 +1687,13 @@ class LiteLLMBackend(Backend):
             )
 
         except Exception as e:
-            logger.error(f"LiteLLM streaming error: {e}")
+            error_message = format_exception_message(e)
+            logger.error(f"LiteLLM streaming error: {error_message}")
             yield StreamEvent(
                 event_type="error",
                 data={
                     "type": "error",
-                    "error": {"type": "api_error", "message": str(e)},
+                    "error": {"type": "api_error", "message": client_message(e, error_message)},
                 },
             )
 
@@ -1871,7 +1888,9 @@ class LiteLLMBackend(Backend):
             )
 
         except Exception as e:
-            logger.error(f"LiteLLM OpenAI error: {e}")
+            error_message = format_exception_message(e)
+            logger.error(f"LiteLLM OpenAI error: {error_message}")
+            error_message = client_message(e, error_message)
 
             # Map to OpenAI error format
             error_type = "api_error"
@@ -1891,13 +1910,13 @@ class LiteLLMBackend(Backend):
             return BackendResponse(
                 body={
                     "error": {
-                        "message": str(e),
+                        "message": error_message,
                         "type": error_type,
                         "code": error_type,
                     }
                 },
                 status_code=status_code,
-                error=str(e),
+                error=error_message,
             )
 
     async def stream_openai_message(
@@ -1965,15 +1984,25 @@ class LiteLLMBackend(Backend):
 
             async for chunk in response:
                 chunk_dict = chunk.model_dump(exclude_none=True, exclude_unset=True)
+                # Report the model the client requested, not the LiteLLM-mapped
+                # provider slug (e.g. "openrouter/qwen3",
+                # "bedrock/us.anthropic.claude-..."). send_openai_message already
+                # rewrites the model to original_model on the non-streaming path;
+                # without this the streaming and non-streaming responses disagree
+                # and OpenAI clients that key cost/telemetry on the model field
+                # see an unrecognized name for every streamed request.
+                if "model" in chunk_dict:
+                    chunk_dict["model"] = original_model
                 yield f"data: {json.dumps(chunk_dict)}\n\n"
 
             yield "data: [DONE]\n\n"
 
         except Exception as e:
-            logger.error(f"LiteLLM OpenAI streaming error: {e}")
+            error_message = format_exception_message(e)
+            logger.error(f"LiteLLM OpenAI streaming error: {error_message}")
             error_data = {
                 "error": {
-                    "message": str(e),
+                    "message": client_message(e, error_message),
                     "type": "api_error",
                     "code": "backend_error",
                 }
