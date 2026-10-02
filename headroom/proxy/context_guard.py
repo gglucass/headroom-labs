@@ -388,8 +388,6 @@ class StreamUsageGuard:
         if self._done:
             return chunk
         self._buf.extend(chunk)
-        if len(self._buf) > _MAX_GUARD_BUFFER:
-            return self._finish()
         out = bytearray()
         while not self._done:
             # LF or CRLF framing: a CRLF stream never contains ``\n\n`` and
@@ -401,7 +399,9 @@ class StreamUsageGuard:
             event = bytes(self._buf[:end])
             del self._buf[:end]
             out += self._process_event(event)
-        if self._done:
+        # Capped on what is still unframed, so one large chunk carrying
+        # message_start is read before the cap can disarm the guard.
+        if self._done or len(self._buf) > _MAX_GUARD_BUFFER:
             out += self._finish()
         return bytes(out)
 

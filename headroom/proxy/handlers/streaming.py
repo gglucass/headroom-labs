@@ -881,6 +881,10 @@ class StreamingMixin:
         if supports_mid_turn_coalescing(client):
             self._active_streams.add(session_key)
 
+        # Before the guard: its learned-limit lookup is keyed on the credential
+        # actually sent, the same one the 400 learning below keys on.
+        headers = await apply_copilot_api_auth(headers, url=url)
+
         # Context-limit guard (see headroom/proxy/context_guard.py): rewrites
         # only the client-bound message_start bytes when the forwarded request
         # is near the model's real window, so clients whose auto-compaction
@@ -922,7 +926,6 @@ class StreamingMixin:
                 logger.debug("context_guard flush skipped", exc_info=True)
                 return b""
 
-        headers = await apply_copilot_api_auth(headers, url=url)
         start_time = time.time()
 
         # Byte-faithful forwarding (PR-A3, fixes P0-2). Resolve outbound

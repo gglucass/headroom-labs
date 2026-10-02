@@ -293,6 +293,13 @@ class TestStreamUsageGuard:
         assert b"\n" not in out.replace(b"\r\n", b"")
         assert _parse_usage(out)["input_tokens"] == int(1_000_000 * REPORT_FRACTION)
 
+    def test_a_chunk_over_the_buffer_cap_still_gets_its_message_start_read(self):
+        guard = StreamUsageGuard(believed_limit=1_000_000, effective_limit=200_000)
+        filler = b"event: content_block_delta\ndata: " + b"x" * (300 * 1024) + b"\n\n"
+        out = guard.feed(_message_start_event(190_000) + filler)
+        assert _parse_usage(out)["input_tokens"] == int(1_000_000 * REPORT_FRACTION)
+        assert out.endswith(filler)
+
     def test_ping_events_pass_through_before_message_start(self):
         guard = StreamUsageGuard(believed_limit=1_000_000, effective_limit=200_000)
         ping = b'event: ping\ndata: {"type": "ping"}\n\n'
