@@ -1702,6 +1702,7 @@ class SavingsTracker:
                 "total_input_cost_usd": 0.0,
                 "output_tokens_saved": 0,
                 "output_savings_usd": 0.0,
+                "output_tokens": 0,
                 "total_output_cost_usd": 0.0,
             },
             "display_session": _empty_display_session(),
@@ -1773,6 +1774,7 @@ class SavingsTracker:
         is_v6_lifetime = False
         lifetime_output_tokens_saved = 0
         lifetime_output_savings_usd = 0.0
+        lifetime_output_tokens = 0
         lifetime_output_cost_usd = 0.0
         if isinstance(lifetime_raw, dict):
             lifetime_requests = _coerce_int(lifetime_raw.get("requests"))
@@ -1793,6 +1795,7 @@ class SavingsTracker:
                 lifetime_basis = str(lifetime_raw.get("savings_basis") or BASIS_UNKNOWN)
             lifetime_output_tokens_saved = _coerce_int(lifetime_raw.get("output_tokens_saved"))
             lifetime_output_savings_usd = _coerce_float(lifetime_raw.get("output_savings_usd"))
+            lifetime_output_tokens = _coerce_int(lifetime_raw.get("output_tokens"))
             lifetime_output_cost_usd = _coerce_float(lifetime_raw.get("total_output_cost_usd"))
 
         if normalized_history:
@@ -1832,6 +1835,10 @@ class SavingsTracker:
             lifetime_output_savings_usd = max(
                 lifetime_output_savings_usd,
                 _coerce_float(last.get("output_savings_usd")),
+            )
+            lifetime_output_tokens = max(
+                lifetime_output_tokens,
+                _coerce_int(last.get("output_tokens")),
             )
             lifetime_output_cost_usd = max(
                 lifetime_output_cost_usd,
@@ -1875,6 +1882,7 @@ class SavingsTracker:
                 "total_input_cost_usd": round(lifetime_input_cost_usd, 6),
                 "output_tokens_saved": lifetime_output_tokens_saved,
                 "output_savings_usd": round(lifetime_output_savings_usd, 6),
+                "output_tokens": lifetime_output_tokens,
                 "total_output_cost_usd": round(lifetime_output_cost_usd, 6),
             },
             "display_session": _normalize_display_session(raw.get("display_session")),

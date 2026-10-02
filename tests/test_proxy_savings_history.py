@@ -150,6 +150,7 @@ def test_savings_tracker_sanitizes_legacy_state_and_applies_retention(tmp_path):
         "total_input_cost_usd": 0.0,
         "output_tokens_saved": 0,
         "output_savings_usd": 0.0,
+        "output_tokens": 0,
         "total_output_cost_usd": 0.0,
     }
     assert snapshot["display_session"] == savings_tracker_module._empty_display_session()
@@ -202,6 +203,7 @@ def test_non_dict_savings_state_resets_to_default(tmp_path):
         "total_input_cost_usd": 0.0,
         "output_tokens_saved": 0,
         "output_savings_usd": 0.0,
+        "output_tokens": 0,
         "total_output_cost_usd": 0.0,
     }
     assert snapshot["display_session"] == savings_tracker_module._empty_display_session()
@@ -2049,6 +2051,17 @@ def test_record_request_accumulates_output_tokens_into_checkpoints(tmp_path):
     reloaded = SavingsTracker(path=path)
     reloaded_history = reloaded.snapshot()["history"]
     assert reloaded_history[-1]["output_tokens"] == 500
+
+    # ...and the lifetime cumulative must resume from it, not restart at 0, or
+    # the next checkpoint (50) reads as a negative delta to every consumer.
+    assert reloaded.snapshot()["lifetime"]["output_tokens"] == 500
+    reloaded.record_request(
+        model="claude-opus-5",
+        input_tokens=100,
+        tokens_saved=10,
+        output_tokens=50,
+    )
+    assert reloaded.snapshot()["history"][-1]["output_tokens"] == 550
 
     # Legacy entries without the key normalize to zero, not an error.
     legacy = savings_tracker_module._normalize_history_entry(
