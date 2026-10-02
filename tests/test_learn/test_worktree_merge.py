@@ -134,3 +134,18 @@ def test_traffic_pattern_in_a_worktree_routes_to_its_repo(tmp_path: Path) -> Non
     )
 
     assert _project_for_pattern(pattern, [project]) is project
+
+
+def test_a_session_started_in_a_worktree_subfolder_records_the_checkout(tmp_path: Path) -> None:
+    """Selecting the worktree itself must find a project whose only session
+    started in one of its subfolders."""
+    base = tmp_path.resolve()
+    main, worktree = _repo_with_worktree(base)
+    (worktree / "src").mkdir()
+    claude_dir = base / "claude"
+    _write_session(claude_dir, worktree / "src", "a")
+
+    [project] = ClaudeCodePlugin(claude_dir=claude_dir).discover_projects()
+
+    assert project.project_path == main
+    assert project.worktree_paths == [worktree / "src", worktree]

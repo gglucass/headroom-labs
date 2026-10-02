@@ -164,7 +164,18 @@ class ClaudeCodePlugin(LearnPlugin, ConversationScanner):
                     data_path=data_path,
                     context_file=claude_md if _path_exists(claude_md) else None,
                     memory_file=memory_file if _path_exists(memory_file) else None,
-                    worktree_paths=[p.project_path for p, root in members if root is not None],
+                    # The session folder can be a subdirectory of the checkout;
+                    # record the checkout root too so selecting the worktree
+                    # itself, or a path elsewhere in it, still finds this project.
+                    worktree_paths=list(
+                        dict.fromkeys(
+                            path
+                            for p, root in members
+                            if root is not None
+                            for path in (p.project_path, _checkout_root(p.project_path))
+                            if path is not None
+                        )
+                    ),
                     extra_data_paths=[p.data_path for p, _ in members if p is not main],
                 )
             )
@@ -490,6 +501,14 @@ def _decode_project_path(escaped_name: str) -> Path | None:
     return None
 
 
+def _checkout_root(path: Path) -> Path | None:
+    """The nearest directory at or above ``path`` holding a ``.git`` entry."""
+    try:
+        return next((d for d in (path, *path.parents) if _path_exists(d / ".git")), None)
+    except OSError:
+        return None
+
+
 def _main_worktree_root(path: Path) -> Path | None:
     """Return the main checkout of the linked git worktree ``path`` is in.
 
@@ -501,7 +520,7 @@ def _main_worktree_root(path: Path) -> Path | None:
     if not path.is_absolute():
         return None
     try:
-        checkout = next((d for d in (path, *path.parents) if _path_exists(d / ".git")), None)
+        checkout = _checkout_root(path)
         if checkout is None:
             return None
         # A main checkout's .git is a directory, so this read fails there.
