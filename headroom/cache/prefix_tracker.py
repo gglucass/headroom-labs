@@ -367,6 +367,39 @@ def _classify_history_canonical(
     )
 
 
+_TRANSIENT_SYSTEM_LINEAGE_ENV = "HEADROOM_TRANSIENT_SYSTEM_LINEAGE"
+
+
+def _transient_system_lineage_enabled() -> bool:
+    return os.environ.get(_TRANSIENT_SYSTEM_LINEAGE_ENV, "").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+
+def _extends_past_system_tail(current_messages: list[Any], previous_messages: list[Any]) -> bool:
+    """Whether ``current`` continues ``previous`` once its trailing system turn is set aside.
+
+    Claude Code ends some requests with a ``role:"system"`` reminder and
+    replaces it on the next turn, so the recorded history is never a prefix of
+    the new one.  Only that last message is excluded: everything before it
+    must survive unchanged and include real user/assistant history, so a
+    changed leading or historical system instruction still diverges.
+    """
+    if len(previous_messages) < 2 or len(current_messages) < len(previous_messages):
+        return False
+    tail = previous_messages[-1]
+    if not isinstance(tail, dict) or tail.get("role") != "system":
+        return False
+    stable = previous_messages[:-1]
+    return current_messages[: len(stable)] == stable and any(
+        isinstance(message, dict) and message.get("role") in ("user", "assistant")
+        for message in stable
+    )
+
+
 def classify_history_relation(
     current_messages: list[dict[str, Any]],
     previous_messages: list[dict[str, Any]],
@@ -1433,7 +1466,10 @@ class SessionTrackerStore:
         where a large leading run and two-block identity suffix survive while
         the middle tail is regenerated; all other rewrites start a fresh
         lineage. This keeps #2671's stable cache boundary attached without
-        merging unrelated parallel sub-calls.
+        merging unrelated parallel sub-calls. When nothing else matches, an
+        Anthropic chain whose trailing ``role:"system"`` reminder the client
+        replaced is matched on the history before that reminder
+        (``HEADROOM_TRANSIENT_SYSTEM_LINEAGE=0`` disables this).
         Byte-identical histories (templated fan-outs before they diverge)
         intentionally share a tracker: their provider cache line is identical
         too, so sharing is harmless.
@@ -1527,6 +1563,28 @@ class SessionTrackerStore:
                 len(rewrite_candidates) == 1 or rewrite_candidates[0][0] != rewrite_candidates[1][0]
             ):
                 best_key = rewrite_candidates[0][1]
+            elif (
+                not rewrite_candidates
+                and provider == "anthropic"
+                and _transient_system_lineage_enabled()
+            ):
+                # Nothing matched as recorded.  A chain whose only change is
+                # its replaced trailing system reminder is still this
+                # conversation; without it every such turn starts a cold
+                # tracker, the confirmed prefix is not replayed, and any
+                # recompressed history re-writes the provider cache.  Only a
+                # unique longest chain qualifies, so equal-length siblings
+                # that differ in their reminder stay separate.
+                tail_candidates = [
+                    (len(chain), key)
+                    for key, chain in by_length
+                    if self._lineage_affinities.get(key) == cache_affinity
+                    and _extends_past_system_tail(snap, chain)
+                ]
+                if tail_candidates and (
+                    len(tail_candidates) == 1 or tail_candidates[0][0] != tail_candidates[1][0]
+                ):
+                    best_key = tail_candidates[0][1]
 
         if best_key is None:
             cap = self._default_config.max_lineages_per_session
