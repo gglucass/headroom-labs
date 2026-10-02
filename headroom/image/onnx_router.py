@@ -86,7 +86,7 @@ class OnnxTechniqueRouter:
         self._siglip_session: Any = None
         self._text_embeddings: dict[str, np.ndarray] = {}
         self._siglip_processor: Any = None
-        self._signals_memo: ImageMemo[ImageSignals | None] = ImageMemo()
+        self._signals_memo: ImageMemo[ImageSignals] = ImageMemo()
 
     def _load_classifier(self) -> None:
         """Lazy-load the technique router ONNX model."""
@@ -180,49 +180,55 @@ class OnnxTechniqueRouter:
         return technique, confidence
 
     def analyze_image(self, image_data: bytes) -> ImageSignals | None:
-        """Analyze image properties using SigLIP ONNX encoder."""
+        """Analyze image properties using SigLIP ONNX encoder.
+
+        Memoized per image; a failed analysis is not, so it is retried.
+        """
         if not self.use_siglip:
             return None
 
         self._load_siglip()
 
         try:
-            from PIL import Image
-
-            img = Image.open(io.BytesIO(image_data)).convert("RGB")
-            img = img.resize((224, 224), Image.Resampling.LANCZOS)
-
-            # Convert to numpy: [1, 3, 224, 224], normalized to [-1, 1]
-            arr = np.array(img, dtype=np.float32) / 255.0
-            arr = (arr - 0.5) / 0.5  # Normalize to [-1, 1]
-            arr = arr.transpose(2, 0, 1)  # HWC → CHW
-            pixel_values = arr[np.newaxis, ...]  # Add batch dim
-
-            embeds = self._siglip_session.run(None, {"pixel_values": pixel_values})[0]
-            embeds = embeds / np.linalg.norm(embeds, axis=-1, keepdims=True)
-
-            def sigmoid(x: float) -> float:
-                return 1 / (1 + math.exp(-x * 5))
-
-            scores = {}
-            for signal_name, text_emb in self._text_embeddings.items():
-                sim = (embeds @ text_emb.T).squeeze()
-                scores[signal_name] = sigmoid(float(sim.max()))
-
-            return ImageSignals(
-                has_text=scores.get("has_text", 0.5),
-                is_document=scores.get("is_document", 0.5),
-                is_complex=scores.get("is_complex", 0.5),
-                has_small_details=scores.get("has_small_details", 0.5),
-            )
+            return self._signals_memo.get(image_data, partial(self._encode_image, image_data))
         except Exception as e:
             logger.warning(f"SigLIP image analysis failed: {e}")
             return None
 
+    def _encode_image(self, image_data: bytes) -> ImageSignals:
+        from PIL import Image
+
+        img = Image.open(io.BytesIO(image_data)).convert("RGB")
+        img = img.resize((224, 224), Image.Resampling.LANCZOS)
+
+        # Convert to numpy: [1, 3, 224, 224], normalized to [-1, 1]
+        arr = np.array(img, dtype=np.float32) / 255.0
+        arr = (arr - 0.5) / 0.5  # Normalize to [-1, 1]
+        arr = arr.transpose(2, 0, 1)  # HWC → CHW
+        pixel_values = arr[np.newaxis, ...]  # Add batch dim
+
+        embeds = self._siglip_session.run(None, {"pixel_values": pixel_values})[0]
+        embeds = embeds / np.linalg.norm(embeds, axis=-1, keepdims=True)
+
+        def sigmoid(x: float) -> float:
+            return 1 / (1 + math.exp(-x * 5))
+
+        scores = {}
+        for signal_name, text_emb in self._text_embeddings.items():
+            sim = (embeds @ text_emb.T).squeeze()
+            scores[signal_name] = sigmoid(float(sim.max()))
+
+        return ImageSignals(
+            has_text=scores.get("has_text", 0.5),
+            is_document=scores.get("is_document", 0.5),
+            is_complex=scores.get("is_complex", 0.5),
+            has_small_details=scores.get("has_small_details", 0.5),
+        )
+
     def classify(self, image_data: bytes, query: str) -> RouteDecision:
         """Combined query + image classification."""
         technique, query_confidence = self.classify_query(query)
-        image_signals = self._signals_memo.get(image_data, partial(self.analyze_image, image_data))
+        image_signals = self.analyze_image(image_data)
 
         confidence = query_confidence
         reason = f"Query → '{technique.value}' ({query_confidence:.0%})"
