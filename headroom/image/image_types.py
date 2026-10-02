@@ -27,9 +27,15 @@ class ImageMemo(Generic[_T]):
     the image stack on every request; OCR and the SigLIP encoder are pure
     functions of the bytes, so each image pays for them once. A ``None`` (no
     confident text, or a failed call) is cached like any result.
+
+    A transcode turn scans the history oldest-first, and a history larger than
+    the memo makes LRU thrash: every miss evicts the image the scan reaches
+    next, so nothing is reused. Entries are a 32-byte key and an OCR string
+    (~1 KB) or four floats, so the bound sits far above any one history, a
+    few MB at most, and only guards a long-lived worker across conversations.
     """
 
-    def __init__(self, max_entries: int = 256) -> None:
+    def __init__(self, max_entries: int = 4096) -> None:
         self._max_entries = max_entries
         self._entries: OrderedDict[bytes, _T] = OrderedDict()
 

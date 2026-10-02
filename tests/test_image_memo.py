@@ -86,6 +86,22 @@ def test_past_deadline_ocrs_nothing_new_but_reuses_the_memo(
     assert calls == [b"b"]
 
 
+def test_long_history_reuses_ocr_across_turns(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Each transcode turn scans the history oldest-first. With fewer slots
+    # than images, every miss evicts the very image the scan reaches next, so
+    # nothing was ever reused; 300 screenshots must fit.
+    calls: list[bytes] = []
+    compressor = ImageCompressor(use_siglip=False)
+    monkeypatch.setattr(compressor, "_ocr_extract", lambda data: calls.append(data) or "text")
+    images = [_image(str(i).encode()) for i in range(300)]
+    history = [{"role": "user", "content": images}]
+
+    for _ in range(2):
+        compressor._apply_compression(history, Technique.TRANSCODE, "anthropic")
+
+    assert len(calls) == 300
+
+
 def test_classify_analyzes_each_image_once(monkeypatch: pytest.MonkeyPatch) -> None:
     router = OnnxTechniqueRouter()
     analyzed: list[bytes] = []
