@@ -130,6 +130,13 @@ _CACHE_ECONOMICS = {
         "write_multiplier": 1.25,
         "label": "Same as Anthropic (Bedrock)",
     },
+    # The modal LiteLLM ratio across xai/grok-* (cache read 0.20 vs 1.25 $/M);
+    # xAI caches automatically with no write premium.
+    "xai": {
+        "read_multiplier": 0.16,
+        "write_multiplier": 1.0,
+        "label": "Automatic, no TTL control",
+    },
 }
 
 

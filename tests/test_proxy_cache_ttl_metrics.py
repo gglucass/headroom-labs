@@ -516,4 +516,5 @@ def test_prefix_cache_stats_prices_xai_cache_reads_with_grok_models(
 
     stats = build_prefix_cache_stats(metrics, tracker)
 
-    assert stats["by_provider"]["xai"]["savings_usd"] > 0
+    # No catalog cache rates: xAI's own fallback ratio, not Anthropic's 0.1.
+    assert stats["by_provider"]["xai"]["savings_usd"] == round(1_000_000 * 3e-6 * (1 - 0.16), 4)
