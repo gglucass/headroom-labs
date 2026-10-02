@@ -176,6 +176,34 @@ def test_learn_project_lookup_and_apply_flow(
     assert plugin.writer.calls[0][2] is False
 
 
+@pytest.mark.parametrize("from_cwd", [False, True])
+def test_learn_selects_the_project_a_worktree_was_merged_into(
+    monkeypatch: pytest.MonkeyPatch, runner: CliRunner, tmp_path: Path, from_cwd: bool
+) -> None:
+    main_checkout, worktree = tmp_path / "repo", tmp_path / "workspaces" / "ws"
+    (worktree / "src").mkdir(parents=True)
+    worktree = worktree.resolve()
+    merged = SimpleNamespace(
+        name="repo", project_path=main_checkout, worktree_paths=[worktree], extra_data_paths=[]
+    )
+    plugin = FakePlugin("claude", "Claude Code", [merged])
+    analyzer = FakeAnalyzer()
+
+    monkeypatch.setattr("headroom.learn.analyzer._detect_default_model", lambda: "gpt-4o")
+    monkeypatch.setattr("headroom.learn.registry.get_plugin", lambda name: plugin)
+    monkeypatch.setattr("headroom.learn.analyzer.SessionAnalyzer", lambda model=None: analyzer)
+
+    args = ["learn", "--agent", "claude"]
+    if from_cwd:
+        monkeypatch.chdir(worktree / "src")
+    else:
+        args += ["--project", str(worktree)]
+    result = runner.invoke(main, args, catch_exceptions=False)
+
+    assert result.exit_code == 0, result.output
+    assert [call[0] for call in plugin.scan_calls] == [merged]
+
+
 class ProgressEchoingAnalyzer(FakeAnalyzer):
     def analyze(self, project, sessions, on_progress=None):  # noqa: ANN001, ANN201
         self.calls.append((project, sessions))
