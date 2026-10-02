@@ -5119,6 +5119,11 @@ class AnthropicHandlerMixin:
                                     status_code=502,
                                 )
 
+                            # This stream is resynthesized from the parsed message,
+                            # so the streaming guard never sees it: nudge here.
+                            self._context_guard_nudge_message(
+                                resp_json, model=model, headers=headers, request_id=request_id
+                            )
                             try:
                                 sse_events = self._response_to_sse(resp_json, "anthropic")
                             except ValueError as sse_err:
@@ -5312,6 +5317,30 @@ class AnthropicHandlerMixin:
         if status_code != 200 or not content:
             return content
         try:
+            payload = json.loads(content)
+        except Exception:
+            return content
+        if not self._context_guard_nudge_message(
+            payload, model=model, headers=headers, request_id=request_id
+        ):
+            return content
+        return json.dumps(payload).encode()
+
+    def _context_guard_nudge_message(
+        self,
+        payload: Any,
+        *,
+        model: str,
+        headers: dict[str, str],
+        request_id: str,
+    ) -> bool:
+        """Nudge a parsed message's usage in place; True when it changed.
+
+        Shared by the buffered body above and the buffered-CCR stream, which
+        resynthesizes SSE from the parsed message and so never passes through
+        the streaming guard.
+        """
+        try:
             from headroom.proxy.context_guard import (
                 believed_context_limit,
                 context_guard_enabled,
@@ -5321,31 +5350,27 @@ class AnthropicHandlerMixin:
             )
 
             if not context_guard_enabled():
-                return content
-            payload = json.loads(content)
+                return False
             if not isinstance(payload, dict) or payload.get("type") != "message":
-                return content
+                return False
             model_limit = self.anthropic_provider.get_context_limit(model)
             beta_header = headers.get("anthropic-beta")
-            nudged = nudge_response_usage(
-                payload,
-                believed_limit=believed_context_limit(model_limit, beta_header),
-                effective_limit=effective_context_limit(
-                    model,
-                    model_limit,
-                    beta_header,
-                    scope=credential_scope_from_headers(headers),
-                ),
-                request_id=request_id,
+            return bool(
+                nudge_response_usage(
+                    payload,
+                    believed_limit=believed_context_limit(model_limit, beta_header),
+                    effective_limit=effective_context_limit(
+                        model,
+                        model_limit,
+                        beta_header,
+                        scope=credential_scope_from_headers(headers),
+                    ),
+                    request_id=request_id,
+                )
             )
-            if not nudged:
-                return content
-            return json.dumps(payload).encode()
         except Exception:
-            logger.debug(
-                f"[{request_id}] context_guard: non-streaming nudge skipped", exc_info=True
-            )
-            return content
+            logger.debug(f"[{request_id}] context_guard: buffered nudge skipped", exc_info=True)
+            return False
 
     def _anthropic_batch_capability_error(self) -> Response | None:
         """Return the stable client error for a Copilot batch target."""

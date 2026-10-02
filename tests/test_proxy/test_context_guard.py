@@ -284,6 +284,15 @@ class TestStreamUsageGuard:
         out = guard.feed(second)
         assert _parse_usage(out)["input_tokens"] == int(1_000_000 * REPORT_FRACTION)
 
+    def test_crlf_framed_events_are_released_and_rewritten(self):
+        guard = StreamUsageGuard(believed_limit=1_000_000, effective_limit=200_000)
+        event = _message_start_event(190_000).replace(b"\n", b"\r\n")
+        out = guard.feed(event)
+        # Released at its own terminator, not held until the buffer cap.
+        assert out.endswith(b"\r\n\r\n")
+        assert b"\n" not in out.replace(b"\r\n", b"")
+        assert _parse_usage(out)["input_tokens"] == int(1_000_000 * REPORT_FRACTION)
+
     def test_ping_events_pass_through_before_message_start(self):
         guard = StreamUsageGuard(believed_limit=1_000_000, effective_limit=200_000)
         ping = b'event: ping\ndata: {"type": "ping"}\n\n'

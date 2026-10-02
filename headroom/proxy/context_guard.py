@@ -50,6 +50,8 @@ import re
 import time
 from typing import Any
 
+from headroom.proxy.sse_byte_buffer_policy import find_sse_event_terminator
+
 logger = logging.getLogger("headroom.proxy")
 
 # Forwarded-usage fraction of the *effective* (real) limit at which the nudge
@@ -237,6 +239,12 @@ def reset_learned_limits() -> None:
     _learned_limits.clear()
 
 
+def _data_line(payload: dict[str, Any], original: bytes) -> bytes:
+    """A rewritten ``data:`` line keeping the original's CRLF ending."""
+    eol = b"\r" if original.endswith(b"\r") else b""
+    return b"data: " + json.dumps(payload, separators=(",", ":")).encode() + eol
+
+
 def _sse_event_type(event: bytes) -> bytes | None:
     """The event type of one SSE frame, or ``None`` when it carries none.
 
@@ -384,11 +392,14 @@ class StreamUsageGuard:
             return self._finish()
         out = bytearray()
         while not self._done:
-            boundary = self._buf.find(b"\n\n")
-            if boundary == -1:
+            # LF or CRLF framing: a CRLF stream never contains ``\n\n`` and
+            # was held until the buffer cap, so it stopped streaming.
+            terminator = find_sse_event_terminator(self._buf)
+            if terminator is None:
                 break
-            event = bytes(self._buf[: boundary + 2])
-            del self._buf[: boundary + 2]
+            end = terminator[0] + terminator[1]
+            event = bytes(self._buf[:end])
+            del self._buf[:end]
             out += self._process_event(event)
         if self._done:
             out += self._finish()
@@ -473,7 +484,7 @@ class StreamUsageGuard:
                 target_total,
                 self._believed_limit,
             )
-            lines[i] = b"data: " + json.dumps(payload, separators=(",", ":")).encode()
+            lines[i] = _data_line(payload, line)
             return b"\n".join(lines)
         return event
 
@@ -500,6 +511,6 @@ class StreamUsageGuard:
                 # Never deflate.
                 return event
             usage["input_tokens"] = new_input
-            lines[i] = b"data: " + json.dumps(payload, separators=(",", ":")).encode()
+            lines[i] = _data_line(payload, line)
             return b"\n".join(lines)
         return event
