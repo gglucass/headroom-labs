@@ -648,9 +648,20 @@ class StreamingMixin:
         cache_write_tokens = stream_state["cache_creation_input_tokens"] or 0
         cache_write_5m_tokens = stream_state["cache_creation_ephemeral_5m_input_tokens"] or 0
         cache_write_1h_tokens = stream_state["cache_creation_ephemeral_1h_input_tokens"] or 0
-        uncached_input_tokens = max(
-            effective_optimized_tokens - cache_read_tokens - cache_write_tokens, 0
-        )
+        if provider == "anthropic" and isinstance(provider_input_tokens, int):
+            # Anthropic's usage.input_tokens already IS the uncached count
+            # (tokens after the last cache breakpoint), the field the
+            # non-streaming path records. Deriving it from Headroom's own
+            # tokenizer count books the estimate's error as uncached input:
+            # where the estimate runs over the provider's count (long
+            # screenshot-heavy sessions, ~10%) every turn reported tens of
+            # thousands of phantom uncached tokens, and where it runs under,
+            # real uncached input clamped to 0.
+            uncached_input_tokens = max(provider_input_tokens, 0)
+        else:
+            uncached_input_tokens = max(
+                effective_optimized_tokens - cache_read_tokens - cache_write_tokens, 0
+            )
 
         # Prefix-tracker mutation is provider-specific state that lives
         # outside the metric funnel. Run it before the funnel so the next
