@@ -613,6 +613,8 @@ def _normalize_history_entry(entry: Any) -> dict[str, Any] | None:
     output_tokens_saved = 0
     output_tokens = 0
     output_savings_usd = 0.0
+    tool_tokens_saved = 0
+    tool_schema_savings_usd = 0.0
     total_output_cost_usd = 0.0
     provider = PROVIDER_UNKNOWN
     model = MODEL_UNKNOWN
@@ -631,6 +633,8 @@ def _normalize_history_entry(entry: Any) -> dict[str, Any] | None:
         output_tokens_saved = _coerce_int(entry.get("output_tokens_saved"))
         output_tokens = _coerce_int(entry.get("output_tokens"))
         output_savings_usd = _coerce_float(entry.get("output_savings_usd"))
+        tool_tokens_saved = _coerce_int(entry.get("tool_tokens_saved"))
+        tool_schema_savings_usd = _coerce_float(entry.get("tool_schema_savings_usd"))
         total_output_cost_usd = _coerce_float(entry.get("total_output_cost_usd"))
         provider = _normalize_provider(entry.get("provider"))
         model = _normalize_model(entry.get("model"))
@@ -662,6 +666,8 @@ def _normalize_history_entry(entry: Any) -> dict[str, Any] | None:
         "output_tokens_saved": output_tokens_saved,
         "output_tokens": output_tokens,
         "output_savings_usd": round(output_savings_usd, 6),
+        "tool_tokens_saved": tool_tokens_saved,
+        "tool_schema_savings_usd": round(tool_schema_savings_usd, 6),
         "total_output_cost_usd": round(total_output_cost_usd, 6),
     }
 
@@ -673,6 +679,8 @@ def _empty_display_session() -> dict[str, Any]:
         "compression_savings_usd": 0.0,
         "compression_savings_list_usd": 0.0,
         "savings_basis": BASIS_UNKNOWN,
+        "tool_tokens_saved": 0,
+        "tool_schema_savings_usd": 0.0,
         "cache_read_tokens": 0,
         "cache_savings_usd": 0.0,
         "total_input_tokens": 0,
@@ -809,6 +817,11 @@ def _normalize_display_session(entry: Any) -> dict[str, Any]:
         "compression_savings_usd": round(savings_usd, 6),
         "compression_savings_list_usd": round(savings_list_usd, 6),
         "savings_basis": savings_basis,
+        "tool_tokens_saved": _coerce_int(entry.get("tool_tokens_saved")),
+        "tool_schema_savings_usd": round(
+            _coerce_float(entry.get("tool_schema_savings_usd")),
+            6,
+        ),
         "cache_read_tokens": _coerce_int(entry.get("cache_read_tokens")),
         "cache_savings_usd": round(
             _coerce_float(entry.get("cache_savings_usd")),
@@ -1116,6 +1129,17 @@ class SavingsTracker:
             if priced is not None
             else _estimate_cache_savings_usd(model, delta_cache_read_tokens)
         )
+        # The same figure that was just folded into ``delta_savings_usd``, kept
+        # as its own delta so the layer is also recorded disjointly below. A
+        # consumer can then recover message-only dollars by subtraction --
+        # without this, checkpoint dollars (folded) over checkpoint tokens
+        # (message-only) imply a $/token inflated by 1 + tool/message, which on
+        # tool-heavy traffic (ratios of 5x+ observed) exceeds the model's own
+        # input price. Without the priced breakdown nothing was folded either,
+        # so 0.0 keeps the disjoint field consistent with the sum.
+        delta_tool_savings_usd = (
+            max(_coerce_float(priced.get("tool_schema")), 0.0) if priced is not None else 0.0
+        )
         delta_input_cost_usd = _estimate_input_cost_usd(
             model,
             delta_input_tokens,
@@ -1181,6 +1205,11 @@ class SavingsTracker:
                 lifetime.get("output_savings_usd", 0.0) + delta_output_savings_usd,
                 6,
             )
+            lifetime["tool_tokens_saved"] += delta_tool_tokens_saved
+            lifetime["tool_schema_savings_usd"] = round(
+                lifetime["tool_schema_savings_usd"] + delta_tool_savings_usd,
+                6,
+            )
             # Actual output tokens emitted (not saved): the cumulative the
             # history checkpoints need so a per-bucket output-reduction rate
             # (saved / (saved + actual)) can be diffed out of consecutive
@@ -1214,6 +1243,11 @@ class SavingsTracker:
                 6,
             )
             session["savings_basis"] = _blend_basis(session.get("savings_basis"), delta_basis)
+            session["tool_tokens_saved"] += delta_tool_tokens_saved
+            session["tool_schema_savings_usd"] = round(
+                session["tool_schema_savings_usd"] + delta_tool_savings_usd,
+                6,
+            )
             session["cache_read_tokens"] += delta_cache_read_tokens
             session["cache_savings_usd"] = round(
                 session["cache_savings_usd"] + delta_cache_savings_usd,
@@ -1268,6 +1302,7 @@ class SavingsTracker:
                 delta_tokens_saved > 0
                 or delta_cache_read_tokens > 0
                 or delta_output_tokens_saved > 0
+                or delta_tool_tokens_saved > 0
                 or delta_output_tokens > 0
             ):
                 self._state["history"].append(
@@ -1284,6 +1319,8 @@ class SavingsTracker:
                         "output_tokens_saved": lifetime.get("output_tokens_saved", 0),
                         "output_tokens": lifetime.get("output_tokens", 0),
                         "output_savings_usd": lifetime.get("output_savings_usd", 0.0),
+                        "tool_tokens_saved": lifetime["tool_tokens_saved"],
+                        "tool_schema_savings_usd": lifetime["tool_schema_savings_usd"],
                         "total_output_cost_usd": lifetime.get("total_output_cost_usd", 0.0),
                     }
                 )
@@ -1615,6 +1652,8 @@ class SavingsTracker:
                 "total_input_cost_usd",
                 "output_tokens_saved_delta",
                 "output_savings_usd_delta",
+                "tool_tokens_saved_delta",
+                "tool_schema_savings_usd_delta",
                 "total_output_cost_usd_delta",
             ]
 
@@ -1655,6 +1694,8 @@ class SavingsTracker:
                 "compression_savings_usd": 0.0,
                 "compression_savings_list_usd": 0.0,
                 "savings_basis": BASIS_UNKNOWN,
+                "tool_tokens_saved": 0,
+                "tool_schema_savings_usd": 0.0,
                 "cache_read_tokens": 0,
                 "cache_savings_usd": 0.0,
                 "total_input_tokens": 0,
@@ -1720,6 +1761,8 @@ class SavingsTracker:
         lifetime_requests = 0
         lifetime_tokens_saved = 0
         lifetime_savings_usd = 0.0
+        lifetime_tool_tokens_saved = 0
+        lifetime_tool_savings_usd = 0.0
         lifetime_cache_read_tokens = 0
         lifetime_cache_savings_usd = 0.0
         lifetime_input_tokens = 0
@@ -1735,6 +1778,8 @@ class SavingsTracker:
             lifetime_requests = _coerce_int(lifetime_raw.get("requests"))
             lifetime_tokens_saved = _coerce_int(lifetime_raw.get("tokens_saved"))
             lifetime_savings_usd = _coerce_float(lifetime_raw.get("compression_savings_usd"))
+            lifetime_tool_tokens_saved = _coerce_int(lifetime_raw.get("tool_tokens_saved"))
+            lifetime_tool_savings_usd = _coerce_float(lifetime_raw.get("tool_schema_savings_usd"))
             lifetime_cache_read_tokens = _coerce_int(lifetime_raw.get("cache_read_tokens"))
             lifetime_cache_savings_usd = _coerce_float(lifetime_raw.get("cache_savings_usd"))
             lifetime_input_tokens = _coerce_int(lifetime_raw.get("total_input_tokens"))
@@ -1759,6 +1804,14 @@ class SavingsTracker:
             lifetime_savings_usd = max(
                 lifetime_savings_usd,
                 _coerce_float(last["compression_savings_usd"]),
+            )
+            lifetime_tool_tokens_saved = max(
+                lifetime_tool_tokens_saved,
+                _coerce_int(last.get("tool_tokens_saved")),
+            )
+            lifetime_tool_savings_usd = max(
+                lifetime_tool_savings_usd,
+                _coerce_float(last.get("tool_schema_savings_usd")),
             )
             lifetime_input_tokens = max(
                 lifetime_input_tokens,
@@ -1814,6 +1867,8 @@ class SavingsTracker:
                 "compression_savings_list_usd": round(lifetime_savings_list_usd, 6),
                 "savings_basis": lifetime_basis,
                 "savings_basis_migrated_at": migrated_at,
+                "tool_tokens_saved": lifetime_tool_tokens_saved,
+                "tool_schema_savings_usd": round(lifetime_tool_savings_usd, 6),
                 "cache_read_tokens": lifetime_cache_read_tokens,
                 "cache_savings_usd": round(lifetime_cache_savings_usd, 6),
                 "total_input_tokens": lifetime_input_tokens,
@@ -2100,6 +2155,8 @@ class SavingsTracker:
         prev_total_input_cost_usd = 0.0
         prev_output_tokens = 0
         prev_output_usd = 0.0
+        prev_tool_tokens = 0
+        prev_tool_usd = 0.0
         prev_output_cost_usd = 0.0
         prev_cache_read_tokens = 0
         prev_cache_savings_usd = 0.0
@@ -2155,6 +2212,8 @@ class SavingsTracker:
             total_input_cost_usd = _coerce_float(point.get("total_input_cost_usd"))
             total_output_tokens = _coerce_int(point.get("output_tokens_saved"))
             total_output_usd = _coerce_float(point.get("output_savings_usd"))
+            total_tool_tokens = _coerce_int(point.get("tool_tokens_saved"))
+            total_tool_usd = _coerce_float(point.get("tool_schema_savings_usd"))
             total_output_cost_usd = _coerce_float(point.get("total_output_cost_usd"))
             delta_tokens = max(total_tokens_saved - prev_total_tokens, 0)
             delta_usd = max(total_usd - prev_total_usd, 0.0)
@@ -2166,6 +2225,8 @@ class SavingsTracker:
 
             delta_output_tokens = max(total_output_tokens - prev_output_tokens, 0)
             delta_output_usd = max(total_output_usd - prev_output_usd, 0.0)
+            delta_tool_tokens = max(total_tool_tokens - prev_tool_tokens, 0)
+            delta_tool_usd = max(total_tool_usd - prev_tool_usd, 0.0)
             delta_output_cost_usd = max(total_output_cost_usd - prev_output_cost_usd, 0.0)
 
             total_cache_read_tokens = _coerce_int(point.get("cache_read_tokens"))
@@ -2183,6 +2244,8 @@ class SavingsTracker:
             prev_total_input_cost_usd = total_input_cost_usd
             prev_output_tokens = total_output_tokens
             prev_output_usd = total_output_usd
+            prev_tool_tokens = total_tool_tokens
+            prev_tool_usd = total_tool_usd
             prev_output_cost_usd = total_output_cost_usd
 
             entry = aggregated.setdefault(
@@ -2199,6 +2262,10 @@ class SavingsTracker:
                     "total_input_cost_usd": total_input_cost_usd,
                     "output_tokens_saved_delta": 0,
                     "output_savings_usd_delta": 0.0,
+                    "tool_tokens_saved_delta": 0,
+                    "tool_schema_savings_usd_delta": 0.0,
+                    "tool_tokens_saved": total_tool_tokens,
+                    "tool_schema_savings_usd": total_tool_usd,
                     "total_output_cost_usd_delta": 0.0,
                     "total_output_cost_usd": total_output_cost_usd,
                     **_empty_cache_delta(),
@@ -2225,6 +2292,13 @@ class SavingsTracker:
                 entry["output_savings_usd_delta"] + delta_output_usd,
                 6,
             )
+            entry["tool_tokens_saved_delta"] += delta_tool_tokens
+            entry["tool_schema_savings_usd_delta"] = round(
+                entry["tool_schema_savings_usd_delta"] + delta_tool_usd,
+                6,
+            )
+            entry["tool_tokens_saved"] = total_tool_tokens
+            entry["tool_schema_savings_usd"] = round(total_tool_usd, 6)
             entry["total_output_cost_usd_delta"] = round(
                 entry["total_output_cost_usd_delta"] + delta_output_cost_usd,
                 6,
