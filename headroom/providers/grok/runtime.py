@@ -14,9 +14,6 @@ DEFAULT_API_URL = "https://api.x.ai"
 # API keys and answers a session token 401.
 SESSION_API_URL = "https://cli-chat-proxy.grok.com"
 PROXY_ENV_KEY = "GROK_MODELS_BASE_URL"
-_XAI_TOKEN_AUTH_HEADER = "x-xai-token-auth"
-_XAI_TOKEN_AUTH_VALUE = "xai-grok-cli"
-_GROK_UA_PREFIXES = ("grok-shell/", "grok/")
 #: User agents trusted to REDIRECT a credential, which is a stricter question
 #: than "is this a Grok CLI". The bare ``grok/`` prefix is deliberately absent:
 #: it is already claimed with a different meaning in
@@ -27,6 +24,43 @@ _SESSION_UA_PREFIXES = ("grok-shell/",)
 #: Kill switch for an operator who never wants a request re-pointed at
 #: grok.com, whatever it claims to be. Any value but "0" leaves routing on.
 SESSION_ROUTING_ENV_KEY = "HEADROOM_GROK_SESSION_ROUTING"
+
+# Official Grok CLI / Grok Build stamps this on inference requests (observed on
+# grok-shell 0.2.x). Used for per-request xAI routing when the shared proxy's
+# process-wide OPENAI target is still api.openai.com (Claude/Codex-started).
+_XAI_TOKEN_AUTH_HEADER = "x-xai-token-auth"
+_XAI_TOKEN_AUTH_VALUE = "xai-grok-cli"
+# UA product tokens emitted by Grok CLI 0.2.x. Matched against whitespace-split
+# tokens so unrelated clients ("litellm-grok/1.0") cannot collide.
+_GROK_UA_PREFIXES = ("grok-pager/", "grok-shell/")
+
+
+def _header_value(headers: Mapping[str, str], name: str) -> str | None:
+    """Case-insensitive header lookup for plain mappings and Starlette Headers."""
+    lowered = name.lower()
+    for key, value in headers.items():
+        if key.lower() == lowered:
+            return value
+    return None
+
+
+def is_grok_cli_request(headers: Mapping[str, str]) -> bool:
+    """Return True when inbound headers identify the official Grok CLI.
+
+    Grok cannot stamp ``x-headroom-base-url`` (no custom attribution headers),
+    so shared-proxy routing must recognize the CLI from wire signals instead.
+    Detection is intentionally narrow: only the official token-auth marker and
+    known Grok UA product tokens (prefix match on whitespace-split tokens) —
+    never model-id heuristics.
+    """
+    token_auth = _header_value(headers, _XAI_TOKEN_AUTH_HEADER)
+    if token_auth is not None and token_auth.strip().lower() == _XAI_TOKEN_AUTH_VALUE:
+        return True
+
+    user_agent = _header_value(headers, "user-agent")
+    if not user_agent:
+        return False
+    return any(token.startswith(_GROK_UA_PREFIXES) for token in user_agent.lower().split())
 
 
 def proxy_base_url(port: int) -> str:
@@ -53,27 +87,6 @@ def build_launch_env(
     base_url = with_project_prefix(proxy_base_url(port), project)
     env[PROXY_ENV_KEY] = base_url
     return env, [f"{PROXY_ENV_KEY}={base_url}"]
-
-
-def _header(headers: Mapping[str, str], name: str) -> str | None:
-    for key, value in headers.items():
-        if key.lower() == name:
-            return value
-    return None
-
-
-def is_grok_cli_request(headers: Mapping[str, str]) -> bool:
-    """Return True when the inbound headers identify the official Grok CLI.
-
-    Attribution only. Every signal it reads is client-controlled, so it must
-    never decide where a credential is SENT - see :func:`session_upstream`,
-    which asks a deliberately narrower question.
-    """
-    token_auth = _header(headers, _XAI_TOKEN_AUTH_HEADER)
-    if token_auth is not None and token_auth.strip().lower() == _XAI_TOKEN_AUTH_VALUE:
-        return True
-    user_agent = (_header(headers, "user-agent") or "").lower()
-    return any(token.startswith(_GROK_UA_PREFIXES) for token in user_agent.split())
 
 
 def session_upstream(headers: Mapping[str, str], configured_target: str | None) -> str | None:
@@ -124,15 +137,15 @@ def _is_xai_target(url: str | None) -> bool:
 
 def _is_grok_session_client(headers: Mapping[str, str]) -> bool:
     """Grok CLI signals strong enough to justify re-pointing a credential."""
-    token_auth = _header(headers, _XAI_TOKEN_AUTH_HEADER)
+    token_auth = _header_value(headers, _XAI_TOKEN_AUTH_HEADER)
     if token_auth is not None and token_auth.strip().lower() == _XAI_TOKEN_AUTH_VALUE:
         return True
-    user_agent = (_header(headers, "user-agent") or "").lower()
+    user_agent = (_header_value(headers, "user-agent") or "").lower()
     return any(token.startswith(_SESSION_UA_PREFIXES) for token in user_agent.split())
 
 
 def _bearer_is_api_key(headers: Mapping[str, str]) -> bool:
-    value = (_header(headers, "authorization") or "").strip().lower()
+    value = (_header_value(headers, "authorization") or "").strip().lower()
     return value.startswith("bearer xai-")
 
 
@@ -142,7 +155,7 @@ def _bearer_is_session_jwt(headers: Mapping[str, str]) -> bool:
     Not case-folded: base64url is case-sensitive and a real JWT header segment
     starts with the exact bytes ``eyJ``.
     """
-    raw = (_header(headers, "authorization") or "").strip()
+    raw = (_header_value(headers, "authorization") or "").strip()
     if len(raw) < 7 or raw[:7].lower() != "bearer ":
         return False
     token = raw[7:].strip()
