@@ -386,9 +386,11 @@ def _extends_past_system_tail(current_messages: list[Any], previous_messages: li
     replaces it on the next turn, so the recorded history is never a prefix of
     the new one.  Only that last message is excluded: everything before it
     must survive unchanged and include real user/assistant history, so a
-    changed leading or historical system instruction still diverges.
+    changed leading or historical system instruction still diverges, and the
+    new history must be longer, so a sibling that only swaps the final
+    instruction is not a continuation.
     """
-    if len(previous_messages) < 2 or len(current_messages) < len(previous_messages):
+    if len(previous_messages) < 2 or len(current_messages) <= len(previous_messages):
         return False
     tail = previous_messages[-1]
     if not isinstance(tail, dict) or tail.get("role") != "system":

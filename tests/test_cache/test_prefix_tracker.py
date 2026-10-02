@@ -872,6 +872,15 @@ class TestConversationLineageResolution:
         tracker = store.resolve_tracker("sid", "anthropic", previous)
         assert store.resolve_tracker("sid", "anthropic", current) is not tracker
 
+    def test_swapped_final_instruction_is_not_a_continuation(self, store):
+        """Same-length siblings that differ only in their final system message
+        stay separate: the new history must extend past the old reminder."""
+        first = [{"role": "user", "content": "task"}, {"role": "system", "content": "A"}]
+        second = [{"role": "user", "content": "task"}, {"role": "system", "content": "B"}]
+        tracker = store.resolve_tracker("sid", "anthropic", first)
+        assert store.resolve_tracker("sid", "anthropic", second) is not tracker
+        assert store.resolve_tracker("sid", "anthropic", first) is tracker
+
     def test_ambiguous_system_tail_siblings_are_not_merged(self, store, monkeypatch):
         """Two lineages that differ only in their reminder (recorded here with
         the fallback disabled) are an ambiguous match: start a fresh lineage
