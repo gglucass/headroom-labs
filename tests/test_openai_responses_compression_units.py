@@ -1525,3 +1525,60 @@ def test_openai_responses_deadline_budget_stays_inside_the_timeout(
         return
     expires_at = origin + int(deadline_ms) / 1000
     assert before + budget <= expires_at <= after + budget
+
+
+@pytest.mark.parametrize(
+    ("compress_user_messages", "expected_user_text"),
+    [(False, None), (None, "compressed history")],
+)
+def test_openai_responses_adapter_historical_user_follows_compress_user_messages(
+    compress_user_messages, expected_user_text
+):
+    # An explicit off (HEADROOM_COMPRESS_USER_MESSAGES=0) keeps earlier user
+    # turns verbatim on Responses too; unset keeps the coding profile's default.
+    from headroom.proxy.models import ProxyConfig
+
+    router = ContentRouter()
+
+    def compress(self, content: str, **_kwargs) -> RouterCompressionResult:
+        return RouterCompressionResult(
+            compressed="compressed history",
+            original=content,
+            strategy_used=CompressionStrategy.KOMPRESS,
+        )
+
+    router.compress = MethodType(compress, router)
+    handler = _handler_with_router(router)
+    handler.config = ProxyConfig(
+        savings_profile="coding", compress_user_messages=compress_user_messages
+    )
+    historical_text = " ".join(f"history{i}" for i in range(2000))
+    tool_output = " ".join(f"line{i}" for i in range(2000))
+    current_text = " ".join(f"current{i}" for i in range(2000))
+    payload = {
+        "model": "gpt-5",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": historical_text}],
+            },
+            {"type": "function_call_output", "call_id": "c1", "output": tool_output},
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": current_text}],
+            },
+        ],
+    }
+
+    new_payload, modified, _saved, _transforms, _units, _chain, _attempted = (
+        handler._compress_openai_responses_live_text_units_with_router(
+            payload, model="gpt-5", request_id="req_user_flag"
+        )
+    )
+
+    assert modified is True
+    assert new_payload["input"][0]["content"][0]["text"] == (expected_user_text or historical_text)
+    assert new_payload["input"][1]["output"] == "compressed history"
+    assert new_payload["input"][2]["content"][0]["text"] == current_text
