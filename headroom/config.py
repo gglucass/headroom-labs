@@ -528,13 +528,14 @@ class ReadMaturationConfig:
     roughly 13x its size. The only cache-safe moment to shrink it is
     BEFORE it is ever cache-written.
 
-    Mechanics: a fresh large Read is held out of the provider prefix
-    cache (the trailing cache breakpoint is relocated to just before it)
-    while its file is ACTIVE, stays verbatim the whole time the model is
-    working with it, and matures into a CCR-backed marker once the file
-    has been quiet for `quiesce_turns`. Only that final compressed form
-    ever enters the cache. No cached byte is ever mutated — there is
-    nothing to bust.
+    Mechanics: a fresh large Read is held verbatim while its file is
+    ACTIVE, so the model sees the full text the whole time it is working
+    with it, and matures into a CCR-backed marker once the file has been
+    quiet for `quiesce_turns`, if it is still outside the provider-cached
+    prefix. The held Read is cached with its turn (the client's
+    breakpoints stay in place), so in a warm session it usually stays
+    verbatim: re-writing everything after a cached Read costs more than
+    the Read saves.
 
     Activity-based (not a fixed hold window) because the audit-reads
     simulation showed touch gaps are fat-tailed: next-touch p50 is 4

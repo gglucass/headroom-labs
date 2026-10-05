@@ -268,7 +268,7 @@ Coding agents re-read the same files repeatedly; these control how stale reads a
 | Flag / env | Default | Effect |
 |---|---|---|
 | `--no-read-lifecycle` | lifecycle on | Stop replacing stale/superseded file reads with CCR markers. |
-| `--read-maturation` / `HEADROOM_READ_MATURATION` | `false` | *(Beta)* Hold freshly-read files out of the prefix cache until the file quiesces. Requires `HEADROOM_ROLLOUT_CHANNEL=beta` (or `dev`). |
+| `--read-maturation` / `HEADROOM_READ_MATURATION` | `false` | *(Beta)* Keep freshly-read files verbatim while in use, then compress them once the file quiesces, unless the provider cache already holds them. Requires `HEADROOM_ROLLOUT_CHANNEL=beta` (or `dev`). |
 | `--read-maturation-quiesce-turns` | `5` | Turns of no change before a held read is admitted. |
 
 ### Reliability: timeouts, retries, limits
