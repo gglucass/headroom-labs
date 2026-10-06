@@ -488,7 +488,7 @@ class TestStreamResponseIntegration:
         mock_response.aread = AsyncMock(return_value=sse_bytes)
         return mock_response
 
-    async def _run(self, proxy, mock_response, headers):
+    async def _run(self, proxy, mock_response, headers, **kwargs):
         from unittest.mock import AsyncMock, MagicMock
 
         proxy.http_client.build_request = MagicMock(return_value=MagicMock())
@@ -511,6 +511,7 @@ class TestStreamResponseIntegration:
             transforms_applied=[],
             tags={},
             optimization_latency=0.0,
+            **kwargs,
         )
 
     @pytest.mark.asyncio
@@ -595,3 +596,71 @@ class TestStreamResponseIntegration:
             )
             == 1_000_000
         )
+
+    @pytest.mark.asyncio
+    async def test_guard_nudges_what_the_memory_filter_releases(self):
+        """The guard runs after the memory filter, on the client-bound frames.
+
+        The filter withholds the proxy's memory call and holds message_delta
+        until the turn's outcome is known; that held delta is still the one
+        the client merges over message_start, so it must come out nudged.
+        """
+        from unittest.mock import AsyncMock, MagicMock
+
+        def frame(payload: dict) -> bytes:
+            return f"event: {payload['type']}\ndata: {json.dumps(payload)}\n\n".encode()
+
+        def tool_block(index: int, tool_id: str, name: str) -> bytes:
+            return (
+                frame(
+                    {
+                        "type": "content_block_start",
+                        "index": index,
+                        "content_block": {"type": "tool_use", "id": tool_id, "name": name},
+                    }
+                )
+                + frame(
+                    {
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {"type": "input_json_delta", "partial_json": "{}"},
+                    }
+                )
+                + frame({"type": "content_block_stop", "index": index})
+            )
+
+        delta = json.loads(_message_delta_event(185_000).split(b"data: ")[1])
+        delta["delta"]["stop_reason"] = "tool_use"
+        sse = (
+            _message_start_event(185_000)
+            + tool_block(0, "toolu_mem", "memory_save")
+            + tool_block(1, "toolu_bash", "Bash")
+            + frame(delta)
+            + frame({"type": "message_stop"})
+        )
+        proxy = self._create_mock_proxy()
+        proxy.memory_handler = MagicMock()
+        proxy.memory_handler.handle_memory_tool_calls = AsyncMock(
+            return_value=[{"type": "tool_result", "tool_use_id": "toolu_mem", "content": "ok"}]
+        )
+        result = await self._run(
+            proxy,
+            self._mock_upstream(sse),
+            {"x-api-key": "sk-test"},
+            memory_user_id="user-1",
+            server_memory_tool_names=frozenset({"memory_save"}),
+        )
+        client_bytes = b"".join([chunk async for chunk in result.body_iterator])
+        events = [
+            json.loads(line[len(b"data: ") :])
+            for line in client_bytes.split(b"\n")
+            if line.startswith(b"data: ")
+        ]
+
+        assert b"memory_save" not in client_bytes
+        assert events[0]["message"]["usage"]["input_tokens"] == int(200_000 * REPORT_FRACTION)
+        final = [e for e in events if e["type"] == "message_delta"]
+        assert len(final) == 1
+        assert final[0]["delta"]["stop_reason"] == "tool_use"
+        assert final[0]["usage"]["input_tokens"] == int(200_000 * REPORT_FRACTION)
+        proxy.memory_handler.handle_memory_tool_calls.assert_awaited_once()
