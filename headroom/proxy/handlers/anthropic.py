@@ -4140,6 +4140,7 @@ class AnthropicHandlerMixin:
                         outcome_provider=provider_name,
                         session_key=session_key,
                         server_memory_tool_names=server_memory_tool_names,
+                        client_beta=client_anthropic_beta or "",
                     )
                 else:
                     # Whatever set it — the client's own ``stream: false`` or
@@ -5070,6 +5071,7 @@ class AnthropicHandlerMixin:
                                             model=model,
                                             headers=headers,
                                             request_id=request_id,
+                                            client_beta=client_anthropic_beta or "",
                                         ),
                                         status_code=response.status_code,
                                         headers=response_headers,
@@ -5195,7 +5197,11 @@ class AnthropicHandlerMixin:
                             # This stream is resynthesized from the parsed message,
                             # so the streaming guard never sees it: nudge here.
                             self._context_guard_nudge_message(
-                                resp_json, model=model, headers=headers, request_id=request_id
+                                resp_json,
+                                model=model,
+                                headers=headers,
+                                request_id=request_id,
+                                client_beta=client_anthropic_beta or "",
                             )
                             try:
                                 sse_events = self._response_to_sse(resp_json, "anthropic")
@@ -5234,6 +5240,7 @@ class AnthropicHandlerMixin:
                                 model=model,
                                 headers=headers,
                                 request_id=request_id,
+                                client_beta=client_anthropic_beta or "",
                             ),
                             status_code=response.status_code,
                             headers=response_headers,
@@ -5373,6 +5380,7 @@ class AnthropicHandlerMixin:
         model: str,
         headers: dict[str, str],
         request_id: str,
+        client_beta: str | None = None,
     ) -> bytes:
         """Apply the context guard to a buffered (non-streaming) message body.
 
@@ -5394,7 +5402,11 @@ class AnthropicHandlerMixin:
         except Exception:
             return content
         if not self._context_guard_nudge_message(
-            payload, model=model, headers=headers, request_id=request_id
+            payload,
+            model=model,
+            headers=headers,
+            request_id=request_id,
+            client_beta=client_beta,
         ):
             return content
         return json.dumps(payload).encode()
@@ -5406,12 +5418,15 @@ class AnthropicHandlerMixin:
         model: str,
         headers: dict[str, str],
         request_id: str,
+        client_beta: str | None = None,
     ) -> bool:
         """Nudge a parsed message's usage in place; True when it changed.
 
         Shared by the buffered body above and the buffered-CCR stream, which
         resynthesizes SSE from the parsed message and so never passes through
-        the streaming guard.
+        the streaming guard. ``client_beta`` is the beta the client itself
+        sent (its gauge follows it; session-sticky merging can add context-1m
+        to the outbound header); None falls back to the outbound header.
         """
         try:
             from headroom.proxy.context_guard import (
@@ -5431,7 +5446,9 @@ class AnthropicHandlerMixin:
             return bool(
                 nudge_response_usage(
                     payload,
-                    believed_limit=believed_context_limit(model_limit, beta_header),
+                    believed_limit=believed_context_limit(
+                        model_limit, beta_header if client_beta is None else client_beta
+                    ),
                     effective_limit=effective_context_limit(
                         model,
                         model_limit,

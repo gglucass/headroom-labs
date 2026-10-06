@@ -1029,6 +1029,7 @@ class StreamingMixin:
         conversation_key: str | None = None,
         conversation_tokens_saved: int | None = None,
         server_memory_tool_names: frozenset[str] | None = None,
+        client_beta: str | None = None,
     ) -> Response | StreamingResponse:
         """Stream response with metrics tracking and memory tool handling.
 
@@ -1075,6 +1076,7 @@ class StreamingMixin:
                 conversation_key=conversation_key,
                 conversation_tokens_saved=conversation_tokens_saved,
                 server_memory_tool_names=server_memory_tool_names,
+                client_beta=client_beta,
             )
         except (Exception, asyncio.CancelledError):
             self._cleanup_mid_turn_stream(session_key)
@@ -1108,6 +1110,7 @@ class StreamingMixin:
         conversation_key: str | None = None,
         conversation_tokens_saved: int | None = None,
         server_memory_tool_names: frozenset[str] | None = None,
+        client_beta: str | None = None,
     ) -> Response | StreamingResponse:
         """Actual streaming implementation, guarded by _stream_response's cleanup wrapper."""
         from fastapi.responses import Response, StreamingResponse
@@ -1155,7 +1158,14 @@ class StreamingMixin:
                     _guard_beta = headers.get("anthropic-beta")
                     _guard_scope = credential_scope_from_headers(headers)
                     context_guard = StreamUsageGuard(
-                        believed_limit=believed_context_limit(_guard_model_limit, _guard_beta),
+                        # The client's gauge follows the beta the client
+                        # sent; session-sticky merging can add context-1m to
+                        # the outbound header after the client dropped it.
+                        # None: the caller did not say, use the outbound one.
+                        believed_limit=believed_context_limit(
+                            _guard_model_limit,
+                            _guard_beta if client_beta is None else client_beta,
+                        ),
                         effective_limit=effective_context_limit(
                             model, _guard_model_limit, _guard_beta, scope=_guard_scope
                         ),

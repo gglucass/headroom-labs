@@ -598,6 +598,34 @@ class TestStreamResponseIntegration:
         )
 
     @pytest.mark.asyncio
+    async def test_sticky_1m_beta_does_not_inflate_a_200k_client_gauge(self):
+        """The client dropped context-1m; session-sticky merging kept it outbound.
+
+        The learned cap still keys on the forwarded beta, but the client's
+        gauge is its own 200k window, so the nudge must target 95% of 200k.
+        """
+        beta_1m = "context-1m-2025-08-07"
+        note_prompt_too_long(
+            "claude-sonnet-4-5",
+            beta_1m,
+            "prompt is too long: 213021 tokens > 200000 maximum",
+            scope=credential_scope("sk-sticky"),
+        )
+        proxy = self._create_mock_proxy()
+        sse = _message_start_event(185_000) + _message_delta_event(185_000)
+        result = await self._run(
+            proxy,
+            self._mock_upstream(sse),
+            {"x-api-key": "sk-sticky", "anthropic-beta": beta_1m},
+            client_beta="",
+        )
+        client_bytes = b"".join([chunk async for chunk in result.body_iterator])
+        events = client_bytes.split(b"\n\n")
+        assert _parse_usage(events[0] + b"\n\n")["input_tokens"] == int(200_000 * REPORT_FRACTION)
+        delta_usage = json.loads(events[1].split(b"data: ")[1])["usage"]
+        assert delta_usage["input_tokens"] == int(200_000 * REPORT_FRACTION)
+
+    @pytest.mark.asyncio
     async def test_guard_nudges_what_the_memory_filter_releases(self):
         """The guard runs after the memory filter, on the client-bound frames.
 
