@@ -1161,6 +1161,8 @@ def test_openai_chat_outcome_provider_uses_the_fixed_taxonomy(
         _chat("https://llm.example.internal/v1")
         # No header: the plain OpenAI path keeps its own label (control).
         _chat(None)
+        _chat("https://api.x.ai")
+        _chat("https://api.x.ai.")
 
         # Grok CLI on the default OpenAI target is routed to api.x.ai without
         # a base-url header (#2693); it is still xAI traffic, not OpenAI's.
@@ -1175,7 +1177,7 @@ def test_openai_chat_outcome_provider_uses_the_fixed_taxonomy(
         assert by_provider["meta"] == 2
         assert by_provider["custom"] == 1
         assert by_provider["openai"] == 1
-        assert by_provider["xai"] == 1
+        assert by_provider["xai"] == 3
 
 
 def test_openai_chat_custom_base_flood_cannot_grow_the_provider_set(

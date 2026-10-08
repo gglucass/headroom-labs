@@ -43,10 +43,10 @@ def test_client_explicit_override_wins_over_user_agent() -> None:
     assert classify_client_signals(signals) == "aider"
 
 
-def test_grok_build_user_agent_is_subscription_client() -> None:
+def test_grok_build_user_agent_keeps_credential_driven_policy() -> None:
     signals = AuthSignals(user_agent="grok/1.2.3")
 
-    assert classify_auth_signals(signals) is AuthMode.SUBSCRIPTION
+    assert classify_auth_signals(signals) is AuthMode.PAYG
     assert classify_client_signals(signals) == "grok_build"
 
 

@@ -19,7 +19,6 @@ SUBSCRIPTION_UA_PREFIXES: tuple[str, ...] = (
     "claude-code/",
     "codex-cli/",
     "cursor/",
-    "grok/",
     "claude-vscode/",
     "github-copilot/",
     "anthropic-cli/",

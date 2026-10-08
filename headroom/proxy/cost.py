@@ -15,6 +15,7 @@ from collections import deque
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, NamedTuple
 
+from headroom.cache_economics import CACHE_ECONOMICS as _CACHE_ECONOMICS
 from headroom.proxy.budget_basis_policy import (
     BUDGET_BASIS_BLOCK,
     BUDGET_BASIS_IGNORE,
@@ -109,35 +110,6 @@ class CostEntry(NamedTuple):
 # source for cache economics, and these ratios stand in when a model publishes
 # no cache pricing. Hardcoded ratios go stale per model and per context tier
 # (Anthropic's >200k rates differ), so they are never preferred over the catalog.
-_CACHE_ECONOMICS = {
-    "anthropic": {
-        "read_multiplier": 0.1,
-        "write_multiplier": 1.25,
-        "label": "Explicit breakpoints, 5-min TTL",
-    },
-    "openai": {
-        "read_multiplier": 0.5,
-        "write_multiplier": 1.0,
-        "label": "Automatic, no TTL control",
-    },
-    "gemini": {
-        "read_multiplier": 0.1,
-        "write_multiplier": 1.0,
-        "label": "Explicit cachedContent, configurable TTL",
-    },
-    "bedrock": {
-        "read_multiplier": 0.1,
-        "write_multiplier": 1.25,
-        "label": "Same as Anthropic (Bedrock)",
-    },
-    # The modal LiteLLM ratio across xai/grok-* (cache read 0.20 vs 1.25 $/M);
-    # xAI caches automatically with no write premium.
-    "xai": {
-        "read_multiplier": 0.16,
-        "write_multiplier": 1.0,
-        "label": "Automatic, no TTL control",
-    },
-}
 
 
 #: Context size at which the major catalogs publish a second, higher price
@@ -1158,13 +1130,13 @@ class CostTracker:
             self._api_cache_read_by_model.get(model, 0) + cache_read_tokens
         )
         self._api_cache_write_by_model[model] = (
-            self._api_cache_write_by_model.get(model, 0) + cache_write_tokens
+            self._api_cache_write_by_model.get(model, 0) + write_eff
         )
         self._api_cache_write_5m_by_model[model] = (
-            self._api_cache_write_5m_by_model.get(model, 0) + cache_write_5m_tokens
+            self._api_cache_write_5m_by_model.get(model, 0) + write_5m_eff
         )
         self._api_cache_write_1h_by_model[model] = (
-            self._api_cache_write_1h_by_model.get(model, 0) + cache_write_1h_tokens
+            self._api_cache_write_1h_by_model.get(model, 0) + write_1h_eff
         )
         self._api_uncached_by_model[model] = (
             self._api_uncached_by_model.get(model, 0) + uncached_tokens

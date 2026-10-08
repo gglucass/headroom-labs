@@ -60,6 +60,7 @@ from enum import Enum
 from functools import lru_cache
 from typing import Any
 
+from headroom.cache_economics import CACHE_ECONOMICS
 from headroom.pricing.cache_ttl import CACHE_WRITE_MULTIPLIERS
 
 logger = logging.getLogger(__name__)
@@ -71,30 +72,8 @@ LONG_CONTEXT_THRESHOLD_TOKENS = 200_000
 
 #: Provider-level cache discount ratios, as a fraction of the base input price.
 #: FALLBACK ONLY — the per-model LiteLLM catalog is always preferred, because
-#: these go stale per model and per context tier. Kept here (rather than in
-#: ``proxy/cost.py``, where they used to live) so every consumer shares one copy.
-CACHE_ECONOMICS: dict[str, dict[str, Any]] = {
-    "anthropic": {
-        "read_multiplier": 0.1,
-        "write_multiplier": 1.25,
-        "label": "Explicit breakpoints, 5-min TTL",
-    },
-    "openai": {
-        "read_multiplier": 0.5,
-        "write_multiplier": 1.0,
-        "label": "Automatic, no TTL control",
-    },
-    "gemini": {
-        "read_multiplier": 0.1,
-        "write_multiplier": 1.0,
-        "label": "Explicit cachedContent, configurable TTL",
-    },
-    "bedrock": {
-        "read_multiplier": 0.1,
-        "write_multiplier": 1.25,
-        "label": "Same as Anthropic (Bedrock)",
-    },
-}
+#: these go stale per model and per context tier. The lightweight shared table
+#: is also used by the dashboard, without importing the pricing package there.
 
 
 class Region(str, Enum):
@@ -463,7 +442,15 @@ def resolve_rates(
     if read == base and write_5m == base and base > 0:
         # Catalog priced the model but published no cache rates. Fall back to
         # the provider ratio table if we can identify the provider.
-        econ = CACHE_ECONOMICS.get((provider or "").split(":")[-1].strip().lower())
+        # Model-only cost consumers do not have a request provider to pass.
+        # Prefer explicit routing context, otherwise use the catalog identity.
+        resolved_provider = provider or info.get("litellm_provider") or ""
+        provider_key = (
+            resolved_provider.split(":")[-1].strip().lower()
+            if isinstance(resolved_provider, str)
+            else ""
+        )
+        econ = CACHE_ECONOMICS.get(provider_key)
         if econ:
             return CacheRates(
                 read=base * float(econ["read_multiplier"]),
