@@ -613,7 +613,6 @@ class TestCCRResponseHandling:
                 }
             ]
         }
-        # Re-issued with its own id and differently spaced arguments: same call.
         final = {
             "choices": [
                 {
@@ -663,45 +662,59 @@ class TestCCRResponseHandling:
     @pytest.mark.parametrize(
         "continuation",
         [
-            # Answers without re-issuing the client call.
-            {"content": [{"type": "text", "text": "Done"}], "stop_reason": "end_turn"},
-            # Re-issues it with different input: not the call the model made.
+            # Withdraws the client call once it has the content.
+            {
+                "content": [{"type": "text", "text": "Do not overwrite old.txt."}],
+                "stop_reason": "end_turn",
+            },
+            # Changes it.
             {
                 "content": [
                     {
                         "type": "tool_use",
                         "id": "user_call_2",
                         "name": "write_file",
-                        "input": {"path": "/tmp/other"},
+                        "input": {"path": "new.txt", "content": "safe output"},
+                    }
+                ],
+                "stop_reason": "tool_use",
+            },
+            # Re-issues it unchanged.
+            {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "user_call_2",
+                        "name": "write_file",
+                        "input": {"path": "old.txt", "content": "overwrite"},
                     }
                 ],
                 "stop_reason": "tool_use",
             },
         ],
-        ids=["not_reissued", "reissued_changed"],
+        ids=["withdrawn", "changed", "reissued"],
     )
-    async def test_handle_response_mixed_tools_returns_turn_when_not_reissued(self, continuation):
-        """A dropped client call is delivered only by an unchanged re-issue.
-        Otherwise the client gets the model's own turn back, as before (#839),
-        so the write still runs."""
+    async def test_handle_response_mixed_tools_returns_the_continuation(self, continuation):
+        """The continuation is the model's newer decision, made with the
+        retrieved content: the client gets it, never the dropped call."""
         store = get_compression_store()
         hash_key = store.store(original="[1,2,3]", compressed="[]")
-        mixed_response = self._mixed_turn(hash_key, {"path": "/tmp/out"})
-        sent = []
+        mixed_response = self._mixed_turn(hash_key, {"path": "old.txt", "content": "overwrite"})
 
         async def mock_api_call(messages, tools):
-            sent.append(messages)
             return continuation
 
         result = await CCRResponseHandler().handle_response(
             mixed_response, [], None, mock_api_call, "anthropic"
         )
 
-        assert len(sent) == 1
-        assert result is mixed_response
+        assert result is continuation
+        assert "user_call" not in [b.get("id") for b in result["content"]]
 
     @pytest.mark.asyncio
     async def test_handle_response_mixed_tools_failed_continuation_returns_turn(self):
+        """No newer decision: the client gets the model's own turn, client
+        call included, as before (#839)."""
         store = get_compression_store()
         hash_key = store.store(original="[1,2,3]", compressed="[]")
         mixed_response = self._mixed_turn(hash_key, {"path": "/tmp/out"})
@@ -714,6 +727,40 @@ class TestCCRResponseHandling:
         )
 
         assert result is mixed_response
+
+    @pytest.mark.asyncio
+    async def test_handle_response_mixed_tools_later_failure_keeps_the_continuation(self):
+        """A continuation that succeeded supersedes the mixed turn even when a
+        later retrieval round fails."""
+        store = get_compression_store()
+        hash_key = store.store(original="[1,2,3]", compressed="[]")
+        mixed_response = self._mixed_turn(hash_key, {"path": "/tmp/out"})
+        retrieve_again = {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "ccr_call_2",
+                    "name": CCR_TOOL_NAME,
+                    "input": {"hash": hash_key},
+                }
+            ],
+            "stop_reason": "tool_use",
+        }
+        calls = 0
+
+        async def mock_api_call(messages, tools):
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                raise RuntimeError("upstream down")
+            return retrieve_again
+
+        result = await CCRResponseHandler().handle_response(
+            mixed_response, [], None, mock_api_call, "anthropic"
+        )
+
+        assert calls == 2
+        assert result is retrieve_again
 
     @pytest.mark.asyncio
     async def test_handle_response_malformed_ccr_call_keeps_turn(self):

@@ -84,8 +84,9 @@ def _message_response(content: list[dict], *, stop_reason: str = "end_turn") -> 
 
 
 class _ContinuationClient:
-    def __init__(self, response_json: dict) -> None:
+    def __init__(self, response_json: dict, status_code: int = 200) -> None:
         self.response_json = response_json
+        self.status_code = status_code
         self.post_calls: list[dict] = []
 
     async def post(self, url, *, content=None, headers=None, timeout=None):  # noqa: ANN001
@@ -97,7 +98,7 @@ class _ContinuationClient:
                 "timeout": timeout,
             }
         )
-        return httpx.Response(200, json=self.response_json)
+        return httpx.Response(self.status_code, json=self.response_json)
 
     async def aclose(self) -> None:
         return None
@@ -348,10 +349,12 @@ def test_mixed_ccr_and_client_tool_serves_retrieval_then_streams_reissued_tool()
     assert "retrieved answer" in json.dumps(tool_result)
 
 
-def test_mixed_turn_not_reissued_streams_both_blocks_as_sse() -> None:
-    """LEGAL mixed turn (#839, #2089) whose continuation does not re-issue the
-    client tool: the client gets the model's own turn as a 200 SSE stream with
-    BOTH tool_use blocks, so the client call still runs. No 502."""
+@pytest.mark.parametrize("status_code", [200, 500], ids=["withdrawn", "failed"])
+def test_mixed_turn_streams_the_continuation_or_the_turn_on_failure(status_code: int) -> None:
+    """LEGAL mixed turn (#839, #2089). A continuation that withdraws the client
+    tool is what the client gets: the dropped call never reaches it. If the
+    continuation fails, the model made no newer decision, so the client gets
+    the model's own turn as a 200 SSE stream with BOTH tool_use blocks. No 502."""
     config = _make_config()
     store = get_compression_store()
     hash_key = store.store(
@@ -385,7 +388,7 @@ def test_mixed_turn_not_reissued_streams_both_blocks_as_sse() -> None:
                 side_effect=AssertionError("live streaming path should not be used")
             )
             continuation_client = _ContinuationClient(
-                _message_response([{"type": "text", "text": "all done"}])
+                _message_response([{"type": "text", "text": "all done"}]), status_code
             )
             proxy.http_client = continuation_client
 
@@ -416,9 +419,13 @@ def test_mixed_turn_not_reissued_streams_both_blocks_as_sse() -> None:
 
     assert resp.status_code == 200, resp.text
     assert "text/event-stream" in resp.headers["content-type"]
-    assert "toolu_ccr" in resp.text
-    assert "toolu_client" in resp.text
-    assert "all done" not in resp.text
+    if status_code == 200:
+        assert "all done" in resp.text
+        assert "toolu_client" not in resp.text
+        assert "headroom_retrieve" not in resp.text
+    else:
+        assert "toolu_ccr" in resp.text
+        assert "toolu_client" in resp.text
     assert "Unable to safely complete streamed CCR retrieval" not in resp.text
     assert len(continuation_client.post_calls) == 1
 

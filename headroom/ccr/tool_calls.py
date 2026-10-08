@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import json
-from collections import Counter
 from dataclasses import dataclass
 from typing import Any
 
@@ -100,26 +98,6 @@ def drop_tool_calls(
                 first = {**choices[0], "message": {**message, "tool_calls": tool_calls}}
                 return {**response, "choices": [first, *choices[1:]]}
     return response
-
-
-def tool_call_signature(tool_call: dict[str, Any]) -> str:
-    """Name and arguments of an Anthropic or OpenAI chat tool call, without its id."""
-    function = tool_call.get("function")
-    if isinstance(function, dict):
-        name, arguments = function.get("name"), function.get("arguments")
-        if isinstance(arguments, str):
-            try:
-                arguments = json.loads(arguments)
-            except ValueError:
-                pass
-    else:
-        name, arguments = tool_call.get("name"), tool_call.get("input")
-    return json.dumps([name, arguments], sort_keys=True, default=str)
-
-
-def reissues_tool_calls(calls: list[dict[str, Any]], signatures: list[str]) -> bool:
-    """Do ``calls`` include every call in ``signatures``, unchanged?"""
-    return not (Counter(signatures) - Counter(tool_call_signature(c) for c in calls))
 
 
 def is_ccr_tool_call(tool_call: dict[str, Any]) -> bool:

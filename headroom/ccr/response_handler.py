@@ -29,8 +29,6 @@ from .tool_calls import (
     has_ccr_tool_calls,
     is_ccr_tool_call,
     parse_ccr_tool_calls,
-    reissues_tool_calls,
-    tool_call_signature,
 )
 from .tool_injection import CCR_TOOL_NAME
 
@@ -471,10 +469,6 @@ class CCRResponseHandler:
         current_response = response
         current_messages = list(messages)  # Copy to avoid mutation
         rounds = 0
-        # A mixed turn whose client calls were dropped, and those calls, until
-        # a continuation re-issues them.
-        mixed_turn: dict[str, Any] | None = None
-        reissue: list[str] = []
 
         while rounds < self.config.max_retrieval_rounds:
             # Check for CCR tool calls
@@ -489,12 +483,14 @@ class CCRResponseHandler:
             # headroom_retrieve", so the model never gets the content), and a
             # continuation needs a tool_result for every tool_use. The client
             # calls have not run yet, so drop them and serve the retrieval now;
-            # the model re-issues them, content in hand, in the continuation.
-            # They count as delivered only if it re-issues every one unchanged;
-            # otherwise the client gets this turn back below. A CCR-named call
-            # without a valid hash, or a provider where dropping a sibling is
-            # not safe (see drop_tool_calls), keeps the turn as it is for the
-            # client to resolve.
+            # the model decides again, content in hand, in the continuation.
+            # That continuation replaces this turn whatever it does: re-issue
+            # the calls, change them or drop them. Only a failed continuation
+            # hands this turn back (below), since the model made no newer
+            # decision. A CCR-named call without a valid hash, or a provider
+            # where dropping a sibling is not safe (see drop_tool_calls), keeps
+            # the turn as it is for the client to resolve.
+            mixed_turn: dict[str, Any] | None = None
             if other_calls:
                 trimmed = (
                     current_response
@@ -516,7 +512,6 @@ class CCRResponseHandler:
                     len(other_calls),
                 )
                 mixed_turn = current_response
-                reissue = [tool_call_signature(c) for c in other_calls]
                 current_response = trimmed
 
             rounds += 1
@@ -570,21 +565,12 @@ class CCRResponseHandler:
                 # entirely (#3129).
                 logger.error("CCR: Continuation API call failed: %s: %r", type(e).__name__, e)
                 # Return the response we had (with unhandled CCR calls)
-                # The client will see the tool_use and might handle it differently
+                # The client will see the tool_use and might handle it differently.
+                # For a mixed turn that is the model's own turn, client calls
+                # included (#839), never the trimmed one that lost them.
+                if mixed_turn is not None:
+                    current_response = mixed_turn
                 break
-
-            if reissue:
-                _, reissued = self._parse_ccr_tool_calls(current_response, provider)
-                if not reissues_tool_calls(reissued, reissue):
-                    break
-                reissue = []
-
-        if reissue and mixed_turn is not None:
-            logger.info(
-                "CCR: the client call(s) dropped for retrieval were not re-issued; "
-                "returning the model's own turn for the client to resolve"
-            )
-            return mixed_turn
 
         if rounds >= self.config.max_retrieval_rounds:
             logger.warning(

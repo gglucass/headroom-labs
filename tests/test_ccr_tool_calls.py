@@ -6,9 +6,7 @@ from headroom.ccr.tool_calls import (
     extract_tool_calls,
     has_ccr_tool_calls,
     parse_ccr_tool_calls,
-    reissues_tool_calls,
     tool_call_id_for_provider,
-    tool_call_signature,
 )
 from headroom.ccr.tool_injection import CCR_TOOL_NAME
 
@@ -147,34 +145,3 @@ def test_drop_tool_calls_returns_unrecognized_shapes_unchanged() -> None:
         ({"candidates": []}, "google"),
     ]:
         assert drop_tool_calls(response, provider, []) is response
-
-
-def test_tool_call_signature_ignores_ids_and_argument_formatting() -> None:
-    def openai(call_id: str, arguments: object) -> dict:
-        return {"id": call_id, "function": {"name": "Read", "arguments": arguments}}
-
-    assert tool_call_signature(openai("a", '{"p": 1, "q": 2}')) == tool_call_signature(
-        openai("b", '{"q":2,"p":1}')
-    )
-    assert tool_call_signature(openai("a", {"p": 1})) == tool_call_signature(
-        openai("b", '{"p": 1}')
-    )
-    # Unparseable arguments compare as the raw string.
-    assert tool_call_signature(openai("a", "{oops")) == tool_call_signature(openai("b", "{oops"))
-    assert tool_call_signature(openai("a", "{oops")) != tool_call_signature(openai("a", "{}"))
-
-    def anthropic(call_id: str, value: int) -> dict:
-        return {"type": "tool_use", "id": call_id, "name": "Read", "input": {"p": value}}
-
-    assert tool_call_signature(anthropic("a", 1)) == tool_call_signature(anthropic("b", 1))
-    assert tool_call_signature(anthropic("a", 1)) != tool_call_signature(anthropic("a", 2))
-
-
-def test_reissues_tool_calls_is_a_multiset_check() -> None:
-    def call(path: str) -> dict:
-        return {"type": "tool_use", "id": path, "name": "Read", "input": {"path": path}}
-
-    wanted = [tool_call_signature(call("a")), tool_call_signature(call("a"))]
-    assert reissues_tool_calls([call("a"), call("a"), call("b")], wanted)
-    assert not reissues_tool_calls([call("a"), call("b")], wanted)
-    assert reissues_tool_calls([], [])
