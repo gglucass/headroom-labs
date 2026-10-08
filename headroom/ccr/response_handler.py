@@ -24,6 +24,7 @@ from headroom.proxy.anthropic_wire import AnthropicSSEEnvelope
 from ..cache.compression_store import format_retrieval_miss_detail, get_compression_store
 from .tool_calls import (
     CCRToolCall,
+    drop_tool_calls,
     extract_tool_calls,
     has_ccr_tool_calls,
     parse_ccr_tool_calls,
@@ -476,18 +477,31 @@ class CCRResponseHandler:
                 # No CCR tool calls, we're done
                 break
 
-            # If the model called CCR alongside non-CCR tools, we cannot build
-            # a valid continuation — every tool_use in the assistant message
-            # requires a matching tool_result, but we only have CCR results.
-            # Skip CCR handling and let the client resolve all tool calls.
+            # The model called CCR alongside client tools. The client has no
+            # headroom_retrieve (Claude Code answers "No such tool available:
+            # headroom_retrieve", so the model never gets the content), and a
+            # continuation needs a tool_result for every tool_use. The client
+            # tools have not run yet, so drop them and serve the retrieval
+            # now: the model re-issues them, content in hand, in the
+            # continuation. Where dropping a sibling is not safe (see
+            # drop_tool_calls), skip CCR and let the client resolve all calls.
             if other_calls:
-                logger.warning(
-                    "CCR: Skipping CCR handling — model called %d non-CCR tool(s) "
-                    "alongside headroom_retrieve. Cannot create a valid continuation "
-                    "without results for the other tools. Client must handle all tool calls.",
+                trimmed = drop_tool_calls(current_response, provider, other_calls)
+                if trimmed is current_response:
+                    logger.warning(
+                        "CCR: Skipping CCR handling — model called %d non-CCR tool(s) "
+                        "alongside headroom_retrieve. Cannot create a valid continuation "
+                        "without results for the other tools. Client must handle all tool calls.",
+                        len(other_calls),
+                    )
+                    break
+                logger.info(
+                    "CCR: model called headroom_retrieve alongside %d client tool(s); "
+                    "serving the retrieval and dropping the unrun client call(s) "
+                    "for the model to re-issue",
                     len(other_calls),
                 )
-                break
+                current_response = trimmed
 
             rounds += 1
             with self._retrieval_count_lock:

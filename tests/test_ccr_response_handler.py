@@ -523,14 +523,13 @@ class TestCCRResponseHandling:
         assert result == response
 
     @pytest.mark.asyncio
-    async def test_handle_response_mixed_tools_skips_ccr(self):
-        """When CCR and non-CCR tools are called together, skip CCR.
+    async def test_handle_response_mixed_tools_serves_retrieval(self):
+        """CCR called alongside a client tool: serve the retrieval now.
 
-        Building a valid continuation is impossible without results for the
-        non-CCR tools (Anthropic requires every tool_use to have a
-        tool_result). Skipping CCR avoids a wasted 400 API call and returns
-        the original response immediately so the client can resolve all
-        tool calls itself.
+        The client has no headroom_retrieve, so handing the turn back made
+        Claude Code answer "No such tool available: headroom_retrieve" and the
+        model never got the content. The client tool has not run yet, so it is
+        dropped from the continuation and the model re-issues it there.
         """
         store = get_compression_store()
         hash_key = store.store(original="[1,2,3]", compressed="[]")
@@ -539,6 +538,7 @@ class TestCCRResponseHandling:
 
         mixed_response = {
             "content": [
+                {"type": "text", "text": "Reading both."},
                 {
                     "type": "tool_use",
                     "id": "ccr_call",
@@ -551,21 +551,116 @@ class TestCCRResponseHandling:
                     "name": "read_file",
                     "input": {"path": "/etc/config"},
                 },
-            ]
+            ],
+            "stop_reason": "tool_use",
         }
-
-        api_call_count = 0
+        reissued = {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "user_call_2",
+                    "name": "read_file",
+                    "input": {"path": "/etc/config"},
+                }
+            ],
+            "stop_reason": "tool_use",
+        }
+        sent = []
 
         async def mock_api_call(messages, tools):
-            nonlocal api_call_count
-            api_call_count += 1
-            return {"content": [{"type": "text", "text": "continuation"}]}
+            sent.append(messages)
+            return reissued
 
         result = await handler.handle_response(mixed_response, [], None, mock_api_call, "anthropic")
 
-        # CCR skipped — no continuation call made (avoids the 400 API round-trip)
-        assert api_call_count == 0, "should not attempt continuation with mixed tools"
-        # Original response returned unchanged so client can handle all tool calls
+        assert len(sent) == 1
+        assistant, tool_result = sent[0]
+        assert [b.get("id") for b in assistant["content"]] == [None, "ccr_call"]
+        assert tool_result["content"][0]["tool_use_id"] == "ccr_call"
+        assert "[1,2,3]" in tool_result["content"][0]["content"]
+        # The client gets the re-issued client tool, never headroom_retrieve.
+        assert result is reissued
+        assert handler.residual_ccr_status(result, "anthropic") == "resolved"
+        # The model's own response is not mutated.
+        assert len(mixed_response["content"]) == 3
+
+    @pytest.mark.asyncio
+    async def test_handle_response_mixed_tools_serves_retrieval_openai(self):
+        store = get_compression_store()
+        hash_key = store.store(original="[1,2,3]", compressed="[]")
+
+        handler = CCRResponseHandler()
+
+        def call(call_id, name, arguments):
+            return {
+                "id": call_id,
+                "type": "function",
+                "function": {"name": name, "arguments": arguments},
+            }
+
+        mixed_response = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            call("call_user", "read_file", '{"path": "/etc/config"}'),
+                            call("call_ccr", CCR_TOOL_NAME, json.dumps({"hash": hash_key})),
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        }
+        final = {"choices": [{"message": {"role": "assistant", "content": "done"}}]}
+        sent = []
+
+        async def mock_api_call(messages, tools):
+            sent.append(messages)
+            return final
+
+        result = await handler.handle_response(mixed_response, [], None, mock_api_call, "openai")
+
+        assert result is final
+        assistant, tool_result = sent[0]
+        assert [c["id"] for c in assistant["tool_calls"]] == ["call_ccr"]
+        assert tool_result["tool_call_id"] == "call_ccr"
+
+    @pytest.mark.asyncio
+    async def test_handle_response_mixed_tools_responses_still_skips(self):
+        """Responses API: a function_call can be the item a reasoning item
+        requires next, so a sibling is not dropped there; the turn is handed
+        back unchanged as before (#839)."""
+        store = get_compression_store()
+        hash_key = store.store(original="[1,2,3]", compressed="[]")
+
+        handler = CCRResponseHandler()
+        mixed_response = {
+            "output": [
+                {"type": "reasoning", "id": "rs_1", "summary": []},
+                {
+                    "type": "function_call",
+                    "call_id": "call_user",
+                    "name": "read_file",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_ccr",
+                    "name": CCR_TOOL_NAME,
+                    "arguments": json.dumps({"hash": hash_key}),
+                },
+            ]
+        }
+
+        async def mock_api_call(messages, tools):
+            raise AssertionError("no continuation for a Responses mixed turn")
+
+        result = await handler.handle_response(
+            mixed_response, [], None, mock_api_call, "openai_responses"
+        )
+
         assert result is mixed_response
 
 

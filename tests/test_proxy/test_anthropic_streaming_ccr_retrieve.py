@@ -257,20 +257,26 @@ def test_streaming_with_headroom_retrieve_available_but_unused_returns_sse() -> 
     proxy._stream_response.assert_not_awaited()
 
 
-def test_mixed_ccr_and_client_tool_streams_both_blocks_as_sse() -> None:
-    """LEGAL mixed turn (#839, #2089): headroom_retrieve emitted alongside a
-    client tool. The proxy cannot synthesize the client tool_result, so it must
-    hand the turn back for the client to resolve — a 200 SSE stream preserving
-    BOTH tool_use blocks, matching the non-streaming path. It must NOT 502 and
-    must NOT issue a continuation request."""
+def test_mixed_ccr_and_client_tool_serves_retrieval_then_streams_reissued_tool() -> None:
+    """headroom_retrieve emitted alongside a client tool (#839, #2089). The
+    client has no headroom_retrieve (Claude Code answers "No such tool
+    available"), so the proxy serves the retrieval in a continuation without
+    the unrun client call, and streams the continuation, where the model
+    re-issues it. No headroom_retrieve reaches the client and nothing 502s."""
     config = _make_config()
+    store = get_compression_store()
+    hash_key = store.store(
+        original=json.dumps({"secret": "retrieved answer"}),
+        compressed="{}",
+        original_item_count=1,
+    )
     initial_response = _message_response(
         [
             {
                 "type": "tool_use",
                 "id": "toolu_ccr",
                 "name": "headroom_retrieve",
-                "input": {"hash": "abc123"},
+                "input": {"hash": hash_key},
             },
             {
                 "type": "tool_use",
@@ -278,6 +284,17 @@ def test_mixed_ccr_and_client_tool_streams_both_blocks_as_sse() -> None:
                 "name": "client_tool",
                 "input": {"value": 1},
             },
+        ],
+        stop_reason="tool_use",
+    )
+    reissued = _message_response(
+        [
+            {
+                "type": "tool_use",
+                "id": "toolu_client_2",
+                "name": "client_tool",
+                "input": {"value": 1},
+            }
         ],
         stop_reason="tool_use",
     )
@@ -289,7 +306,7 @@ def test_mixed_ccr_and_client_tool_streams_both_blocks_as_sse() -> None:
             proxy._stream_response = AsyncMock(
                 side_effect=AssertionError("live streaming path should not be used")
             )
-            continuation_client = _ContinuationClient(_message_response([]))
+            continuation_client = _ContinuationClient(reissued)
             proxy.http_client = continuation_client
 
             async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
@@ -319,14 +336,16 @@ def test_mixed_ccr_and_client_tool_streams_both_blocks_as_sse() -> None:
 
     assert resp.status_code == 200, resp.text
     assert "text/event-stream" in resp.headers["content-type"]
-    # Both tool_use blocks are preserved for the client to resolve.
-    assert "headroom_retrieve" in resp.text
-    assert "client_tool" in resp.text
-    assert "toolu_ccr" in resp.text
-    assert "toolu_client" in resp.text
+    assert "toolu_client_2" in resp.text
+    assert "headroom_retrieve" not in resp.text
+    assert 'toolu_client"' not in resp.text
     assert "Unable to safely complete streamed CCR retrieval" not in resp.text
-    # No continuation is issued — the client resolves all tool calls.
-    assert continuation_client.post_calls == []
+    assert len(continuation_client.post_calls) == 1
+    body = json.loads(continuation_client.post_calls[0]["content"].decode())
+    assistant, tool_result = body["messages"][-2:]
+    assert [b["id"] for b in assistant["content"]] == ["toolu_ccr"]
+    assert tool_result["content"][0]["tool_use_id"] == "toolu_ccr"
+    assert "retrieved answer" in json.dumps(tool_result)
 
 
 def test_unresolved_ccr_only_streams_through_as_200() -> None:
