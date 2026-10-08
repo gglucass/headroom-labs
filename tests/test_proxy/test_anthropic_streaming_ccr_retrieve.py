@@ -348,6 +348,81 @@ def test_mixed_ccr_and_client_tool_serves_retrieval_then_streams_reissued_tool()
     assert "retrieved answer" in json.dumps(tool_result)
 
 
+def test_mixed_turn_not_reissued_streams_both_blocks_as_sse() -> None:
+    """LEGAL mixed turn (#839, #2089) whose continuation does not re-issue the
+    client tool: the client gets the model's own turn as a 200 SSE stream with
+    BOTH tool_use blocks, so the client call still runs. No 502."""
+    config = _make_config()
+    store = get_compression_store()
+    hash_key = store.store(
+        original=json.dumps({"secret": "retrieved answer"}),
+        compressed="{}",
+        original_item_count=1,
+    )
+    initial_response = _message_response(
+        [
+            {
+                "type": "tool_use",
+                "id": "toolu_ccr",
+                "name": "headroom_retrieve",
+                "input": {"hash": hash_key},
+            },
+            {
+                "type": "tool_use",
+                "id": "toolu_client",
+                "name": "client_tool",
+                "input": {"value": 1},
+            },
+        ],
+        stop_reason="tool_use",
+    )
+
+    with patch("headroom.proxy.server.AnyLLMBackend"):
+        app = create_app(config)
+        with TestClient(app) as client:
+            proxy = client.app.state.proxy
+            proxy._stream_response = AsyncMock(
+                side_effect=AssertionError("live streaming path should not be used")
+            )
+            continuation_client = _ContinuationClient(
+                _message_response([{"type": "text", "text": "all done"}])
+            )
+            proxy.http_client = continuation_client
+
+            async def _fake_retry(method, url, headers, body, stream=False, **kwargs):  # noqa: ANN001
+                assert body["stream"] is False
+                return httpx.Response(200, json=initial_response)
+
+            proxy._retry_request = _fake_retry  # type: ignore[assignment]
+
+            resp = client.post(
+                "/v1/messages",
+                headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
+                json={
+                    "model": "claude-sonnet-4-6",
+                    "max_tokens": 64,
+                    "stream": True,
+                    "tools": [
+                        create_ccr_tool_definition("anthropic"),
+                        {
+                            "name": "client_tool",
+                            "description": "Client-owned tool",
+                            "input_schema": {"type": "object", "properties": {}},
+                        },
+                    ],
+                    "messages": [{"role": "user", "content": _buffered("use tools")}],
+                },
+            )
+
+    assert resp.status_code == 200, resp.text
+    assert "text/event-stream" in resp.headers["content-type"]
+    assert "toolu_ccr" in resp.text
+    assert "toolu_client" in resp.text
+    assert "all done" not in resp.text
+    assert "Unable to safely complete streamed CCR retrieval" not in resp.text
+    assert len(continuation_client.post_calls) == 1
+
+
 def test_unresolved_ccr_only_streams_through_as_200() -> None:
     """CCR-only turn that never resolves: the model keeps re-emitting
     headroom_retrieve so the continuation exhausts its retrieval rounds with a

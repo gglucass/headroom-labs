@@ -613,7 +613,19 @@ class TestCCRResponseHandling:
                 }
             ]
         }
-        final = {"choices": [{"message": {"role": "assistant", "content": "done"}}]}
+        # Re-issued with its own id and differently spaced arguments: same call.
+        final = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [call("call_user_2", "read_file", '{"path":"/etc/config"}')],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ]
+        }
         sent = []
 
         async def mock_api_call(messages, tools):
@@ -626,6 +638,100 @@ class TestCCRResponseHandling:
         assistant, tool_result = sent[0]
         assert [c["id"] for c in assistant["tool_calls"]] == ["call_ccr"]
         assert tool_result["tool_call_id"] == "call_ccr"
+
+    @staticmethod
+    def _mixed_turn(hash_key, client_input):
+        return {
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "ccr_call",
+                    "name": CCR_TOOL_NAME,
+                    "input": {"hash": hash_key},
+                },
+                {
+                    "type": "tool_use",
+                    "id": "user_call",
+                    "name": "write_file",
+                    "input": client_input,
+                },
+            ],
+            "stop_reason": "tool_use",
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "continuation",
+        [
+            # Answers without re-issuing the client call.
+            {"content": [{"type": "text", "text": "Done"}], "stop_reason": "end_turn"},
+            # Re-issues it with different input: not the call the model made.
+            {
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "user_call_2",
+                        "name": "write_file",
+                        "input": {"path": "/tmp/other"},
+                    }
+                ],
+                "stop_reason": "tool_use",
+            },
+        ],
+        ids=["not_reissued", "reissued_changed"],
+    )
+    async def test_handle_response_mixed_tools_returns_turn_when_not_reissued(self, continuation):
+        """A dropped client call is delivered only by an unchanged re-issue.
+        Otherwise the client gets the model's own turn back, as before (#839),
+        so the write still runs."""
+        store = get_compression_store()
+        hash_key = store.store(original="[1,2,3]", compressed="[]")
+        mixed_response = self._mixed_turn(hash_key, {"path": "/tmp/out"})
+        sent = []
+
+        async def mock_api_call(messages, tools):
+            sent.append(messages)
+            return continuation
+
+        result = await CCRResponseHandler().handle_response(
+            mixed_response, [], None, mock_api_call, "anthropic"
+        )
+
+        assert len(sent) == 1
+        assert result is mixed_response
+
+    @pytest.mark.asyncio
+    async def test_handle_response_mixed_tools_failed_continuation_returns_turn(self):
+        store = get_compression_store()
+        hash_key = store.store(original="[1,2,3]", compressed="[]")
+        mixed_response = self._mixed_turn(hash_key, {"path": "/tmp/out"})
+
+        async def mock_api_call(messages, tools):
+            raise RuntimeError("upstream down")
+
+        result = await CCRResponseHandler().handle_response(
+            mixed_response, [], None, mock_api_call, "anthropic"
+        )
+
+        assert result is mixed_response
+
+    @pytest.mark.asyncio
+    async def test_handle_response_malformed_ccr_call_keeps_turn(self):
+        """A headroom_retrieve without a valid hash is not a client call to
+        drop: the turn is handed back unchanged."""
+        store = get_compression_store()
+        hash_key = store.store(original="[1,2,3]", compressed="[]")
+        mixed_response = self._mixed_turn(hash_key, {})
+        mixed_response["content"][1]["name"] = CCR_TOOL_NAME
+
+        async def mock_api_call(messages, tools):
+            raise AssertionError("no continuation when a CCR call is malformed")
+
+        result = await CCRResponseHandler().handle_response(
+            mixed_response, [], None, mock_api_call, "anthropic"
+        )
+
+        assert result is mixed_response
 
     @pytest.mark.asyncio
     async def test_handle_response_mixed_tools_responses_still_skips(self):
