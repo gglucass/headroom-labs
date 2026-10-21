@@ -21,7 +21,10 @@ from urllib.parse import urlsplit
 
 from headroom.proxy.session_affinity import session_affinity_headers
 from headroom.proxy.stage_timer import StageTimer, emit_stage_timings_log
-from headroom.proxy.tool_schema_savings_policy import without_deferral_flags
+from headroom.proxy.tool_schema_savings_policy import (
+    net_hook_tool_saving,
+    without_deferral_flags,
+)
 
 if TYPE_CHECKING:
     from fastapi import Request
@@ -36,6 +39,7 @@ from headroom.ccr.context_tracker import looks_like_claude_code_compact_summary
 from headroom.ccr.marker_resolution import resolve_markers_in_response
 from headroom.ccr.tool_calls import has_ccr_retrieve_tool
 from headroom.copilot_auth import apply_copilot_api_auth, is_copilot_upstream_url
+from headroom.log_safety import describe_exception
 from headroom.pipeline import PipelineStage, summarize_routing_markers
 from headroom.proxy import public_errors
 from headroom.proxy.anthropic_wire import (
@@ -58,6 +62,7 @@ from headroom.proxy.buffered_ccr_response import (
 )
 from headroom.proxy.compression_decision import CompressionDecision
 from headroom.proxy.handlers._debug_dump import _debug_dump_mode, _redact_debug_value
+from headroom.proxy.handlers._failure_logging import log_hook_failure, log_request_failure
 from headroom.proxy.helpers import (
     extract_tags,
     invalid_request_body_message,
@@ -335,8 +340,15 @@ def _dump_prefix_mismatch(request_id: str, current: list, previous: list) -> Non
                 fh,
                 default=str,
             )
-    except Exception:  # noqa: BLE001 - debug aid only
-        pass
+    except (OSError, TypeError, ValueError, RecursionError) as e:  # debug aid; never fail the turn
+        # describe_exception keeps an OSError's errno and strerror; other errors
+        # could quote message content, so no message is logged.
+        logger.warning(
+            "[%s] prefix_mismatch_debug dump to %s failed: %s",
+            request_id,
+            os.environ.get("HEADROOM_DEBUG_PREFIX_MISMATCH"),
+            describe_exception(e),
+        )
 
 
 class AnthropicHandlerMixin:
@@ -1680,7 +1692,7 @@ class AnthropicHandlerMixin:
                 try:
                     messages = self.config.hooks.pre_compress(messages, _hook_ctx)
                 except Exception as e:
-                    logger.debug(f"[{request_id}] pre_compress hook error: {e}")
+                    log_hook_failure(request_id, "pre_compress", self.config.hooks, e)
             else:
                 _hook_ctx = None
 
@@ -1978,21 +1990,31 @@ class AnthropicHandlerMixin:
                             scope=credential_scope_from_headers(headers),
                         )
                     result = None
-                    biases = (
-                        self.config.hooks.compute_biases(messages, _hook_ctx)
-                        if self.config.hooks and _hook_ctx is not None
-                        else None
-                    )
+                    biases = None
                     # Hard per-message veto. Separate from ``biases`` because a
                     # bias is a soft multiplier that several strategies clamp or
                     # ignore, so it cannot express "leave this one alone".
-                    from headroom.hooks import collect_protected
+                    protect = None
+                    if self.config.hooks and _hook_ctx is not None:
+                        from headroom.hooks import collect_protected
 
-                    protect = (
-                        collect_protected(self.config.hooks, messages, _hook_ctx)
-                        if self.config.hooks and _hook_ctx is not None
-                        else None
-                    )
+                        # A failure still aborts optimization for this request (the
+                        # outer handler forwards it uncompressed); this only names
+                        # the stage. Compressing without a veto would be unsafe.
+                        _hook_stage = "compute_biases"
+                        try:
+                            biases = self.config.hooks.compute_biases(messages, _hook_ctx)
+                            _hook_stage = "protect_messages"
+                            protect = collect_protected(self.config.hooks, messages, _hook_ctx)
+                        except Exception as e:
+                            log_hook_failure(
+                                request_id,
+                                _hook_stage,
+                                self.config.hooks,
+                                e,
+                                outcome="skipping compression for this turn",
+                            )
+                            raise
 
                     # F2.1 c5/5: derive the per-request CompressionPolicy
                     # from the auth_mode classified at request entry. The
@@ -2007,6 +2029,15 @@ class AnthropicHandlerMixin:
                     compression_policy = resolve_policy(getattr(request.state, "auth_mode", None))
                     if is_token_mode(self.config.mode):
                         comp_cache = self._get_compression_cache(session_id)
+                        from headroom.cache.prefix_tracker import (
+                            seed_restored_compression_cache,
+                        )
+
+                        # Seeds the empty cache after a restart
+                        # (HEADROOM_PREFIX_STATE_FILE); without it the clamp below
+                        # freezes nothing and read maturation rewrites Reads
+                        # inside the cached prefix.
+                        seed_restored_compression_cache(prefix_tracker, comp_cache)
 
                         # Freeze + stable marking + Zone-1 swap now live in the
                         # shared session engine (PROXY policy: clamp by BOTH the
@@ -2374,8 +2405,12 @@ class AnthropicHandlerMixin:
                             # enabled" with Before == After (issue #2357).
                             tags["passthrough_reason"] = "cache_mode_prefix_mismatch"
                             logger.info(
-                                "[%s] Compression skipped: reason=cache_mode_prefix_mismatch",
+                                "[%s] Compression skipped: reason=cache_mode_prefix_mismatch "
+                                "model=%s current_len=%d previous_len=%d",
                                 request_id,
+                                model,
+                                len(original_client_messages),
+                                len(previous_original_messages),
                             )
                             if os.environ.get("HEADROOM_DEBUG_PREFIX_MISMATCH"):
                                 _dump_prefix_mismatch(
@@ -2394,9 +2429,11 @@ class AnthropicHandlerMixin:
                     if result and result.waste_signals:
                         waste_signals_dict = result.waste_signals.to_dict()
                 except Exception as e:
-                    # Include type so TimeoutError vs other failures is distinguishable
-                    # in bug reports — str(asyncio.TimeoutError()) is empty otherwise.
-                    logger.warning(f"[{request_id}] Optimization failed: {type(e).__name__}: {e}")
+                    # Types and code locations only: a compressor or hook error can
+                    # quote the messages it was given.
+                    logger.warning(
+                        "[%s] Optimization failed: %s", request_id, describe_exception(e)
+                    )
                     # Flag compression failure for observability
                     _compression_failed = True
                     # Split timeout from other errors: a timeout means the
@@ -2581,6 +2618,10 @@ class AnthropicHandlerMixin:
                             compression_store=get_compression_store(),
                         )
                         prefix_tracker.read_maturation_manager = maturation_mgr
+                        state = getattr(prefix_tracker, "restored_maturation_state", None)
+                        if state is not None:
+                            prefix_tracker.restored_maturation_state = None
+                            maturation_mgr.restore_state(state)
                     _maturation_mgr = maturation_mgr
                     maturation = maturation_mgr.apply(
                         optimized_messages,
@@ -2622,7 +2663,7 @@ class AnthropicHandlerMixin:
                         )
                     )
                 except Exception as e:
-                    logger.debug(f"[{request_id}] post_compress hook error: {e}")
+                    log_hook_failure(request_id, "post_compress", self.config.hooks, e)
 
             # CCR Tool Injection: Inject retrieval tool if compression occurred
             # OR if this session has previously done CCR (PR-B7 sticky-on).
@@ -3140,7 +3181,12 @@ class AnthropicHandlerMixin:
             def _count_tool_tokens(value: object) -> int:
                 try:
                     return tokenizer.count_text(json.dumps(value, default=str))
-                except Exception:
+                except Exception as e:
+                    logger.debug(
+                        "[%s] tool token count failed; tool savings not counted: %s",
+                        request_id,
+                        describe_exception(e),
+                    )
                     return 0
 
             _tools_compaction_started = time.time()
@@ -3393,6 +3439,11 @@ class AnthropicHandlerMixin:
             )
 
             _pre_hook_tokens: int | None = None
+            # Tool-definition tokens a turn hook ADDED (e.g. a search tool). Folded
+            # into the forwarded count below so the headline nets them; shrinkage
+            # stays on the turn_hook_tools_saved_tokens tag.
+            _th_tool_growth = 0
+            _th_saved = 0
             _req_ctx: TurnContext | None = None
             if registered_turn_hooks():
                 _req_ctx = TurnContext(
@@ -3435,6 +3486,7 @@ class AnthropicHandlerMixin:
                     else 0
                 )
                 _th_saved = max(0, _th_tok_before - _th_tok_after)
+                _th_tool_growth = max(0, _th_tok_after - _th_tok_before)
                 if _th_saved > 0:
                     tags["turn_hook_tools_saved_tokens"] = (
                         int(tags.get("turn_hook_tools_saved_tokens", 0) or 0) + _th_saved
@@ -3560,6 +3612,8 @@ class AnthropicHandlerMixin:
                 if 0 < _tool_tokens_after < _tool_tokens_before:
                     original_tokens += _tool_tokens_before
                     optimized_tokens += _tool_tokens_after
+                # A tool a turn hook added is sent too: it reduces the saving.
+                optimized_tokens += _th_tool_growth
                 # First-appearance accounting for matured Reads. The client
                 # re-sends the raw conversation every turn, so this diff would
                 # otherwise re-book a matured Read's removal on every request
@@ -3580,7 +3634,11 @@ class AnthropicHandlerMixin:
                         # Advisory, like the maturation pass itself: a failure
                         # here must not skip the recount around it.
                         logger.debug("maturation replay debt skipped", exc_info=True)
-                tokens_saved = max(0, original_tokens - optimized_tokens - _replay_debt)
+                # Signed, then clamped once: message text a hook added offsets
+                # the tool definitions it removed (booked on the tag above).
+                tokens_saved = net_hook_tool_saving(
+                    original_tokens - optimized_tokens - _replay_debt, tags, _th_saved
+                )
                 # Attribute the fold to the hook ONLY when the hook itself reduced
                 # tokens (same-tokenizer pre vs post) — not when the recount above
                 # merely normalized a cross-estimator scale difference.
@@ -4599,7 +4657,8 @@ class AnthropicHandlerMixin:
 
                                 # Reuse main client for CCR continuations (connection pooling)
                                 logger.info(
-                                    f"CCR: Making continuation request with {len(msgs)} messages"
+                                    f"[{request_id}] CCR: Making continuation request "
+                                    f"with {len(msgs)} messages"
                                 )
                                 assert self.http_client is not None, "HTTP client not initialized"
                                 # Byte-faithful (PR-A3, fixes P0-2). The CCR
@@ -4650,6 +4709,7 @@ class AnthropicHandlerMixin:
                                         timeout=self._anthropic_buffered_request_timeout(),
                                     )
 
+                                cont_response: httpx.Response | None = None
                                 try:
                                     cont_response = await self._send_buffered_as_stream(
                                         _post_continuation,
@@ -4659,7 +4719,8 @@ class AnthropicHandlerMixin:
                                         request_id=request_id,
                                     )
                                     logger.info(
-                                        f"CCR: Got response status={cont_response.status_code}, "
+                                        f"[{request_id}] CCR: Got response "
+                                        f"status={cont_response.status_code}, "
                                         f"content-encoding={cont_response.headers.get('content-encoding')}"
                                     )
                                     if not 200 <= cont_response.status_code < 300:
@@ -4668,16 +4729,23 @@ class AnthropicHandlerMixin:
                                             f"{cont_response.status_code}"
                                         )
                                     result: dict[str, Any] = cont_response.json()
-                                    logger.info("CCR: Parsed JSON successfully")
+                                    logger.info(f"[{request_id}] CCR: Parsed JSON successfully")
                                     return result
                                 except Exception as e:
-                                    resp_headers: str | dict[str, str] = "N/A"
-                                    try:
-                                        resp_headers = dict(cont_response.headers)
-                                    except Exception:
-                                        pass
-                                    logger.error(
-                                        f"CCR: API call failed: {e}, response headers: {resp_headers}"
+                                    # Status and the upstream request id only:
+                                    # the other response headers are not ours
+                                    # to copy into a log.
+                                    upstream_request_id = (
+                                        cont_response.headers.get("request-id")
+                                        if cont_response is not None
+                                        else None
+                                    )
+                                    log_request_failure(
+                                        request_id,
+                                        "CCR continuation",
+                                        e,
+                                        status=getattr(cont_response, "status_code", None),
+                                        upstream_request_id=upstream_request_id,
                                     )
                                     raise
 
@@ -5515,8 +5583,11 @@ class AnthropicHandlerMixin:
                 raise
             except Exception as e:
                 await self.metrics.record_failed(provider=provider_name)
-                # Log full error details internally for debugging
-                logger.error(f"[{request_id}] Request failed: {type(e).__name__}: {e}")
+                # Error names the failure; text and traceback go to debug.
+                # `model` is unbound when the failure precedes body parsing.
+                log_request_failure(
+                    request_id, "Request", e, provider=provider_name, model=locals().get("model")
+                )
 
                 # An untrusted TLS-inspection root is the one failure worth
                 # spelling out: it is environmental, never transient, and the
@@ -6028,7 +6099,7 @@ class AnthropicHandlerMixin:
 
         except Exception as e:
             await self.metrics.record_failed(provider="anthropic")
-            logger.error(f"[{request_id}] Batch request failed: {type(e).__name__}: {e}")
+            log_request_failure(request_id, "Anthropic batch request", e)
             return JSONResponse(
                 status_code=502,
                 content={

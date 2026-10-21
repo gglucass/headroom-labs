@@ -22,10 +22,13 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from datetime import datetime
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote, unquote, urlparse
 
+from headroom.log_safety import describe_exception
 from headroom.proxy.conversation_savings import savings_conversation_key
+from headroom.proxy.handlers._failure_logging import log_hook_failure, log_request_failure
 from headroom.proxy.helpers import (
     COMPRESSION_TIMEOUT_SECONDS,
     _headroom_bypass_enabled,
@@ -43,9 +46,17 @@ from headroom.proxy.provider_usage import (
     usage_int,
 )
 from headroom.proxy.rate_limit_identity import rate_limit_identity
+from headroom.proxy.savings import ItemMeasure, get_item_ledger, prefix_key, responses_items
+from headroom.proxy.savings_attribution import SAVINGS_ATTRIBUTION_TAG
+from headroom.proxy.savings_attribution import accumulate as accumulate_savings
+from headroom.proxy.savings_attribution import from_tags as savings_from_tags
 from headroom.proxy.semantic_cache_key_policy import compute_request_cache_partition
 from headroom.proxy.stage_timer import StageTimer, emit_stage_timings_log
-from headroom.proxy.tool_schema_savings_policy import without_deferral_flags
+from headroom.proxy.tool_schema_savings_policy import (
+    net_hook_tool_saving,
+    without_deferral_flags,
+)
+from headroom.proxy.turn_hooks import run_responses_create_hooks
 from headroom.proxy.upstream_guard import is_safe_upstream_url
 from headroom.proxy.ws_headers import WS_HOP_BY_HOP_HEADERS
 from headroom.proxy.ws_session_registry import (
@@ -346,13 +357,22 @@ class TurnHookUsage:
     the safe direction for a bill.
     """
 
-    __slots__ = ("_seen", "input_tokens", "output_tokens", "cache_read_tokens", "extra_calls")
+    __slots__ = (
+        "_seen",
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "extra_calls",
+    )
 
     def __init__(self) -> None:
-        self._seen: list[tuple[int, Any, int, int, int]] = []
+        self._seen: list[tuple[int, Any, int, int, int, int]] = []
         self.input_tokens = 0
         self.output_tokens = 0
         self.cache_read_tokens = 0
+        #: Reported (Responses ``cache_write_tokens``) writes only; 0 otherwise.
+        self.cache_write_tokens = 0
         self.extra_calls = 0
 
     def record(
@@ -376,17 +396,19 @@ class TurnHookUsage:
                 usage_int(usage.get(input_key)),
                 usage_int(usage.get(output_key)),
                 cached,
+                _reported_cache_write(details) or 0,
             )
         else:
-            entry = (id(payload), payload, 0, 0, 0)
+            entry = (id(payload), payload, 0, 0, 0, 0)
         self._seen.append(entry)
 
     def settle(self, final: Any) -> None:
         """Total everything except ``final``, which the usage block will read."""
         self.input_tokens = self.output_tokens = self.cache_read_tokens = 0
+        self.cache_write_tokens = 0
         self.extra_calls = 0
         dropped = False
-        for _ident, payload, tin, tout, cached in self._seen:
+        for _ident, payload, tin, tout, cached, written in self._seen:
             if not dropped and payload is final:
                 dropped = True
                 continue
@@ -394,6 +416,7 @@ class TurnHookUsage:
             self.input_tokens += tin
             self.output_tokens += tout
             self.cache_read_tokens += cached
+            self.cache_write_tokens += written
 
 
 def _sanitize_forwarded_response_headers(
@@ -609,7 +632,13 @@ def _passthrough_usage_from_json(payload: Any, provider: str | None = None) -> d
             "input_tokens": billed_input_from_usage(usage, provider) or usage_int(input_tokens),
             "output_tokens": usage_int(output_tokens),
             "cache_read_input_tokens": usage_int(usage.get("cache_read_input_tokens", cache_read)),
-            "cache_creation_input_tokens": usage_int(usage.get("cache_creation_input_tokens")),
+            # Responses spells a billed write ``input_tokens_details.cache_write_tokens``.
+            "cache_creation_input_tokens": usage_int(
+                usage.get(
+                    "cache_creation_input_tokens",
+                    details.get("cache_write_tokens") if isinstance(details, dict) else None,
+                )
+            ),
         }
 
     return {}
@@ -1748,6 +1777,48 @@ def _infer_openai_cache_write_tokens(input_tokens: int, cache_read_tokens: int) 
     return max(input_tokens - cache_read_tokens, 0)
 
 
+def _reported_cache_write(details: Any) -> int | None:
+    """``input_tokens_details.cache_write_tokens``, or ``None`` when not reported."""
+    if not isinstance(details, dict) or details.get("cache_write_tokens") is None:
+        return None
+    return usage_int(details.get("cache_write_tokens"))
+
+
+def _hook_reported_write(final_write: int | None, hook_usage: Any) -> int | None:
+    """The final response's reported write plus any turn-hook re-drives' writes.
+
+    A final response without the field still carries the re-drives' reported
+    writes: treating its own write as 0 prices the same as inferring it, since
+    an inferred write is dropped from pricing anyway.
+    """
+    hook_writes = hook_usage.cache_write_tokens if hook_usage.extra_calls else 0
+    if final_write is None:
+        return hook_writes or None
+    return final_write + hook_writes
+
+
+def _openai_responses_cache_split(
+    input_tokens: int, cached: int, reported_write: int | None
+) -> tuple[int, int, int, bool]:
+    """Split a Responses ``input_tokens`` total into ``(read, write, uncached, inferred)``.
+
+    Responses usage now reports cache writes itself as
+    ``input_tokens_details.cache_write_tokens``, billed at the write rate
+    (above list input on current models). When present it is the truth and the
+    three buckets are disjoint. Older responses omit it; the write is then
+    inferred from the uncached slice and flagged, so pricing drops it rather
+    than billing the same tokens twice.
+    """
+    if reported_write is not None:
+        return cached, reported_write, max(input_tokens - cached - reported_write, 0), False
+    return (
+        cached,
+        _infer_openai_cache_write_tokens(input_tokens, cached),
+        max(input_tokens - cached, 0),
+        True,
+    )
+
+
 def _deferrable_savings_delta(input_delta: int, saved_delta: int) -> int:
     """Gate a WS Responses turn's compression-savings delta on input accounting.
 
@@ -1768,32 +1839,36 @@ def _deferrable_savings_delta(input_delta: int, saved_delta: int) -> int:
     return saved_delta
 
 
-def _extract_responses_usage(event: dict[str, Any]) -> tuple[int, int, int, int, int]:
+def _extract_responses_usage(event: dict[str, Any]) -> tuple[int, int, int, int, int, bool]:
     """Return input/output/cache usage from a Responses event.
 
     Codex WebSocket streams include usage on ``response.completed`` events.
     The shape mirrors HTTP Responses usage:
     ``response.usage.input_tokens`` plus
-    ``response.usage.input_tokens_details.cached_tokens``.
+    ``response.usage.input_tokens_details.cached_tokens`` / ``cache_write_tokens``.
+    The last element says whether the write was inferred (see
+    :func:`_openai_responses_cache_split`).
     """
 
     if event.get("type") != "response.completed":
-        return 0, 0, 0, 0, 0
+        return 0, 0, 0, 0, 0, True
 
     response = event.get("response")
     if not isinstance(response, dict):
         response = {}
     usage = response.get("usage") or event.get("usage")
     if not isinstance(usage, dict):
-        return 0, 0, 0, 0, 0
+        return 0, 0, 0, 0, 0, True
 
     input_tokens = usage_int(usage.get("input_tokens"))
     output_tokens = usage_int(usage.get("output_tokens"))
     details = usage.get("input_tokens_details")
-    cached_tokens = usage_int(details.get("cached_tokens")) if isinstance(details, dict) else 0
-    cache_write_tokens = _infer_openai_cache_write_tokens(input_tokens, cached_tokens)
-    uncached_tokens = max(input_tokens - cached_tokens, 0)
-    return input_tokens, output_tokens, cached_tokens, cache_write_tokens, uncached_tokens
+    cached, write, uncached, inferred = _openai_responses_cache_split(
+        input_tokens,
+        usage_int(details.get("cached_tokens")) if isinstance(details, dict) else 0,
+        _reported_cache_write(details),
+    )
+    return input_tokens, output_tokens, cached, write, uncached, inferred
 
 
 def _prefers_http1_passthrough(base_url: str) -> bool:
@@ -1991,6 +2066,24 @@ class OpenAIHandlerMixin:
                 await traffic_learner.on_messages(learner_messages)
         except Exception as exc:
             logger.debug("[%s] Traffic learner (ws): %s", request_id, exc)
+
+    @staticmethod
+    async def _run_ws_create_hooks(
+        frame: Any, ws_headers: dict[str, str], connection_id: str
+    ) -> bool:
+        """Run ``on_responses_create`` on a WS create frame's inner payload.
+
+        True when a hook changed it, so the caller re-serializes the frame.
+        """
+        inner = frame.get("response", frame) if isinstance(frame, dict) else None
+        if not isinstance(inner, dict):
+            return False
+        return await run_responses_create_hooks(
+            inner,
+            headers=MappingProxyType(ws_headers),
+            transport="websocket",
+            connection_id=connection_id,
+        )
 
     @staticmethod
     def _headroom_bypass_enabled(headers: Any) -> bool:
@@ -2802,8 +2895,12 @@ class OpenAIHandlerMixin:
                     - tokenizer.count_text(_json_debug_dumps(working.get("tools"))),
                 )
                 _add_timing("compression_tool_schema_token_count", tool_token_started)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(
+                    "[%s] tool schema compaction token count failed; savings not counted: %s",
+                    request_id,
+                    describe_exception(e),
+                )
 
         # Layer 2: Tool description truncation (opt-in via
         # HEADROOM_TOOL_DESC_MAX_CHARS).
@@ -2831,10 +2928,17 @@ class OpenAIHandlerMixin:
                             tokenizer.count_text(_json_debug_dumps(payload.get("tools")))
                             - tokenizer.count_text(_json_debug_dumps(working.get("tools"))),
                         )
-                    except Exception:
-                        pass
-        except Exception:
-            pass
+                    except Exception as e:
+                        logger.debug(
+                            "[%s] tool desc compaction token count failed; savings not counted: %s",
+                            request_id,
+                            describe_exception(e),
+                        )
+        except Exception as e:
+            # Tool schemas are client content: log the failure, never its message.
+            logger.warning(
+                "[%s] tool desc compaction step failed: %s", request_id, describe_exception(e)
+            )
 
         # Server-side Tool Search deferral (OpenAI Responses, gpt-5.4+): mark
         # non-core function/MCP tools defer_loading + inject {"type": "tool_search"}
@@ -2956,8 +3060,12 @@ class OpenAIHandlerMixin:
                     )
                     if _mt_after < _mt_before:
                         tokens_saved += _mt_before - _mt_after
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(
+                        "[%s] turn-hook message fold token count failed; savings not counted: %s",
+                        request_id,
+                        describe_exception(e),
+                    )
             modified = True
             transforms.append("openai:responses:turn_hook")
 
@@ -3006,8 +3114,12 @@ class OpenAIHandlerMixin:
                     "compression_tool_schema_attempted_token_count",
                     attempted_token_started,
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(
+                    "[%s] tool schema attempted-token count failed: %s",
+                    request_id,
+                    describe_exception(e),
+                )
 
         dedupe_started = time.perf_counter()
         deduped: list[str] = []
@@ -3639,12 +3751,15 @@ class OpenAIHandlerMixin:
             from headroom.hooks import CompressContext, collect_protected
 
             _hook_ctx = CompressContext(model=model, provider="openai")
+            _hook_stage = "pre_compress"
             try:
                 messages = self.config.hooks.pre_compress(messages, _hook_ctx)
+                _hook_stage = "compute_biases"
                 _hook_biases = self.config.hooks.compute_biases(messages, _hook_ctx)
+                _hook_stage = "protect_messages"
                 _hook_protect = collect_protected(self.config.hooks, messages, _hook_ctx)
             except Exception as e:
-                logger.debug(f"[{request_id}] Hook error: {e}")
+                log_hook_failure(request_id, _hook_stage, self.config.hooks, e)
 
         # x-headroom-keep-last-turns: N — trim history before optimization.
         # Consumed here (after bypass check, after _strip_internal_headers)
@@ -3809,6 +3924,12 @@ class OpenAIHandlerMixin:
 
                 if is_token_mode(self.config.mode):
                     comp_cache = self._get_compression_cache(openai_session_id)
+                    from headroom.cache.prefix_tracker import seed_restored_compression_cache
+
+                    # Seeds the empty cache after a restart
+                    # (HEADROOM_PREFIX_STATE_FILE); without it the freeze below
+                    # freezes nothing.
+                    seed_restored_compression_cache(openai_prefix_tracker, comp_cache)
 
                     if not is_cache_mode(self.config.mode):
                         # Token mode: shared engine, REPLAYABLE policy — its
@@ -4049,7 +4170,7 @@ class OpenAIHandlerMixin:
                     )
                 )
             except Exception as e:
-                logger.debug(f"[{request_id}] post_compress hook error: {e}")
+                log_hook_failure(request_id, "post_compress", self.config.hooks, e)
 
         # CCR Tool Injection: Inject retrieval tool if compression occurred
         # OR if this session has previously done CCR (PR-B7 sticky-on).
@@ -4449,6 +4570,7 @@ class OpenAIHandlerMixin:
         )
 
         _th_ctx: TurnContext | None = None
+        _th_raw_saved = None
         if registered_turn_hooks():
             _th_tools_before = body.get("tools")
             _th_tok_before = (
@@ -4496,7 +4618,17 @@ class OpenAIHandlerMixin:
                 optimized_tokens = _th_msg_after
                 if 0 < tool_tokens_after_compaction < tool_tokens_before_compaction:
                     optimized_tokens += tool_tokens_after_compaction
-                tokens_saved = max(0, original_tokens - optimized_tokens)
+                # A tool the hook added is sent too: it reduces the saving.
+                _th_tools_after_count = (
+                    tokenizer.count_text(
+                        json.dumps(without_deferral_flags(_th_ctx.tools), default=str)
+                    )
+                    if _th_ctx.tools
+                    else 0
+                )
+                optimized_tokens += max(0, _th_tools_after_count - _th_tok_before)
+                _th_raw_saved: int | None = original_tokens - optimized_tokens
+                tokens_saved = max(0, _th_raw_saved)
                 # Attribute to the hook ONLY when the hook itself reduced tokens.
                 if _th_msg_before is not None and _th_msg_after < _th_msg_before:
                     transforms_applied.append("turn_hook")
@@ -4513,6 +4645,10 @@ class OpenAIHandlerMixin:
                     int(tags.get("turn_hook_tools_saved_tokens", 0) or 0) + _th_saved
                 )
                 transforms_applied.append(f"turn_hook:tools:{_th_saved}tok")
+            # Signed, then clamped once: message text a hook added offsets the
+            # tool definitions it removed.
+            if _th_raw_saved is not None:
+                tokens_saved = net_hook_tool_saving(_th_raw_saved, tags, _th_saved)
 
         # Compatibility shim: GPT-5 / o-series chat models REJECT the legacy
         # `max_tokens` ("Unsupported parameter … Use 'max_completion_tokens'
@@ -4866,8 +5002,12 @@ class OpenAIHandlerMixin:
                                     current_forwarded_messages=optimized_messages,
                                 ),
                             )
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug(
+                            "[%s] cache observation (openai chat, backend) failed: %s",
+                            request_id,
+                            describe_exception(e),
+                        )
 
                     openai_prefix_tracker.update_from_response(
                         cache_read_tokens=cache_read_tokens,
@@ -5366,8 +5506,12 @@ class OpenAIHandlerMixin:
                                 current_forwarded_messages=optimized_messages,
                             ),
                         )
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug(
+                        "[%s] cache observation (openai chat, direct) failed: %s",
+                        request_id,
+                        describe_exception(e),
+                    )
 
                 openai_prefix_tracker.update_from_response(
                     cache_read_tokens=cache_read_tokens,
@@ -5560,8 +5704,14 @@ class OpenAIHandlerMixin:
                 )
         except Exception as e:
             await self.metrics.record_failed(provider=openai_chat_outcome_provider)
-            # Log full error details internally for debugging
-            logger.error(f"[{request_id}] OpenAI request failed: {type(e).__name__}: {e}")
+            # Error names the failure; text and traceback go to debug.
+            log_request_failure(
+                request_id,
+                "OpenAI request",
+                e,
+                provider=openai_chat_outcome_provider,
+                model=model,
+            )
             # Return sanitized error message to client (don't expose internal details)
             return JSONResponse(
                 status_code=502,
@@ -5651,8 +5801,6 @@ class OpenAIHandlerMixin:
                 },
             )
 
-        model = body.get("model", "unknown")
-        stream = body.get("stream", False)
         body_mutation_tracker = BodyMutationTracker()
         _bypass = self._headroom_bypass_enabled(request.headers)
         if _bypass:
@@ -5672,8 +5820,17 @@ class OpenAIHandlerMixin:
             url=str(request.url),
             headers=dict(request.headers.items()),
             body=body,
-            metadata={"path": request.url.path, "stream": stream},
+            metadata={"path": request.url.path, "stream": body.get("stream", False)},
         )
+        # Before every stage that reads the body, so a hook's replacement is
+        # what compression, deferral, token counting, pricing and the
+        # stream/buffered dispatch all see.
+        if not _bypass and await run_responses_create_hooks(
+            body, headers=request.headers, transport="http"
+        ):
+            body_mutation_tracker.mark_mutated("responses_create_hook")
+        model = body.get("model", "unknown")
+        stream = body.get("stream", False)
 
         # /v1/responses uses provider-specific CompressionUnit extraction
         # below, then routes mutable text through ContentRouter. The
@@ -6380,6 +6537,36 @@ class OpenAIHandlerMixin:
                 "upstream request for server-side retrieval handling"
             )
 
+        # Per-item original/sent counts against this conversation's previous
+        # request, in Headroom's tokenizer (headroom.proxy.savings). ORIGINAL
+        # is the client's bytes, before memory, compression or shaping; SENT is
+        # the body forwarded below. All of it runs off the event loop: it
+        # decodes, serializes and tokenizes the whole transcript. Skipped for
+        # incremental bodies (previous_response_id / conversation): the
+        # provider bills context they do not carry. It covers the first
+        # upstream call only; continuations and re-drives are the wiring's to
+        # mark as estimated. The outcome funnel settles it (ItemLedger.settle).
+        savings_measure = None
+        if not (body.get("previous_response_id") or body.get("conversation")):
+
+            def _measure_items() -> ItemMeasure:
+                original = responses_items(json.loads(original_body_bytes))
+                return get_item_ledger().measure(
+                    prefix_key(_pre_compression_conversation_key, model, original),
+                    original,
+                    responses_items(body),
+                    tokenizer.count_text,
+                )
+
+            try:
+                savings_measure = await asyncio.to_thread(_measure_items)
+            except Exception as exc:  # noqa: BLE001 - telemetry must never break a request
+                logger.warning(
+                    "[%s] savings item measurement skipped: %s",
+                    request_id,
+                    describe_exception(exc),
+                )
+
         try:
             if stream and not buffered_stream_ccr:
                 # Streaming for Responses API uses semantic events
@@ -6404,6 +6591,7 @@ class OpenAIHandlerMixin:
                     waste_signals=waste_signals_dict,
                     conversation_key=responses_conversation_key,
                     conversation_tokens_saved=tokens_saved,
+                    savings_measure=savings_measure,
                 )
             else:
 
@@ -6591,6 +6779,7 @@ class OpenAIHandlerMixin:
                     total_input_tokens = original_tokens  # fallback
                     output_tokens = 0
                     cache_read_tokens = 0
+                    details: Any = None
                     resp_json = None
                     try:
                         resp_json = response.json()
@@ -6810,11 +6999,17 @@ class OpenAIHandlerMixin:
                     # Cost is recorded once by the outcome funnel below; here we only
                     # compute the cache-write / uncached split the funnel needs.
                     # (Recording here too double-counted spend + budget on this path.)
-                    cache_write_tokens = _infer_openai_cache_write_tokens(
+                    # Reads include the hook's re-drives added above.
+                    (
+                        cache_read_tokens,
+                        cache_write_tokens,
+                        uncached_input_tokens,
+                        cache_inferred,
+                    ) = _openai_responses_cache_split(
                         total_input_tokens,
                         cache_read_tokens,
+                        _hook_reported_write(_reported_cache_write(details), _resp_hook_usage),
                     )
-                    uncached_input_tokens = max(0, total_input_tokens - cache_read_tokens)
 
                     # Was: optimized := provider count, then original := max(original,
                     # optimized + saved) to stop `attempted` exceeding `original`.
@@ -6856,7 +7051,7 @@ class OpenAIHandlerMixin:
                             cache_read_tokens=cache_read_tokens,
                             cache_write_tokens=cache_write_tokens,
                             uncached_input_tokens=uncached_input_tokens,
-                            cache_inferred=True,
+                            cache_inferred=cache_inferred,
                             total_latency_ms=total_latency,
                             overhead_ms=optimization_latency,
                             transforms_applied=tuple(transforms_applied),
@@ -6865,6 +7060,7 @@ class OpenAIHandlerMixin:
                             tags=_resp_log_tags,
                             conversation_key=responses_conversation_key,
                             conversation_tokens_saved=tokens_saved,
+                            savings_measure=savings_measure,
                             turn_id=compute_turn_id(model, body.get("instructions"), messages),
                             request_messages=messages
                             if getattr(self.config, "log_full_messages", False)
@@ -6998,7 +7194,7 @@ class OpenAIHandlerMixin:
             return await _buffered_ccr_operation()
         except Exception as e:
             await self.metrics.record_failed(provider="openai")
-            logger.error(f"[{request_id}] OpenAI responses request failed: {type(e).__name__}: {e}")
+            log_request_failure(request_id, "OpenAI responses request", e, model=model)
             return JSONResponse(
                 status_code=502,
                 content={
@@ -7131,6 +7327,12 @@ class OpenAIHandlerMixin:
         # handshake. Returns `{}` when no tags are present.
         _extract_ws_tags = getattr(self, "_extract_tags", None)
         ws_tags = _extract_ws_tags(ws_headers) if callable(_extract_ws_tags) else {}
+        # Savings attribution rows (turn hooks, tool-search deferral) from frames
+        # that were rewritten and sent, waiting for the next turn's outcome. Each
+        # frame compresses into its own dict: a timed-out compression thread
+        # keeps running and must not book rows for a frame sent uncompressed.
+        # Coalesced per source by ``accumulate_savings``, so it stays small.
+        ws_turn_savings: list[dict[str, Any]] = []
 
         # Extract subprotocol from client — this is an application-level negotiation
         # that MUST be forwarded end-to-end (unlike sec-websocket-key which is per-connection).
@@ -7621,6 +7823,19 @@ class OpenAIHandlerMixin:
             except json.JSONDecodeError:
                 # Not JSON — pass through as-is
                 pass
+            first_frame_is_create = isinstance(body, dict) and (
+                body.get("type") == "response.create" or ("type" not in body and "input" in body)
+            )
+            _ws_bypass = self._headroom_bypass_enabled(ws_headers)
+            if _ws_bypass:
+                logger.info(
+                    "[%s] WS /v1/responses passthrough reason=bypass_header mutation=disabled",
+                    request_id,
+                )
+            elif first_frame_is_create and await self._run_ws_create_hooks(
+                body, ws_headers, session_id
+            ):
+                first_msg_raw = json.dumps(body)
             if isinstance(body, dict) and body:
                 ws_response_body_for_store = (
                     body["response"] if isinstance(body.get("response"), dict) else body
@@ -7636,6 +7851,11 @@ class OpenAIHandlerMixin:
             ws_cache_read_tokens_total = 0
             ws_cache_write_tokens_total = 0
             ws_uncached_input_tokens_total = 0
+            # Whether the latest usage frame's write was inferred rather than
+            # reported (see _openai_responses_cache_split). One flag for the
+            # summed deltas: a session that mixed reported and unreported
+            # frames would misprice one kind, which Codex does not do.
+            ws_cache_inferred = True
             ws_recorded_input_tokens_total = 0
             ws_recorded_output_tokens_total = 0
             ws_recorded_cache_read_tokens_total = 0
@@ -8092,9 +8312,7 @@ class OpenAIHandlerMixin:
                     logger.warning(f"[{request_id}] WS Memory injection failed: {e}")
                     return frame_raw
 
-            if isinstance(body, dict) and (
-                body.get("type") == "response.create" or ("type" not in body and "input" in body)
-            ):
+            if first_frame_is_create:
                 first_msg_raw = await _prepare_memory_frame(body, first_msg_raw)
                 first_response_body = body.get("response", body)
                 current_response_input = _responses_input_to_items(
@@ -8150,6 +8368,7 @@ class OpenAIHandlerMixin:
                         )
                         _record_ws_compression_overhead(_preflight_ms)
                         _compression_started = time.perf_counter()
+                        _frame_savings: dict[str, Any] = {}
                         try:
                             (
                                 _new_inner,
@@ -8169,6 +8388,7 @@ class OpenAIHandlerMixin:
                                 if client == "codex"
                                 else COMPRESSION_TIMEOUT_SECONDS,
                                 client=client,
+                                savings_tags=_frame_savings,
                             )
                             for _timing_name, _timing_ms in _ws_compression_timing.items():
                                 _record_ws_compression_timing(_timing_name, _timing_ms)
@@ -8217,6 +8437,9 @@ class OpenAIHandlerMixin:
                                 )
                                 _record_ws_compression_overhead(_rewrite_ms)
                                 tokens_saved += int(_ws_saved)
+                                accumulate_savings(
+                                    ws_turn_savings, savings_from_tags(_frame_savings)
+                                )
                                 ws_conversation_tokens_saved = int(_ws_saved)
                                 ws_conversation_key = savings_conversation_key(
                                     _send_body, session_id=f"ws:{session_id}"
@@ -8543,6 +8766,7 @@ class OpenAIHandlerMixin:
                             )
                             _record_ws_compression_overhead(_preflight_ms)
                             _compression_started = time.perf_counter()
+                            frame_savings: dict[str, Any] = {}
                             try:
                                 (
                                     new_inner,
@@ -8562,6 +8786,7 @@ class OpenAIHandlerMixin:
                                     if client == "codex"
                                     else COMPRESSION_TIMEOUT_SECONDS,
                                     client=client,
+                                    savings_tags=frame_savings,
                                 )
                                 for _timing_name, _timing_ms in frame_compression_timing.items():
                                     _record_ws_compression_timing(_timing_name, _timing_ms)
@@ -8711,6 +8936,7 @@ class OpenAIHandlerMixin:
                         )
                         _record_ws_compression_overhead(_rewrite_ms)
                         tokens_saved += int(frame_saved)
+                        accumulate_savings(ws_turn_savings, savings_from_tags(frame_savings))
                         ws_conversation_tokens_saved = int(frame_saved)
                         ws_conversation_key = savings_conversation_key(
                             new_inner, session_id=f"ws:{session_id}"
@@ -8812,6 +9038,10 @@ class OpenAIHandlerMixin:
                                     inbound_response = _inbound_frame_body.get(
                                         "response", _inbound_frame_body
                                     )
+                                    if not _ws_bypass and await self._run_ws_create_hooks(
+                                        _inbound_frame_body, ws_headers, session_id
+                                    ):
+                                        msg = json.dumps(_inbound_frame_body)
                                     current_response_input = _responses_input_to_items(
                                         inbound_response.get("input")
                                         if isinstance(inbound_response, dict)
@@ -8956,7 +9186,7 @@ class OpenAIHandlerMixin:
                         nonlocal ws_memory_response_pending
                         nonlocal ws_input_tokens_total, ws_output_tokens_total
                         nonlocal ws_cache_read_tokens_total, ws_cache_write_tokens_total
-                        nonlocal ws_uncached_input_tokens_total
+                        nonlocal ws_uncached_input_tokens_total, ws_cache_inferred
                         nonlocal ws_recorded_input_tokens_total
                         nonlocal ws_recorded_output_tokens_total
                         nonlocal ws_recorded_cache_read_tokens_total
@@ -9067,6 +9297,15 @@ class OpenAIHandlerMixin:
                             # at the WS upgrade) so dashboards can
                             # slice WS turns by tag — same surface
                             # as HTTP turns.
+                            # Same gate as ``saved_delta``: a usage-less turn
+                            # leaves its rows pending for a usage-carrying one.
+                            turn_tags = ws_tags
+                            if ws_turn_savings and input_delta > 0:
+                                turn_tags = {
+                                    **ws_tags,
+                                    SAVINGS_ATTRIBUTION_TAG: list(ws_turn_savings),
+                                }
+                                ws_turn_savings.clear()
                             await self._record_request_outcome(
                                 RequestOutcome(
                                     # Per-emission ids keep dashboard request-log keys unique.
@@ -9086,6 +9325,7 @@ class OpenAIHandlerMixin:
                                     cache_read_tokens=max(0, cache_read_delta),
                                     cache_write_tokens=max(0, cache_write_delta),
                                     uncached_input_tokens=max(0, uncached_delta),
+                                    cache_inferred=ws_cache_inferred,
                                     total_latency_ms=latency_ms,
                                     overhead_ms=overhead_delta_ms,
                                     ttfb_ms=ttfb_for_record_ms,
@@ -9096,7 +9336,7 @@ class OpenAIHandlerMixin:
                                     )
                                     if isinstance(body, dict)
                                     else 0,
-                                    tags=ws_tags,
+                                    tags=turn_tags,
                                     conversation_key=ws_conversation_key,
                                     conversation_tokens_saved=ws_conversation_tokens_saved,
                                     client=client,
@@ -9230,8 +9470,10 @@ class OpenAIHandlerMixin:
                                     usage_cache_read_tokens,
                                     usage_cache_write_tokens,
                                     usage_uncached_tokens,
+                                    usage_cache_inferred,
                                 ) = _extract_responses_usage(event)
                                 if usage_input_tokens or usage_output_tokens:
+                                    ws_cache_inferred = usage_cache_inferred
                                     ws_input_tokens_total += usage_input_tokens
                                     ws_output_tokens_total += usage_output_tokens
                                     ws_cache_read_tokens_total += usage_cache_read_tokens
@@ -9625,6 +9867,7 @@ class OpenAIHandlerMixin:
                     fb_cache_read_tokens,
                     fb_cache_write_tokens,
                     fb_uncached_tokens,
+                    ws_cache_inferred,
                 ) = await self._ws_http_fallback(
                     websocket, body, first_msg_raw, upstream_headers, request_id
                 )
@@ -9708,6 +9951,10 @@ class OpenAIHandlerMixin:
                 "cache_write_tokens": str(ws_cache_write_tokens_total),
                 "uncached_input_tokens": str(ws_uncached_input_tokens_total),
             }
+            if ws_turn_savings and residual_input_tokens > 0:
+                # Rows no per-turn record claimed ride with the residual, under
+                # the same input-usage gate as ``residual_tokens_saved``.
+                ws_session_tags[SAVINGS_ATTRIBUTION_TAG] = list(ws_turn_savings)
             if (
                 residual_input_tokens > 0
                 or residual_output_tokens > 0
@@ -9756,6 +10003,7 @@ class OpenAIHandlerMixin:
                         cache_read_tokens=residual_cache_read_tokens,
                         cache_write_tokens=residual_cache_write_tokens,
                         uncached_input_tokens=residual_uncached_input_tokens,
+                        cache_inferred=ws_cache_inferred,
                         total_latency_ms=ws_session_duration_ms,
                         overhead_ms=final_overhead_delta_ms,
                         ttfb_ms=final_ttfb_ms,
@@ -9902,7 +10150,7 @@ class OpenAIHandlerMixin:
         first_msg_raw: str,
         upstream_headers: dict[str, str],
         request_id: str,
-    ) -> tuple[int, int, int, int, int]:
+    ) -> tuple[int, int, int, int, int, bool]:
         """Fall back to HTTP POST streaming when upstream WS fails.
 
         Converts the WS ``response.create`` message to an HTTP POST to
@@ -9916,7 +10164,9 @@ class OpenAIHandlerMixin:
         authoritative wire-token count; otherwise a fallback recorded
         ``input_tokens=0`` and savings percentages blew past 100 (#2957).
         """
-        fallback_usage = [0, 0, 0, 0, 0]
+        # Five summed counters, then whether the latest frame's write was
+        # inferred (see _openai_responses_cache_split).
+        fallback_usage: list[int] = [0, 0, 0, 0, 0, True]
 
         def _accumulate_usage(data_str: str) -> None:
             try:
@@ -9924,8 +10174,10 @@ class OpenAIHandlerMixin:
             except (json.JSONDecodeError, TypeError):
                 return
             if isinstance(event, dict) and event.get("type") == "response.completed":
-                for i, value in enumerate(_extract_responses_usage(event)):
+                usage = _extract_responses_usage(event)
+                for i, value in enumerate(usage[:5]):
                     fallback_usage[i] += value
+                fallback_usage[5] = usage[5]
 
         # Route to correct endpoint based on auth mode
         is_chatgpt_fallback = has_chatgpt_account_header(upstream_headers)
@@ -10577,12 +10829,20 @@ class OpenAIHandlerMixin:
                 session_tracker = self.session_tracker_store.get_or_create(
                     _session_key, _tracker_provider
                 )
+                from headroom.cache.prefix_tracker import seed_restored_compression_cache
+
+                seed_restored_compression_cache(session_tracker, comp_cache)
 
             # A claimed turn prepares its executor-side work here (tokenizer,
             # hooks, scope binding) — CPU-bound parts run inside the closures
             # below with the rest of the turn.
             if _turn is not None:
                 _turn.prepare(model_name=model_name, tags=tags, config=self.config)
+
+            # Whether the returned ``tokens_after`` was counted over the FINAL,
+            # post-hook messages (so it already includes any text a hook added).
+            # Set by whichever closure runs; read after the executor.
+            _after_counts_hook = [False]
 
             def _run_stateless():
                 result = pipeline.apply(messages=messages, model=model, **pipeline_kwargs)
@@ -10592,6 +10852,7 @@ class OpenAIHandlerMixin:
                     final = _turn.transform(final)
                     if _turn.folded_messages:
                         tokens_after = _turn.count_messages(final, tokens_after)
+                        _after_counts_hook[0] = True
                 return (
                     result,
                     final,
@@ -10681,6 +10942,7 @@ class OpenAIHandlerMixin:
                         _tok = get_tokenizer(model_name)
                         raw_tokens_before = _tok.count_messages(messages)
                         final_tokens_after = _tok.count_messages(final)
+                        _after_counts_hook[0] = True
                     except Exception as e:
                         # Fail-open, but LOUD: this fallback reverts to the
                         # pipeline's counts of the cache-swapped input, which
@@ -10731,7 +10993,19 @@ class OpenAIHandlerMixin:
 
             ccr_hashes = _response_ccr_hashes(final_messages, result.markers_inserted)
 
-            tokens_saved = max(0, tokens_before - tokens_after)
+            # Tools and message text a turn hook added are sent too: they reduce
+            # the saving, and offset tools the hook removed (signed, clamped once).
+            _hook_tool_saved = 0
+            if _turn is not None:
+                tokens_after += max(0, int(getattr(_turn, "tool_growth_tokens", 0) or 0))
+                # Only a count of pre-hook messages lacks the text a hook added;
+                # a recount of the final messages (stateless fold, session) has it.
+                if not _after_counts_hook[0]:
+                    tokens_after += max(0, int(getattr(_turn, "message_growth_tokens", 0) or 0))
+                _hook_tool_saved = int(getattr(_turn, "hook_tool_saved_tokens", 0) or 0)
+            tokens_saved = net_hook_tool_saving(
+                tokens_before - tokens_after, tags, _hook_tool_saved
+            )
             latency_ms = (time.time() - start_time) * 1000
             _transforms_applied = list(result.transforms_applied or ())
             # The claimed turn adds its labels and response fields BEFORE the
