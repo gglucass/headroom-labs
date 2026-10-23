@@ -451,6 +451,10 @@ class BaseTokenizer(ABC):
     @staticmethod
     def _estimate_document_tokens(doc_bytes: bytes) -> int:
         """Estimate a document file's tokens from its page count (see the constants)."""
+        if b"%PDF-" not in doc_bytes[:1024]:
+            # Only a PDF has a page tree: other bytes (a Strands txt/csv/docx
+            # document) keep the size estimate even when their text quotes PDF syntax.
+            return max(1, len(doc_bytes) // _DOCUMENT_BYTES_PER_PAGE) * _DOCUMENT_TOKENS_PER_PAGE
         searchable = [doc_bytes]
         # One inflate budget for the whole file, not per stream: a PDF with
         # many object streams must not multiply the request path's memory.

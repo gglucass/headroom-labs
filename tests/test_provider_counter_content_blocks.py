@@ -159,6 +159,10 @@ def test_pdf_page_count_falls_back_from_tree_to_page_objects_to_size() -> None:
     # Page tree hidden (compressed object streams): ~3KB of file per page.
     opaque = bytes(range(256)) * 4096
     assert count_content_blocks([_base64_document(opaque)], len) == len(opaque) // 3000 * 1500
+    # Text that quotes PDF syntax is not a PDF (a Strands txt document): size estimate.
+    quoted = b"Notes on /Type /Pages /Count 1 and /Type /Page objects.\n" + b"x" * 300_000
+    strands = {"document": {"format": "txt", "name": "notes", "source": {"bytes": quoted}}}
+    assert count_content_blocks([strands], len) == len(quoted) // 3000 * 1500
     # Undecodable base64 is still a document: one page, no exception.
     broken = {"type": "document", "source": {"type": "base64", "data": "not base64!"}}
     assert count_content_blocks([broken], len) == 1500
