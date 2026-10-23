@@ -6,7 +6,12 @@ tokenizer backends must implement.
 
 from __future__ import annotations
 
+import base64
+import binascii
+import contextlib
 import json
+import re
+import zlib
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import Any, Protocol, runtime_checkable
@@ -24,6 +29,22 @@ _MAX_COERCED_FIELD_CHARS = 200_000
 _COUNT_CACHE_MIN_CHARS = 256
 _COUNT_CACHE_MAX_ENTRIES = 4096
 _COUNT_CACHE_MAX_CHARS = 8_000_000
+
+#: Document pricing (see ``BaseTokenizer._estimate_document_tokens``). Anthropic
+#: documents ~1,500-3,000 text tokens per PDF page; the low end is used. Pages
+#: come from the PDF's own page tree when it is readable: the root ``/Pages``
+#: node's ``/Count`` is the total (inner nodes count subsets, hence the max),
+#: else the ``/Type /Page`` objects. PDF 1.5+ often keeps both inside compressed
+#: object streams, which are inflated for the search (one budget per file). Only
+#: when neither is found does ~3KB of file per page stand in.
+_DOCUMENT_TOKENS_PER_PAGE = 1500
+_DOCUMENT_BYTES_PER_PAGE = 3000
+_PDF_OBJECT_STREAM_MAX_BYTES = 4_000_000
+_PDF_OBJECT_STREAM = re.compile(rb"/Type\s*/ObjStm\b[^>]*>>\s*stream\r?\n")
+_PDF_PAGE_TREE_COUNT = re.compile(
+    rb"/Type\s*/Pages\b[^>]*?/Count\s+(\d+)|/Count\s+(\d+)[^>]*?/Type\s*/Pages\b"
+)
+_PDF_PAGE_OBJECT = re.compile(rb"/Type\s*/Page(?![A-Za-z])")
 
 
 class TokenCountCache:
@@ -264,6 +285,12 @@ class BaseTokenizer(ABC):
                     # This prevents the base64 blob from being json.dumps'd and counted
                     # as text tokens (1MB image = ~330K fake tokens without this).
                     total += 1600
+                elif part_type == "document":
+                    # Anthropic document block. Its base64 PDF used to reach the
+                    # JSON catch-all below and be priced as prose: a 1 MB PDF
+                    # counted ~907K tokens, against the ~1,600 an image of the
+                    # same bytes gets.
+                    total += self._count_document_block(part)
                 elif part_type in ("input_audio", "audio"):
                     # Audio has fixed token cost, not tokenized as text
                     total += 200
@@ -321,8 +348,7 @@ class BaseTokenizer(ABC):
                     source = doc.get("source", {})
                     doc_bytes = source.get("bytes", b"")
                     if isinstance(doc_bytes, bytes | bytearray):
-                        estimated_pages = max(1, len(doc_bytes) // 3000)
-                        total += estimated_pages * 1500
+                        total += self._estimate_document_tokens(bytes(doc_bytes))
                     else:
                         total += self.count_text(str(doc_bytes))
                 elif not part_type and "image" in part:
@@ -392,6 +418,57 @@ class BaseTokenizer(ABC):
             s[int(i * step) : int(i * step) + self.SAMPLE_CHUNK] for i in range(chunks)
         )
         return int(self.count_text(sample) * len(s) / len(sample))
+
+    def _count_document_block(self, part: dict[str, Any]) -> int:
+        """Price an Anthropic ``document`` block by its source type."""
+        source = part.get("source")
+        source = source if isinstance(source, dict) else {}
+        source_type = source.get("type")
+        if source_type == "base64":
+            try:
+                doc_bytes = base64.b64decode(source.get("data") or b"")
+            except (binascii.Error, TypeError, ValueError):
+                doc_bytes = b""
+            total = self._estimate_document_tokens(doc_bytes)
+        elif source_type == "content":
+            content = source.get("content")
+            if isinstance(content, list):
+                total = self._count_content_parts(content)
+            else:
+                total = self.count_text(str(content or ""))
+        elif source_type in ("url", "file"):
+            # The bytes live with the provider; one page as a nominal estimate.
+            total = _DOCUMENT_TOKENS_PER_PAGE
+        else:
+            # A plain-text source, or an untyped one carrying text.
+            total = self.count_text(str(source.get("data") or ""))
+        for key in ("title", "context"):
+            value = part.get(key)
+            if isinstance(value, str):
+                total += self.count_text(value)
+        return total
+
+    @staticmethod
+    def _estimate_document_tokens(doc_bytes: bytes) -> int:
+        """Estimate a document file's tokens from its page count (see the constants)."""
+        searchable = [doc_bytes]
+        # One inflate budget for the whole file, not per stream: a PDF with
+        # many object streams must not multiply the request path's memory.
+        budget = _PDF_OBJECT_STREAM_MAX_BYTES
+        for match in _PDF_OBJECT_STREAM.finditer(doc_bytes):
+            if budget <= 0:
+                break
+            end = doc_bytes.find(b"endstream", match.end())
+            with contextlib.suppress(zlib.error):
+                inflated = zlib.decompressobj().decompress(doc_bytes[match.end() : end], budget)
+                budget -= len(inflated)
+                searchable.append(inflated)
+        text = b"\n".join(searchable)
+        tree_counts = [int(a or b) for a, b in _PDF_PAGE_TREE_COUNT.findall(text)]
+        pages = max(tree_counts) if tree_counts else len(_PDF_PAGE_OBJECT.findall(text))
+        if not pages:
+            pages = len(doc_bytes) // _DOCUMENT_BYTES_PER_PAGE
+        return max(1, pages) * _DOCUMENT_TOKENS_PER_PAGE
 
     @staticmethod
     def _estimate_image_tokens(image_data: dict[str, Any]) -> int:

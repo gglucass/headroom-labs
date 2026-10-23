@@ -29,6 +29,9 @@ media a pixel/byte-based estimate instead.
 
 from __future__ import annotations
 
+import base64
+import zlib
+
 import pytest
 
 from headroom.providers.anthropic import AnthropicProvider
@@ -104,3 +107,80 @@ def test_shared_walker_counts_nested_tool_result_blocks() -> None:
     }
     flat = {"type": "tool_result", "tool_use_id": "t", "content": _BIG}
     assert abs(count_content_blocks([nested], len) - count_content_blocks([flat], len)) < 100
+
+
+def _pdf(page_count: int, *, tree: bool = True, pad: int = 1_000_000) -> bytes:
+    """A PDF-shaped blob: its page tree (or only page objects), then opaque bytes."""
+    pages = b"".join(
+        b"%d 0 obj << /Type /Page /Parent 2 0 R >> endobj\n" % (3 + i) for i in range(page_count)
+    )
+    root = b"2 0 obj << /Type /Pages /Count %d >> endobj\n" % page_count if tree else b""
+    return (
+        b"%PDF-1.7\n1 0 obj << /Type /Catalog >> endobj\n"
+        + root
+        + pages
+        + bytes(range(256)) * (pad // 256)
+    )
+
+
+def _base64_document(raw: bytes) -> dict:
+    data = base64.b64encode(raw).decode()
+    return {
+        "type": "document",
+        "source": {"type": "base64", "media_type": "application/pdf", "data": data},
+    }
+
+
+def test_base64_pdf_document_is_priced_by_pages_not_as_text() -> None:
+    """A 1 MB base64 PDF read as prose was ~907K tokens; 12 pages are ~18K."""
+    document = _base64_document(_pdf(12))
+    for placement in (
+        [document],
+        [{"type": "tool_result", "tool_use_id": "t", "content": [document]}],
+    ):
+        assert count_content_blocks(placement, len) == 12 * 1500
+        for name, counter in _counters().items():
+            got = counter.count_messages([{"role": "user", "content": placement}])
+            assert 12 * 1500 <= got < 12 * 1500 + 100, f"{name} priced a 12-page PDF at {got}"
+
+
+def test_pdf_page_count_falls_back_from_tree_to_page_objects_to_size() -> None:
+    assert count_content_blocks([_base64_document(_pdf(5, tree=False))], len) == 5 * 1500
+    # PDF 1.5+ keeps the page tree inside a compressed object stream.
+    packed = zlib.compress(b"<< /Type /Pages /Kids [3 0 R] /Count 7 >>")
+    hidden = (
+        b"%PDF-1.7\n4 0 obj << /Type /ObjStm /N 1 /First 4 /Filter /FlateDecode >>\nstream\n"
+        + packed
+        + b"\nendstream\nendobj\n"
+        + bytes(range(256)) * 4096
+    )
+    assert count_content_blocks([_base64_document(hidden)], len) == 7 * 1500
+    # Page tree hidden (compressed object streams): ~3KB of file per page.
+    opaque = bytes(range(256)) * 4096
+    assert count_content_blocks([_base64_document(opaque)], len) == len(opaque) // 3000 * 1500
+    # Undecodable base64 is still a document: one page, no exception.
+    broken = {"type": "document", "source": {"type": "base64", "data": "not base64!"}}
+    assert count_content_blocks([broken], len) == 1500
+
+
+def test_text_and_content_document_sources_count_their_text() -> None:
+    text = {
+        "type": "document",
+        "source": {"type": "text", "media_type": "text/plain", "data": _BIG},
+    }
+    assert count_content_blocks([text], len) == len(_BIG)
+    content = {
+        "type": "document",
+        "source": {"type": "content", "content": [{"type": "text", "text": _BIG}]},
+    }
+    assert count_content_blocks([content], len) == len(_BIG)
+    titled = {**text, "title": "Q3 report", "context": "board deck"}
+    assert count_content_blocks([titled], len) == len(_BIG) + len("Q3 report") + len("board deck")
+
+
+def test_url_and_file_document_sources_are_one_nominal_page() -> None:
+    for source in (
+        {"type": "url", "url": "https://example.com/a.pdf"},
+        {"type": "file", "file_id": "file_1"},
+    ):
+        assert count_content_blocks([{"type": "document", "source": source}], len) == 1500
