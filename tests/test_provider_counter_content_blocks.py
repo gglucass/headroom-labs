@@ -36,6 +36,7 @@ import pytest
 
 from headroom.providers.anthropic import AnthropicProvider
 from headroom.providers.openai import OpenAIProvider
+from headroom.tokenizers import base
 from headroom.tokenizers.base import count_content_blocks
 
 _BIG = "x " * 3400  # ~6,800 chars
@@ -163,6 +164,27 @@ def test_pdf_page_count_falls_back_from_tree_to_page_objects_to_size() -> None:
     assert count_content_blocks([broken], len) == 1500
 
 
+def test_object_stream_inflation_shares_one_budget_per_file(monkeypatch) -> None:
+    def object_stream(body: bytes) -> bytes:
+        return (
+            b"1 0 obj << /Type /ObjStm /N 1 /First 4 /Filter /FlateDecode >>\nstream\n"
+            + zlib.compress(body)
+            + b"\nendstream\nendobj\n"
+        )
+
+    filler = b"<< /Type /Font >>" * 4
+    pdf = (
+        b"%PDF-1.7\n"
+        + object_stream(filler)
+        + object_stream(b"<< /Type /Pages /Kids [3 0 R] /Count 7 >>")
+        + bytes(range(256)) * 4096
+    )
+    assert count_content_blocks([_base64_document(pdf)], len) == 7 * 1500
+    # The first stream spends the whole budget, so the page tree after it stays packed.
+    monkeypatch.setattr(base, "_PDF_OBJECT_STREAM_MAX_BYTES", len(filler))
+    assert count_content_blocks([_base64_document(pdf)], len) == len(pdf) // 3000 * 1500
+
+
 def test_text_and_content_document_sources_count_their_text() -> None:
     text = {
         "type": "document",
@@ -174,6 +196,8 @@ def test_text_and_content_document_sources_count_their_text() -> None:
         "source": {"type": "content", "content": [{"type": "text", "text": _BIG}]},
     }
     assert count_content_blocks([content], len) == len(_BIG)
+    plain = {"type": "document", "source": {"type": "content", "content": _BIG}}
+    assert count_content_blocks([plain], len) == len(_BIG)
     titled = {**text, "title": "Q3 report", "context": "board deck"}
     assert count_content_blocks([titled], len) == len(_BIG) + len("Q3 report") + len("board deck")
 
