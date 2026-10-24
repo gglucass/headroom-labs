@@ -235,18 +235,26 @@ def test_a_pdf_with_too_many_objects_to_walk_gets_the_size_estimate(monkeypatch)
     assert count_content_blocks([_base64_document(pdf)], len) == len(pdf) // 3000 * 1500
 
 
+def _one_page_objects(
+    text: bytes, count: bytes = b"/Count 1", length: bytes | None = None
+) -> dict[int, bytes]:
+    """A minimal valid one-page PDF showing ``text``; ``count`` ends its page tree's dict.
+    With ``length``, that is the content stream's whole dict and object 6 holds the
+    stream's real length, for ``/Length 6 0 R``."""
+    data = b"BT /F1 12 Tf 72 720 Td (%s) Tj ET" % text
+    return {
+        1: b"<< /Type /Catalog /Pages 2 0 R >>",
+        2: b"<< /Type /Pages /Kids [3 0 R] /MediaBox [0 0 612 792] %s >>" % count,
+        3: b"<< /Type /Page /Parent 2 0 R /Contents 4 0 R"
+        b" /Resources << /Font << /F1 5 0 R >> >> >>",
+        4: _stream(data) if length is None else b"<< %s >>\nstream\n%s\nendstream" % (length, data),
+        5: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        **({} if length is None else {6: b"%d" % len(data)}),
+    }
+
+
 def _one_page_pdf(text: bytes, count: bytes) -> bytes:
-    """A minimal valid one-page PDF showing ``text``; ``count`` ends its page tree's dict."""
-    return _pdf_file(
-        {
-            1: b"<< /Type /Catalog /Pages 2 0 R >>",
-            2: b"<< /Type /Pages /Kids [3 0 R] /MediaBox [0 0 612 792] %s >>" % count,
-            3: b"<< /Type /Page /Parent 2 0 R /Contents 4 0 R"
-            b" /Resources << /Font << /F1 5 0 R >> >> >>",
-            4: _stream(b"BT /F1 12 Tf 72 720 Td (%s) Tj ET" % text),
-            5: b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
-        }
-    )
+    return _pdf_file(_one_page_objects(text, count))
 
 
 @pytest.mark.parametrize(
@@ -285,7 +293,7 @@ def test_page_count_comes_only_from_the_page_tree_dict(text: bytes, count: bytes
     assert base.BaseTokenizer._estimate_document_tokens(_one_page_pdf(text, count)) == 1500
 
 
-_FAKE_TREE = b"endstream\n2 0 obj << /Type /Pages /Count 9999 >> endobj"
+_FAKE_TREE = b"endstream 2 0 obj << /Type /Pages /Count 9999 >> endobj"
 
 
 @pytest.mark.parametrize(
@@ -330,6 +338,52 @@ def test_root_pages_and_stream_keys_come_only_from_their_own_dicts(
     }
     pdf = _pdf_file({**_page_tree(1), **decoys, **objects}, trailer=trailer)
     assert base.BaseTokenizer._estimate_document_tokens(pdf) == 1500
+
+
+def _packed(objects: dict[int, bytes], number: int) -> dict[int, bytes | dict[int, bytes]]:
+    """``objects`` with ``number`` moved into object stream 7, indexed by an xref stream."""
+    return {**{n: o for n, o in objects.items() if n != number}, 7: {number: objects[number]}}
+
+
+_INDIRECT = _one_page_objects(_FAKE_TREE, length=b"/Length 6 0 R")
+
+
+@pytest.mark.parametrize(
+    ("pdf", "pages"),
+    [
+        # JerrettDavis's case: object 6, read at its xref offset, ends the stream.
+        (_pdf_file(_INDIRECT), 1),
+        # Page text that also fakes object 6 with the length (24) of the quoted endstream.
+        (
+            _pdf_file(
+                _one_page_objects(_FAKE_TREE + b" 6 0 obj 24 endobj", length=b"/Length 6 0 R")
+            ),
+            1,
+        ),
+        # Through an xref stream, and through /Prev to the section that lists object 6.
+        (_pdf_file(_packed(_INDIRECT, 5)), 1),
+        (_pdf_file({5: _INDIRECT[5]}, prior=_pdf_file(_INDIRECT)), 1),
+        # A stream end that cannot be verified stops the walk, and 0 means the size
+        # estimate: the length packed in an object stream, a wrong one, a reference to
+        # no object, no /Length at all.
+        (_pdf_file(_packed(_INDIRECT, 6)), 0),
+        (_pdf_file({**_INDIRECT, 6: b"40"}), 0),
+        (_pdf_file(_one_page_objects(_FAKE_TREE, length=b"/Length 9 0 R")), 0),
+        (_pdf_file(_one_page_objects(_FAKE_TREE, length=b"")), 0),
+    ],
+    ids=[
+        "indirect",
+        "fake-length-object",
+        "xref-stream",
+        "prev-section",
+        "packed-length",
+        "wrong-length",
+        "dangling-length",
+        "no-length",
+    ],
+)
+def test_stream_data_is_never_walked_as_objects(pdf: bytes, pages: int) -> None:
+    assert base._pdf_page_count(pdf) == pages
 
 
 def test_incremental_update_prices_the_active_page_tree_not_an_obsolete_one() -> None:
