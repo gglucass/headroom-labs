@@ -346,6 +346,7 @@ def _packed(objects: dict[int, bytes], number: int) -> dict[int, bytes | dict[in
 
 
 _INDIRECT = _one_page_objects(_FAKE_TREE, length=b"/Length 6 0 R")
+_LONE_CR = b"BT /F1 12 Tf 72 720 Td (hi) Tj ET endobj 2 0 obj << /Type /Pages /Count 9999 >> endobj"
 
 
 @pytest.mark.parametrize(
@@ -363,6 +364,18 @@ _INDIRECT = _one_page_objects(_FAKE_TREE, length=b"/Length 6 0 R")
         # Through an xref stream, and through /Prev to the section that lists object 6.
         (_pdf_file(_packed(_INDIRECT, 5)), 1),
         (_pdf_file({5: _INDIRECT[5]}, prior=_pdf_file(_INDIRECT)), 1),
+        # A lone CR after the stream keyword still starts a stream, so bare tokens after
+        # the text operators stay data.
+        (
+            _pdf_file(
+                {
+                    **_INDIRECT,
+                    4: b"<< /Length 6 0 R >>\nstream\r%s\nendstream" % _LONE_CR,
+                    6: b"%d" % len(_LONE_CR),
+                }
+            ),
+            1,
+        ),
         # A stream end that cannot be verified stops the walk, and 0 means the size
         # estimate: the length packed in an object stream, a wrong one, a reference to
         # no object, no /Length at all.
@@ -376,6 +389,7 @@ _INDIRECT = _one_page_objects(_FAKE_TREE, length=b"/Length 6 0 R")
         "fake-length-object",
         "xref-stream",
         "prev-section",
+        "lone-cr",
         "packed-length",
         "wrong-length",
         "dangling-length",

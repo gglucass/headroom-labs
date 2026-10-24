@@ -54,8 +54,10 @@ _PDF_MAX_XREF_SECTIONS = 1_000  # bounds the /Prev chain an indirect /Length is 
 _PDF_TOP_LEVEL = re.compile(
     rb"(?=[%\dt])(?:%[^\r\n]*|(?<!\d)(\d{1,10})\s+\d{1,5}\s+obj\b|(?<![A-Za-z/])trailer\b)"
 )
+# A stream's data starts after its keyword, any spaces and an EOL if present (a
+# lone CR too): the spec requires CRLF or LF, but readers accept the others.
 _PDF_SYNTAX_STOP = re.compile(
-    rb"(?=[%(se])(?:%[^\r\n]*|\(|(?<![A-Za-z/])(?:stream\r?\n|endobj|startxref))"
+    rb"(?=[%(se])(?:%[^\r\n]*|\(|(?<![A-Za-z/])(?:stream *(?:\r\n?|\n)?|endobj|startxref))"
 )
 _PDF_STRING_TOKEN = re.compile(rb"\\.|[()]", re.S)
 _PDF_STREAM_LENGTH = re.compile(rb"/Length\s+(\d{1,10})(?!\d|\s+\d+\s+R)")
