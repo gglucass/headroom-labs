@@ -36,10 +36,11 @@ _COUNT_CACHE_MAX_CHARS = 8_000_000
 #: its ``/Pages`` node and that node's ``/Count``, each object read at its latest
 #: definition (an incremental update appends the new one). Only object syntax is
 #: read: comments, string literals and stream bodies are skipped, so page text
-#: never passes for structure. PDF 1.5+ often keeps these objects inside
-#: compressed object streams, which are inflated (one budget per file). With no
-#: usable tree the ``/Type /Page`` objects count, and with none of those ~3KB of
-#: file per page stands in.
+#: never passes for structure, and each key comes from its own dictionary's top
+#: level, never from a dict, array or hex string nested in it. PDF 1.5+ often
+#: keeps these objects inside compressed object streams, which are inflated (one
+#: budget per file). With no usable tree the ``/Type /Page`` objects count, and
+#: with none of those ~3KB of file per page stands in.
 _DOCUMENT_TOKENS_PER_PAGE = 1500
 _DOCUMENT_BYTES_PER_PAGE = 3000
 _PDF_MAX_PAGES = 10_000  # a larger /Count is treated as malformed, not priced
@@ -61,6 +62,7 @@ _PDF_PAGES = re.compile(rb"/Pages\s+(\d{1,10})\s+\d{1,5}\s+R")
 _PDF_COUNT = re.compile(rb"/Count\s+(\d{1,5})(?!\d)")
 _PDF_FIRST = re.compile(rb"/First\s+(\d{1,10})")
 _PDF_PAGE_OBJECT = re.compile(rb"/Type\s*/Page(?![A-Za-z])")
+_PDF_NESTING = re.compile(rb"<<|>>|<[^<>]*>|\[|\]")
 
 
 def _pdf_syntax(data: bytes, pos: int = 0) -> tuple[bytes, int, bool]:
@@ -83,6 +85,24 @@ def _pdf_syntax(data: bytes, pos: int = 0) -> tuple[bytes, int, bool]:
     return b"".join(parts) + data[pos:], len(data), False
 
 
+def _pdf_own_keys(syntax: bytes) -> bytes:
+    """The top level of the dictionary ``syntax`` opens with, each nested dict, array
+    and hex string cut to ``_``: a key read from it is that dictionary's own."""
+    body = syntax.lstrip(b"\0\t\n\x0c\r ")
+    if not body.startswith(b"<<"):
+        return b""
+    parts: list[bytes] = []
+    depth = pos = 0
+    for token in _PDF_NESTING.finditer(body):
+        if depth == 1:
+            parts += [body[pos : token.start()], b" _ "]
+        depth += {b"<<": 1, b"[": 1, b">>": -1, b"]": -1}.get(token.group(), 0)
+        if not depth:
+            break
+        pos = token.end()
+    return b"".join(parts)
+
+
 def _pdf_page_count(doc: bytes) -> int:
     """Pages in the PDF's active page tree, else its page objects, else 0."""
     objects: dict[int, bytes] = {}
@@ -98,20 +118,21 @@ def _pdf_page_count(doc: bytes) -> int:
             continue
         syntax, pos, is_stream = _pdf_syntax(doc, pos)
         if match.group(1) is None:
-            trailers.append(syntax)
+            trailers.append(_pdf_own_keys(syntax))
             continue
         objects[int(match.group(1))] = syntax  # a later definition replaces an earlier one
         if not is_stream:
             continue
-        length = _PDF_STREAM_LENGTH.search(syntax)
+        keys = _pdf_own_keys(syntax)
+        length = _PDF_STREAM_LENGTH.search(keys)
         end = pos + int(length.group(1)) if length else -1
         if not (length and _PDF_STREAM_END.match(doc, end)):
             end = doc.find(b"endstream", pos)
         start, pos = pos, len(doc) if end < 0 else end
-        if re.search(rb"/Type\s*/XRef\b", syntax):
-            trailers.append(syntax)  # a cross-reference stream's dict is its trailer
-        first = _PDF_FIRST.search(syntax)
-        if first and budget > 0 and re.search(rb"/Type\s*/ObjStm\b", syntax):
+        if re.search(rb"/Type\s*/XRef\b", keys):
+            trailers.append(keys)  # a cross-reference stream's dict is its trailer
+        first = _PDF_FIRST.search(keys)
+        if first and budget > 0 and re.search(rb"/Type\s*/ObjStm\b", keys):
             # One inflate budget for the whole file, not per stream: a PDF with
             # many object streams must not multiply the request path's memory.
             with contextlib.suppress(zlib.error):
@@ -125,15 +146,15 @@ def _pdf_page_count(doc: bytes) -> int:
     if len(objects) > _PDF_MAX_OBJECTS:
         return 0  # too many objects to walk: the size estimate stands in
 
-    def syntax_of(number: int) -> bytes:
-        return _pdf_syntax(objects.get(number, b""))[0]
+    def keys_of(number: int) -> bytes:
+        return _pdf_own_keys(_pdf_syntax(objects.get(number, b""))[0])
 
     root = next((m for t in reversed(trailers) if (m := _PDF_ROOT.search(t))), None)
-    tree = _PDF_PAGES.search(syntax_of(int(root.group(1)))) if root else None
-    count = _PDF_COUNT.search(syntax_of(int(tree.group(1)))) if tree else None
+    tree = _PDF_PAGES.search(keys_of(int(root.group(1)))) if root else None
+    count = _PDF_COUNT.search(keys_of(int(tree.group(1)))) if tree else None
     if count and 0 < int(count.group(1)) <= _PDF_MAX_PAGES:
         return int(count.group(1))
-    return sum(1 for number in objects if _PDF_PAGE_OBJECT.search(syntax_of(number)))
+    return sum(1 for number in objects if _PDF_PAGE_OBJECT.search(keys_of(number)))
 
 
 class TokenCountCache:

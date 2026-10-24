@@ -114,10 +114,12 @@ def _stream(data: bytes, entries: bytes = b"") -> bytes:
     return b"<< /Length %d%s >>\nstream\n%s\nendstream" % (len(data), entries, data)
 
 
-def _pdf_file(objects: dict[int, bytes | dict[int, bytes]], prior: bytes = b"") -> bytes:
+def _pdf_file(
+    objects: dict[int, bytes | dict[int, bytes]], prior: bytes = b"", trailer: bytes = b""
+) -> bytes:
     """A PDF with catalog 1, indexed by an xref table and trailer, or by an xref stream
     when a dict value packs those objects into an object stream. With ``prior``, an
-    incremental update of that file."""
+    incremental update of that file; ``trailer`` opens the trailer's dict."""
     out = prior or b"%PDF-1.7\n"
     rows = {} if prior else {0: (0, 0, 65535)}
     for number, body in objects.items():
@@ -142,7 +144,8 @@ def _pdf_file(objects: dict[int, bytes | dict[int, bytes]], prior: bytes = b"") 
             bytes([kind]) + a.to_bytes(4, "big") + b.to_bytes(2, "big")
             for _, (kind, a, b) in sorted(rows.items())
         )
-        entries = b" /Type /XRef /Size %d /W [1 4 2] /Index [%s] /Root 1 0 R%s" % (
+        entries = b" %s/Type /XRef /Size %d /W [1 4 2] /Index [%s] /Root 1 0 R%s" % (
+            trailer,
             max(rows) + 1,
             index,
             prev,
@@ -153,7 +156,7 @@ def _pdf_file(objects: dict[int, bytes | dict[int, bytes]], prior: bytes = b"") 
             b"%d 1\n%010d %05d %s \n" % (number, a, b, b"n" if kind else b"f")
             for number, (kind, a, b) in sorted(rows.items())
         )
-        out += b"trailer\n<< /Size %d /Root 1 0 R%s >>\n" % (max(rows) + 1, prev)
+        out += b"trailer\n<< %s/Size %d /Root 1 0 R%s >>\n" % (trailer, max(rows) + 1, prev)
     return out + b"startxref\n%d\n%%%%EOF\n" % xref_at
 
 
@@ -259,11 +262,74 @@ def _one_page_pdf(text: bytes, count: bytes) -> bytes:
         # A malformed or absurd count falls back to the page objects.
         (b"hello", b"/Count 1000000"),
         (b"hello", b"/Count " + b"9" * 5000),
+        # A count in a dict, array or hex string nested in the tree's dict is not its own.
+        (b"hello", b"/PieceInfo << /Example << /Private << /Count 9999 >> >> >> /Count 1"),
+        (b"hello", b"/Private [<00ff> << /Count 9999 >>] /Count 1"),
+        # Nor is a nested /Type /Page a page object when the count falls back to those.
+        (b"hello", b"/PieceInfo << /Private << /Type /Page >> >> /Count 1000000"),
     ],
-    ids=["plain", "quoted-tree", "long-number", "fake-object", "comment-string", "absurd", "long"],
+    ids=[
+        "plain",
+        "quoted-tree",
+        "long-number",
+        "fake-object",
+        "comment-string",
+        "absurd",
+        "long",
+        "nested-dict",
+        "nested-array",
+        "nested-page",
+    ],
 )
 def test_page_count_comes_only_from_the_page_tree_dict(text: bytes, count: bytes) -> None:
     assert base.BaseTokenizer._estimate_document_tokens(_one_page_pdf(text, count)) == 1500
+
+
+_FAKE_TREE = b"endstream\n2 0 obj << /Type /Pages /Count 9999 >> endobj"
+
+
+@pytest.mark.parametrize(
+    ("objects", "trailer"),
+    [
+        # The catalog nests a private /Pages ahead of its own.
+        (
+            {1: b"<< /PieceInfo << /Private << /Pages 7 0 R >> >> /Type /Catalog /Pages 2 0 R >>"},
+            b"",
+        ),
+        # The trailer nests a private /Root ahead of its own.
+        ({}, b"/Private << /Root 6 0 R >> "),
+        # Laid out like an object stream redefining page tree 2, but /Type /ObjStm is
+        # private data, not a key of the stream's own dict.
+        (
+            {
+                8: _stream(
+                    zlib.compress(b"2 0 << /Type /Pages /Count 9999 >>"),
+                    b" /Filter /FlateDecode /Private << /Type /ObjStm /N 1 /First 4 >>",
+                )
+            },
+            b"",
+        ),
+        # A private /Length 0 ahead of the stream's own would end the skip at the
+        # stream's first byte, and its data would be walked as objects.
+        (
+            {
+                8: b"<< /DecodeParms << /Length 0 >> /Length %d >>\nstream\n%s\nendstream"
+                % (len(_FAKE_TREE), _FAKE_TREE)
+            },
+            b"",
+        ),
+    ],
+    ids=["catalog-pages", "trailer-root", "object-stream", "stream-length"],
+)
+def test_root_pages_and_stream_keys_come_only_from_their_own_dicts(
+    objects: dict[int, bytes], trailer: bytes
+) -> None:
+    decoys = {
+        6: b"<< /Type /Catalog /Pages 7 0 R >>",
+        7: b"<< /Type /Pages /Kids [] /Count 9999 >>",
+    }
+    pdf = _pdf_file({**_page_tree(1), **decoys, **objects}, trailer=trailer)
+    assert base.BaseTokenizer._estimate_document_tokens(pdf) == 1500
 
 
 def test_incremental_update_prices_the_active_page_tree_not_an_obsolete_one() -> None:
