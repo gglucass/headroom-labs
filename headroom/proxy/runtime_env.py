@@ -91,6 +91,12 @@ RUNTIME_ENV_KNOBS: tuple[Knob, ...] = (
         "(default on; 0 counts them again).",
     ),
     Knob(
+        "HEADROOM_WEB_SEARCH_HISTORY",
+        "bool",
+        "Drop web_search_call history from a Responses request that declares no "
+        "web_search tool (default on; 0 disables).",
+    ),
+    Knob(
         "HEADROOM_BUFFERED_UPSTREAM_STREAM",
         "bool",
         "Send buffered CCR requests upstream as stream:true and fold the reply "
