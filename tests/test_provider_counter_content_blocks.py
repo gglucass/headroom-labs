@@ -400,6 +400,63 @@ def test_stream_data_is_never_walked_as_objects(pdf: bytes, pages: int) -> None:
     assert base._pdf_page_count(pdf) == pages
 
 
+def _xref_chain(*sections: bytes) -> bytes:
+    """A file of xref streams chained by /Prev, each of ``sections`` the end of one's dict
+    and its stream, ready as an update's ``prior``."""
+    out, prev = b"%PDF-1.7\n", b""
+    for number, body in enumerate(sections, 100):
+        at = len(out)
+        out += b"%d 0 obj\n<< /Type /XRef /Size 999999 /W [1 4 2]%s%s\nendobj\n" % (
+            number,
+            prev,
+            body,
+        )
+        prev = b" /Prev %d" % at
+    return out + b"startxref\n%d\n%%%%EOF\n" % at
+
+
+def _flate_rows(index: bytes, data: bytes) -> bytes:
+    packed = zlib.compress(data, 9)
+    return b" /Index [%s] /Filter /FlateDecode /Length %d >>\nstream\n%s\nendstream" % (
+        index,
+        len(packed),
+        packed,
+    )
+
+
+def _priced_after(prior: bytes) -> int:
+    return base._pdf_page_count(_pdf_file(_INDIRECT, prior=prior))
+
+
+def test_xref_rows_share_one_budget_across_sections() -> None:
+    # Two compressed sections of 100,000 entries each: 200,000 rows read is past the
+    # 100,000 the whole traversal may read, so the size estimate stands in.
+    rows = bytes(7 * 100_000)
+    chain = _xref_chain(_flate_rows(b"0 100000", rows), _flate_rows(b"100000 100000", rows))
+    assert _priced_after(chain) == 0
+    # A normal update chain through a compressed section is well inside the budgets.
+    assert _priced_after(_xref_chain(_flate_rows(b"0 1", bytes(7)))) == 1
+
+
+def test_xref_streams_share_the_files_one_inflate_budget(monkeypatch) -> None:
+    # 100 sections each inflating to 4 MB of rows: the first runs out the file's one
+    # 4 MB budget, so the size estimate stands in and no other section is inflated.
+    inflates = []
+    real = zlib.decompressobj
+    monkeypatch.setattr(base.zlib, "decompressobj", lambda *a: inflates.append(1) or real(*a))
+    assert _priced_after(_xref_chain(*[_flate_rows(b"0 571428", bytes(4_000_000))] * 100)) == 0
+    assert len(inflates) == 1
+
+
+def test_xref_dicts_share_one_scan_budget_across_sections() -> None:
+    # 300 table sections whose trailer dicts stay open, so each holds every later one:
+    # reading the chain would rescan most of the file 300 times.
+    section = b"xref\n0 0\ntrailer\n<< /Prev %010d " + b"/A " * 200
+    width = len(section % 0)
+    chain = b"%PDF-1.7\n" + b"".join(section % (9 + (i + 1) * width) for i in range(300))
+    assert _priced_after(chain + b">> " * 300 + b"\nstartxref\n9\n%%EOF\n") == 0
+
+
 def test_incremental_update_prices_the_active_page_tree_not_an_obsolete_one() -> None:
     original = _pdf_file(_page_tree(5))
     # An edit keeps two pages under a new tree; the old tree (/Count 5) stays in the file.

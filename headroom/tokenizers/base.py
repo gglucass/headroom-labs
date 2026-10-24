@@ -49,7 +49,7 @@ _DOCUMENT_BYTES_PER_PAGE = 3000
 _PDF_MAX_PAGES = 10_000  # a larger /Count is treated as malformed, not priced
 _PDF_OBJECT_STREAM_MAX_BYTES = 4_000_000
 _PDF_MAX_OBJECTS = 100_000  # bounds the walk on the request path
-_PDF_MAX_XREF_SECTIONS = 1_000  # bounds the /Prev chain an indirect /Length is read through
+_PDF_MAX_XREF_SECTIONS = 1_000  # a longer /Prev chain is treated as malformed
 # Each pattern opens with a lookahead on its first byte so the scan skips binary fast.
 _PDF_TOP_LEVEL = re.compile(
     rb"(?=[%\dt])(?:%[^\r\n]*|(?<!\d)(\d{1,10})\s+\d{1,5}\s+obj\b|(?<![A-Za-z/])trailer\b)"
@@ -119,24 +119,34 @@ def _pdf_own_keys(syntax: bytes) -> bytes:
     return b"".join(parts)
 
 
-def _pdf_xref(doc: bytes, end: int) -> dict[int, int]:
+def _pdf_xref(doc: bytes, end: int, budget: int) -> tuple[dict[int, int], int] | None:
     """Offset of each uncompressed object, from the cross-reference sections the last
     ``startxref`` before ``end`` chains to (a table's ``/XRefStm``, then ``/Prev``);
     the newest entry wins. Read the way a PDF reader reads it, never by searching the
-    file for an object's text, which page content can fake."""
+    file for an object's text, which page content can fake. Returns what is left of
+    ``budget`` too, or None once a budget runs out: the whole traversal shares one
+    budget of rows read and one of bytes scanned or inflated, repeats included, so
+    no chain of sections can multiply the work."""
     offsets: dict[int, int] = {}
+    rows = _PDF_MAX_OBJECTS  # one per row read, plus one per section and subsection
     last = doc.rfind(b"startxref", 0, end)
     start = _PDF_STARTXREF.match(doc, last) if last >= 0 else None
     todo = [int(start.group(1))] if start else []
     seen: set[int] = set()
-    while todo and len(seen) < _PDF_MAX_XREF_SECTIONS:
+    while todo:
         at = todo.pop(0)
         if at in seen:
             continue
         seen.add(at)
+        rows -= 1
+        if len(seen) > _PDF_MAX_XREF_SECTIONS or rows < 0:
+            return None
         if table := _PDF_XREF_TABLE.match(doc, at):
             pos = table.end()
             while sub := _PDF_XREF_SUBSECTION.match(doc, pos):
+                rows -= int(sub.group(2)) + 1  # also caps the distinct counts compiled below
+                if rows < 0:
+                    return None
                 table_rows = re.compile(rb"(?:\d{10} \d{5} [nf]\s{1,2}){%s}" % sub.group(2))
                 if not (block := table_rows.match(doc, sub.end())):
                     break
@@ -147,10 +157,17 @@ def _pdf_xref(doc: bytes, end: int) -> dict[int, int]:
                         offsets.setdefault(number, int(offset))
                 pos = block.end()
             trailer = _PDF_XREF_TRAILER.match(doc, pos)
-            keys = _pdf_own_keys(_pdf_syntax(doc, trailer.end())[0]) if trailer else b""
+            syntax, stop, _ = _pdf_syntax(doc, trailer.end()) if trailer else (b"", pos, False)
+            budget -= stop - pos
         elif header := _PDF_XREF_STREAM.match(doc, at):
             syntax, pos, is_stream = _pdf_syntax(doc, header.end())
-            keys = _pdf_own_keys(syntax)
+            budget -= pos - header.end()
+        else:
+            continue
+        if budget < 0:
+            return None
+        keys = _pdf_own_keys(syntax)
+        if not table:
             length = _PDF_STREAM_LENGTH.search(keys)
             widths = _PDF_XREF_WIDTHS.search(keys)
             kind, field, gen = map(int, widths.groups()) if widths else (0, 0, 0)
@@ -171,26 +188,32 @@ def _pdf_xref(doc: bytes, end: int) -> dict[int, int]:
                 continue
             data = doc[pos : pos + int(length.group(1))]
             if b"/Filter" in keys:
+                if budget <= 0:  # max_length 0 would mean no limit
+                    return None
+                inflate = zlib.decompressobj()
                 try:
-                    data = zlib.decompressobj().decompress(data, _PDF_OBJECT_STREAM_MAX_BYTES)
+                    data = inflate.decompress(data, budget)
                 except zlib.error:
                     continue
+                if inflate.unconsumed_tail:
+                    return None
+                budget -= len(data)
             index = re.search(rb"/Index\s*\[([\d\s]*)\]", keys)
             bounds = [int(n) for n in (index.group(1) if index else b"0 " + size.group(1)).split()]
+            rows -= min(sum(bounds[1::2]), len(data) // row)
+            if rows < 0:
+                return None
             numbers = (
                 n for a, count in zip(bounds[::2], bounds[1::2]) for n in range(a, a + count)
             )
-            rows = range(0, min(len(data), _PDF_MAX_OBJECTS * row) - row + 1, row)
-            for number, at_row in zip(numbers, rows):
+            for number, at_row in zip(numbers, range(0, len(data) - row + 1, row)):
                 entry = data[at_row : at_row + row]
                 if int.from_bytes(entry[:kind] or b"\x01", "big") == 1:  # type 1: at an offset
                     offsets.setdefault(number, int.from_bytes(entry[kind : kind + field], "big"))
-        else:
-            continue
         for key in (rb"/XRefStm", rb"/Prev"):
             if found := re.search(key + rb"\s+(\d{1,10})(?!\d)", keys):
                 todo.append(int(found.group(1)))
-    return offsets
+    return offsets, budget
 
 
 def _pdf_page_count(doc: bytes) -> int:
@@ -218,7 +241,11 @@ def _pdf_page_count(doc: bytes) -> int:
         length = _PDF_STREAM_LENGTH.search(keys)
         size = int(length.group(1)) if length else -1
         if not length and (ref := _PDF_LENGTH_REF.search(keys)):
-            xref = _pdf_xref(doc, len(doc) if eof < 0 else eof) if xref is None else xref
+            if xref is None:
+                found = _pdf_xref(doc, len(doc) if eof < 0 else eof, budget)
+                if not found:
+                    return 0  # reading the xref ran out of budget: the size estimate
+                xref, budget = found
             value = _PDF_LENGTH_OBJECT.match(doc, xref.get(int(ref.group(1)), len(doc)))
             if value and value.group(1, 2) == ref.group(1, 2):
                 size = int(value.group(3))
