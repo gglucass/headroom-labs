@@ -32,19 +32,108 @@ _COUNT_CACHE_MAX_CHARS = 8_000_000
 
 #: Document pricing (see ``BaseTokenizer._estimate_document_tokens``). Anthropic
 #: documents ~1,500-3,000 text tokens per PDF page; the low end is used. Pages
-#: come from the PDF's own page tree when it is readable: the root ``/Pages``
-#: node's ``/Count`` is the total (inner nodes count subsets, hence the max),
-#: else the ``/Type /Page`` objects. PDF 1.5+ often keeps both inside compressed
-#: object streams, which are inflated for the search (one budget per file). Only
-#: when neither is found does ~3KB of file per page stand in.
+#: come from the PDF's active page tree: the last trailer's ``/Root`` catalog,
+#: its ``/Pages`` node and that node's ``/Count``, each object read at its latest
+#: definition (an incremental update appends the new one). Only object syntax is
+#: read: comments, string literals and stream bodies are skipped, so page text
+#: never passes for structure. PDF 1.5+ often keeps these objects inside
+#: compressed object streams, which are inflated (one budget per file). With no
+#: usable tree the ``/Type /Page`` objects count, and with none of those ~3KB of
+#: file per page stands in.
 _DOCUMENT_TOKENS_PER_PAGE = 1500
 _DOCUMENT_BYTES_PER_PAGE = 3000
+_PDF_MAX_PAGES = 10_000  # a larger /Count is treated as malformed, not priced
 _PDF_OBJECT_STREAM_MAX_BYTES = 4_000_000
-_PDF_OBJECT_STREAM = re.compile(rb"/Type\s*/ObjStm\b[^>]*>>\s*stream\r?\n")
-_PDF_PAGE_TREE_COUNT = re.compile(
-    rb"/Type\s*/Pages\b[^>]*?/Count\s+(\d+)|/Count\s+(\d+)[^>]*?/Type\s*/Pages\b"
+_PDF_MAX_OBJECTS = 100_000  # bounds the walk on the request path
+# Each pattern opens with a lookahead on its first byte so the scan skips binary fast.
+_PDF_TOP_LEVEL = re.compile(
+    rb"(?=[%\dt])(?:%[^\r\n]*|(?<!\d)(\d{1,10})\s+\d{1,5}\s+obj\b|(?<![A-Za-z/])trailer\b)"
 )
+_PDF_SYNTAX_STOP = re.compile(
+    rb"(?=[%(se])(?:%[^\r\n]*|\(|(?<![A-Za-z/])(?:stream\r?\n|endobj|startxref))"
+)
+_PDF_STRING_TOKEN = re.compile(rb"\\.|[()]", re.S)
+_PDF_STREAM_LENGTH = re.compile(rb"/Length\s+(\d{1,10})(?!\d|\s+\d+\s+R)")
+_PDF_STREAM_END = re.compile(rb"\s*endstream")
+_PDF_ROOT = re.compile(rb"/Root\s+(\d{1,10})\s+\d{1,5}\s+R")
+_PDF_PAGES = re.compile(rb"/Pages\s+(\d{1,10})\s+\d{1,5}\s+R")
+# A longer digit run never reaches int(): it is malformed, and the page objects count instead.
+_PDF_COUNT = re.compile(rb"/Count\s+(\d{1,5})(?!\d)")
+_PDF_FIRST = re.compile(rb"/First\s+(\d{1,10})")
 _PDF_PAGE_OBJECT = re.compile(rb"/Type\s*/Page(?![A-Za-z])")
+
+
+def _pdf_syntax(data: bytes, pos: int = 0) -> tuple[bytes, int, bool]:
+    """PDF syntax from ``pos`` to the next ``stream``/``endobj``/``startxref``, minus
+    comments and string literals; also where it stopped and whether a stream starts there."""
+    parts = []
+    while match := _PDF_SYNTAX_STOP.search(data, pos):
+        parts.append(data[pos : match.start()])
+        pos = match.end()
+        if match.group() == b"(":
+            depth = 0  # a string literal may nest balanced parentheses
+            pos = len(data)
+            for token in _PDF_STRING_TOKEN.finditer(data, match.start()):
+                depth += {b"(": 1, b")": -1}.get(token.group(), 0)
+                if not depth:
+                    pos = token.end()
+                    break
+        elif not match.group().startswith(b"%"):
+            return b"".join(parts), pos, match.group().startswith(b"stream")
+    return b"".join(parts) + data[pos:], len(data), False
+
+
+def _pdf_page_count(doc: bytes) -> int:
+    """Pages in the PDF's active page tree, else its page objects, else 0."""
+    objects: dict[int, bytes] = {}
+    trailers: list[bytes] = []
+    budget = _PDF_OBJECT_STREAM_MAX_BYTES
+    pos = 0
+    eof = doc.rfind(b"%%EOF")  # bytes after the last revision hold no objects
+    while len(objects) <= _PDF_MAX_OBJECTS and (
+        match := _PDF_TOP_LEVEL.search(doc, pos, len(doc) if eof < 0 else eof)
+    ):
+        pos = match.end()
+        if match.group().startswith(b"%"):
+            continue
+        syntax, pos, is_stream = _pdf_syntax(doc, pos)
+        if match.group(1) is None:
+            trailers.append(syntax)
+            continue
+        objects[int(match.group(1))] = syntax  # a later definition replaces an earlier one
+        if not is_stream:
+            continue
+        length = _PDF_STREAM_LENGTH.search(syntax)
+        end = pos + int(length.group(1)) if length else -1
+        if not (length and _PDF_STREAM_END.match(doc, end)):
+            end = doc.find(b"endstream", pos)
+        start, pos = pos, len(doc) if end < 0 else end
+        if re.search(rb"/Type\s*/XRef\b", syntax):
+            trailers.append(syntax)  # a cross-reference stream's dict is its trailer
+        first = _PDF_FIRST.search(syntax)
+        if first and budget > 0 and re.search(rb"/Type\s*/ObjStm\b", syntax):
+            # One inflate budget for the whole file, not per stream: a PDF with
+            # many object streams must not multiply the request path's memory.
+            with contextlib.suppress(zlib.error):
+                inflated = zlib.decompressobj().decompress(memoryview(doc)[start:pos], budget)
+                budget -= len(inflated)
+                head = re.findall(rb"\d{1,10}", inflated[: int(first.group(1))])
+                offsets = [int(first.group(1)) + int(offset) for offset in head[1::2]]
+                for number, at, stop in zip(head[::2], offsets, [*offsets[1:], len(inflated)]):
+                    objects[int(number)] = inflated[at:stop]
+
+    if len(objects) > _PDF_MAX_OBJECTS:
+        return 0  # too many objects to walk: the size estimate stands in
+
+    def syntax_of(number: int) -> bytes:
+        return _pdf_syntax(objects.get(number, b""))[0]
+
+    root = next((m for t in reversed(trailers) if (m := _PDF_ROOT.search(t))), None)
+    tree = _PDF_PAGES.search(syntax_of(int(root.group(1)))) if root else None
+    count = _PDF_COUNT.search(syntax_of(int(tree.group(1)))) if tree else None
+    if count and 0 < int(count.group(1)) <= _PDF_MAX_PAGES:
+        return int(count.group(1))
+    return sum(1 for number in objects if _PDF_PAGE_OBJECT.search(syntax_of(number)))
 
 
 class TokenCountCache:
@@ -455,23 +544,7 @@ class BaseTokenizer(ABC):
             # Only a PDF has a page tree: other bytes (a Strands txt/csv/docx
             # document) keep the size estimate even when their text quotes PDF syntax.
             return max(1, len(doc_bytes) // _DOCUMENT_BYTES_PER_PAGE) * _DOCUMENT_TOKENS_PER_PAGE
-        searchable = [doc_bytes]
-        # One inflate budget for the whole file, not per stream: a PDF with
-        # many object streams must not multiply the request path's memory.
-        budget = _PDF_OBJECT_STREAM_MAX_BYTES
-        for match in _PDF_OBJECT_STREAM.finditer(doc_bytes):
-            if budget <= 0:
-                break
-            end = doc_bytes.find(b"endstream", match.end())
-            with contextlib.suppress(zlib.error):
-                inflated = zlib.decompressobj().decompress(doc_bytes[match.end() : end], budget)
-                budget -= len(inflated)
-                searchable.append(inflated)
-        text = b"\n".join(searchable)
-        tree_counts = [int(a or b) for a, b in _PDF_PAGE_TREE_COUNT.findall(text)]
-        pages = max(tree_counts) if tree_counts else len(_PDF_PAGE_OBJECT.findall(text))
-        if not pages:
-            pages = len(doc_bytes) // _DOCUMENT_BYTES_PER_PAGE
+        pages = _pdf_page_count(doc_bytes) or len(doc_bytes) // _DOCUMENT_BYTES_PER_PAGE
         return max(1, pages) * _DOCUMENT_TOKENS_PER_PAGE
 
     @staticmethod
