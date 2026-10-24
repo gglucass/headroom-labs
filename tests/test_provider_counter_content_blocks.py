@@ -114,12 +114,32 @@ def _stream(data: bytes, entries: bytes = b"") -> bytes:
     return b"<< /Length %d%s >>\nstream\n%s\nendstream" % (len(data), entries, data)
 
 
+def _png_encoded(data: bytes, width: int) -> bytes:
+    """``data`` as PNG predictor rows of ``width`` bytes, cycling the five filter types."""
+    out, prior = b"", bytes(width)
+    for number, at in enumerate(range(0, len(data), width)):
+        row, coded = data[at : at + width], bytearray()
+        for i, value in enumerate(row):
+            left, up, corner = row[i - 1] if i else 0, prior[i], prior[i - 1] if i else 0
+            guess = left + up - corner
+            pa, pb, pc = abs(guess - left), abs(guess - up), abs(guess - corner)
+            paeth = left if pa <= pb and pa <= pc else up if pb <= pc else corner
+            coded.append((value - (0, left, up, (left + up) // 2, paeth)[number % 5]) & 255)
+        out += bytes([number % 5]) + coded
+        prior = row
+    return out
+
+
 def _pdf_file(
-    objects: dict[int, bytes | dict[int, bytes]], prior: bytes = b"", trailer: bytes = b""
+    objects: dict[int, bytes | dict[int, bytes]],
+    prior: bytes = b"",
+    trailer: bytes = b"",
+    predictor: bool = False,
 ) -> bytes:
     """A PDF with catalog 1, indexed by an xref table and trailer, or by an xref stream
-    when a dict value packs those objects into an object stream. With ``prior``, an
-    incremental update of that file; ``trailer`` opens the trailer's dict."""
+    when a dict value packs those objects into an object stream or ``predictor`` asks
+    for a Flate xref stream with PNG predictor rows. With ``prior``, an incremental
+    update of that file; ``trailer`` opens the trailer's dict."""
     out = prior or b"%PDF-1.7\n"
     rows = {} if prior else {0: (0, 0, 65535)}
     for number, body in objects.items():
@@ -137,7 +157,7 @@ def _pdf_file(
         out += b"%d 0 obj\n%s\nendobj\n" % (number, body)
     prev = b" /Prev %s" % prior.split(b"startxref")[-1].split()[0] if prior else b""
     xref_at = len(out)
-    if any(kind == 2 for kind, _, _ in rows.values()):
+    if predictor or any(kind == 2 for kind, _, _ in rows.values()):
         rows[max(rows) + 1] = (1, xref_at, 0)
         index = b" ".join(b"%d 1" % number for number in sorted(rows))
         table = b"".join(
@@ -150,6 +170,9 @@ def _pdf_file(
             index,
             prev,
         )
+        if predictor:
+            table = zlib.compress(_png_encoded(table, 7))
+            entries += b" /Filter /FlateDecode /DecodeParms << /Columns 7 /Predictor 12 >>"
         out += b"%d 0 obj\n%s\nendobj\n" % (max(rows), _stream(table, entries))
     else:
         out += b"xref\n" + b"".join(
@@ -200,9 +223,10 @@ def test_base64_pdf_document_is_priced_by_pages_not_as_text() -> None:
             assert 12 * 1500 <= got < 12 * 1500 + 100, f"{name} priced a 12-page PDF at {got}"
 
 
-def test_pdf_page_count_falls_back_from_tree_to_page_objects_to_size() -> None:
-    # A truncated file has no trailer to find its page tree from: its page objects count.
-    assert count_content_blocks([_base64_document(_pdf(5, trailer=False))], len) == 5 * 1500
+def test_pdf_page_count_falls_back_from_the_tree_to_the_size_estimate() -> None:
+    # A truncated file has no xref to find its page tree through: ~3KB of file per page.
+    truncated = _pdf(5, trailer=False)
+    assert count_content_blocks([_base64_document(truncated)], len) == len(truncated) // 3000 * 1500
     # PDF 1.5+ keeps the page tree inside a compressed object stream.
     hidden = _pdf_file({10: _page_tree(7), 11: _stream(bytes(range(256)) * 4096)})
     assert count_content_blocks([_base64_document(hidden)], len) == 7 * 1500
@@ -218,18 +242,20 @@ def test_pdf_page_count_falls_back_from_tree_to_page_objects_to_size() -> None:
     assert count_content_blocks([broken], len) == 1500
 
 
-def test_object_stream_inflation_shares_one_budget_per_file(monkeypatch) -> None:
+def test_only_the_page_trees_object_stream_is_inflated_within_the_budget(monkeypatch) -> None:
     fonts = dict.fromkeys(range(10, 30), b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
     pdf = _pdf_file({30: fonts, 31: _page_tree(7), 32: _stream(bytes(range(256)) * 4096)})
+    inflates = []
+    real = zlib.decompressobj
+    monkeypatch.setattr(base.zlib, "decompressobj", lambda *a: inflates.append(1) or real(*a))
     assert count_content_blocks([_base64_document(pdf)], len) == 7 * 1500
-    # The fonts stream (larger than the page tree's) spends the whole budget, so the
-    # page tree after it stays packed.
-    fonts_stream = pdf[pdf.index(b"stream\n") + 7 : pdf.index(b"\nendstream")]
-    monkeypatch.setattr(base, "_PDF_OBJECT_STREAM_MAX_BYTES", len(zlib.decompress(fonts_stream)))
+    assert len(inflates) == 1  # the fonts' stream is never read
+    # A budget the page tree's stream does not fit in gives the size estimate.
+    monkeypatch.setattr(base, "_PDF_OBJECT_STREAM_MAX_BYTES", 600)
     assert count_content_blocks([_base64_document(pdf)], len) == len(pdf) // 3000 * 1500
 
 
-def test_a_pdf_with_too_many_objects_to_walk_gets_the_size_estimate(monkeypatch) -> None:
+def test_a_pdf_with_more_xref_rows_than_the_budget_gets_the_size_estimate(monkeypatch) -> None:
     pdf = _pdf(5)
     monkeypatch.setattr(base, "_PDF_MAX_OBJECTS", 4)
     assert count_content_blocks([_base64_document(pdf)], len) == len(pdf) // 3000 * 1500
@@ -267,14 +293,12 @@ def _one_page_pdf(text: bytes, count: bytes) -> bytes:
         (b"2 0 obj << /Type /Pages /Count 999 >> endobj", b"/Count 1"),
         # Neither is a comment or a string inside the page tree's own dict.
         (b"hello", b"% /Count 999\n/Title (a (nested) /Count 999) /Count 1"),
-        # A malformed or absurd count falls back to the page objects.
+        # A malformed or absurd count gives the size estimate (1 page at this size).
         (b"hello", b"/Count 1000000"),
         (b"hello", b"/Count " + b"9" * 5000),
         # A count in a dict, array or hex string nested in the tree's dict is not its own.
         (b"hello", b"/PieceInfo << /Example << /Private << /Count 9999 >> >> >> /Count 1"),
         (b"hello", b"/Private [<00ff> << /Count 9999 >>] /Count 1"),
-        # Nor is a nested /Type /Page a page object when the count falls back to those.
-        (b"hello", b"/PieceInfo << /Private << /Type /Page >> >> /Count 1000000"),
     ],
     ids=[
         "plain",
@@ -286,7 +310,6 @@ def _one_page_pdf(text: bytes, count: bytes) -> bytes:
         "long",
         "nested-dict",
         "nested-array",
-        "nested-page",
     ],
 )
 def test_page_count_comes_only_from_the_page_tree_dict(text: bytes, count: bytes) -> None:
@@ -376,13 +399,12 @@ _LONE_CR = b"BT /F1 12 Tf 72 720 Td (hi) Tj ET endobj 2 0 obj << /Type /Pages /C
             ),
             1,
         ),
-        # A stream end that cannot be verified stops the walk, and 0 means the size
-        # estimate: the length packed in an object stream, a wrong one, a reference to
-        # no object, no /Length at all.
-        (_pdf_file(_packed(_INDIRECT, 6)), 0),
-        (_pdf_file({**_INDIRECT, 6: b"40"}), 0),
-        (_pdf_file(_one_page_objects(_FAKE_TREE, length=b"/Length 9 0 R")), 0),
-        (_pdf_file(_one_page_objects(_FAKE_TREE, length=b"")), 0),
+        # The page count never reads a content stream, so neither does its length: one
+        # packed in an object stream, a wrong one, a reference to no object, or none.
+        (_pdf_file(_packed(_INDIRECT, 6)), 1),
+        (_pdf_file({**_INDIRECT, 6: b"40"}), 1),
+        (_pdf_file(_one_page_objects(_FAKE_TREE, length=b"/Length 9 0 R")), 1),
+        (_pdf_file(_one_page_objects(_FAKE_TREE, length=b"")), 1),
     ],
     ids=[
         "indirect",
@@ -455,6 +477,47 @@ def test_xref_dicts_share_one_scan_budget_across_sections() -> None:
     width = len(section % 0)
     chain = b"%PDF-1.7\n" + b"".join(section % (9 + (i + 1) * width) for i in range(300))
     assert _priced_after(chain + b">> " * 300 + b"\nstartxref\n9\n%%EOF\n") == 0
+
+
+def _unreferenced(pdf: bytes, obj: bytes) -> bytes:
+    """``pdf`` (an xref table file) with ``obj`` added before its table, which does not list it."""
+    at = pdf.rindex(b"\nxref\n") + 1
+    xref_at = int(pdf.rsplit(b"startxref\n", 1)[1].split()[0])
+    tail = pdf[at:].replace(b"startxref\n%d" % xref_at, b"startxref\n%d" % (xref_at + len(obj)))
+    return pdf[:at] + obj + tail
+
+
+_DECOY_TREE = b"<< /Type /Pages /Kids [3 0 R] /Count 9999 >>"
+_DECOY_STREAM = _stream(
+    zlib.compress(b"2 0 " + _DECOY_TREE), b" /Type /ObjStm /N 1 /First 4 /Filter /FlateDecode"
+)
+
+
+@pytest.mark.parametrize(
+    "pdf",
+    [
+        # A later "2 0 obj" outside any stream that the xref does not list.
+        _unreferenced(_one_page_pdf(b"hello", b"/Count 1"), b"2 0 obj\n%s\nendobj\n" % _DECOY_TREE),
+        # A later object stream holding an object 2, unlisted or listed: either way the
+        # xref puts object 2 at its own offset.
+        _unreferenced(
+            _one_page_pdf(b"hello", b"/Count 1"), b"9 0 obj\n%s\nendobj\n" % _DECOY_STREAM
+        ),
+        _pdf_file({**_one_page_objects(b"hello"), 9: _DECOY_STREAM}),
+    ],
+    ids=["object", "unlisted-object-stream", "listed-object-stream"],
+)
+def test_only_the_definition_the_xref_points_at_counts(pdf: bytes) -> None:
+    assert base.BaseTokenizer._estimate_document_tokens(pdf) == 1500
+
+
+def test_a_predictor_12_xref_stream_is_decoded_row_by_row() -> None:
+    # Its rows cycle the five PNG filter types; the tree is top level, or packed.
+    for pdf in (
+        _pdf_file(_page_tree(12), predictor=True),
+        _pdf_file({20: _page_tree(12)}, predictor=True),
+    ):
+        assert base.BaseTokenizer._estimate_document_tokens(pdf) == 12 * 1500
 
 
 def test_incremental_update_prices_the_active_page_tree_not_an_obsolete_one() -> None:

@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import base64
 import binascii
-import contextlib
 import json
 import re
 import zlib
@@ -32,28 +31,24 @@ _COUNT_CACHE_MAX_CHARS = 8_000_000
 
 #: Document pricing (see ``BaseTokenizer._estimate_document_tokens``). Anthropic
 #: documents ~1,500-3,000 text tokens per PDF page; the low end is used. Pages
-#: come from the PDF's active page tree: the last trailer's ``/Root`` catalog,
-#: its ``/Pages`` node and that node's ``/Count``, each object read at its latest
-#: definition (an incremental update appends the new one). Only object syntax is
-#: read: comments, string literals and stream bodies are skipped, so page text
-#: never passes for structure, and each key comes from its own dictionary's top
-#: level, never from a dict, array or hex string nested in it. A stream body ends
-#: at its ``/Length`` only where ``endstream`` follows; an indirect ``/Length``
-#: is read at the offset the cross-reference data gives, and a stream end that
-#: cannot be verified stops the walk (size estimate). PDF 1.5+ often
-#: keeps these objects inside compressed object streams, which are inflated (one
-#: budget per file). With no usable tree the ``/Type /Page`` objects count, and
-#: with none of those ~3KB of file per page stands in.
+#: come from the PDF's active page tree, read the way a PDF reader reads it: the
+#: cross-reference data the last ``startxref`` chains to (tables and xref streams,
+#: through ``/Prev``) gives ``/Root`` and where each object lives, and the catalog
+#: and its ``/Pages`` node are read there (an ``N G obj`` at that offset, or entry
+#: i of an object stream), each verified, never wherever their text happens to
+#: appear in the file. Comments and string literals are cut from an object's
+#: syntax, and each key comes from its own dictionary's top level, never from a
+#: dict, array or hex string nested in it. A missing, damaged or unverifiable xref,
+#: an absurd ``/Count``, or a spent budget gives ~3KB of file per page instead.
 _DOCUMENT_TOKENS_PER_PAGE = 1500
 _DOCUMENT_BYTES_PER_PAGE = 3000
 _PDF_MAX_PAGES = 10_000  # a larger /Count is treated as malformed, not priced
+# One budget per file of bytes scanned or inflated, and one of xref rows read
+# (repeats included), so no chain of sections or streams can multiply the work.
 _PDF_OBJECT_STREAM_MAX_BYTES = 4_000_000
-_PDF_MAX_OBJECTS = 100_000  # bounds the walk on the request path
+_PDF_MAX_OBJECTS = 100_000
 _PDF_MAX_XREF_SECTIONS = 1_000  # a longer /Prev chain is treated as malformed
 # Each pattern opens with a lookahead on its first byte so the scan skips binary fast.
-_PDF_TOP_LEVEL = re.compile(
-    rb"(?=[%\dt])(?:%[^\r\n]*|(?<!\d)(\d{1,10})\s+\d{1,5}\s+obj\b|(?<![A-Za-z/])trailer\b)"
-)
 # A stream's data starts after its keyword, any spaces and an EOL if present (a
 # lone CR too): the spec requires CRLF or LF, but readers accept the others.
 _PDF_SYNTAX_STOP = re.compile(
@@ -62,222 +57,294 @@ _PDF_SYNTAX_STOP = re.compile(
 _PDF_STRING_TOKEN = re.compile(rb"\\.|[()]", re.S)
 _PDF_STREAM_LENGTH = re.compile(rb"/Length\s+(\d{1,10})(?!\d|\s+\d+\s+R)")
 _PDF_STREAM_END = re.compile(rb"\s*endstream")
-_PDF_ROOT = re.compile(rb"/Root\s+(\d{1,10})\s+\d{1,5}\s+R")
-_PDF_PAGES = re.compile(rb"/Pages\s+(\d{1,10})\s+\d{1,5}\s+R")
-# A longer digit run never reaches int(): it is malformed, and the page objects count instead.
+_PDF_ROOT = re.compile(rb"/Root\s+(\d{1,10})\s+(\d{1,5})\s+R")
+_PDF_PAGES = re.compile(rb"/Pages\s+(\d{1,10})\s+(\d{1,5})\s+R")
+# A longer digit run never reaches int(): it is malformed, and the size estimate stands in.
 _PDF_COUNT = re.compile(rb"/Count\s+(\d{1,5})(?!\d)")
 _PDF_FIRST = re.compile(rb"/First\s+(\d{1,10})")
-_PDF_PAGE_OBJECT = re.compile(rb"/Type\s*/Page(?![A-Za-z])")
 _PDF_NESTING = re.compile(rb"<<|>>|<[^<>]*>|(\[[\d\s]*\])|\[|\]")
 _PDF_LENGTH_REF = re.compile(rb"/Length\s+(\d{1,10})\s+(\d{1,5})\s+R")
 _PDF_LENGTH_OBJECT = re.compile(rb"\s*(\d{1,10})\s+(\d{1,5})\s+obj\s*(\d{1,10})\s*endobj")
+_PDF_OBJECT_HEADER = re.compile(rb"\s*(\d{1,10})\s+(\d{1,5})\s+obj\b")
 _PDF_STARTXREF = re.compile(rb"startxref\s+(\d{1,10})")
 _PDF_XREF_TABLE = re.compile(rb"\s*xref\b")
 _PDF_XREF_SUBSECTION = re.compile(rb"\s*(\d{1,10})\s+(\d{1,5})\s+")
-_PDF_XREF_ROW = re.compile(rb"(\d{10}) \d{5} ([nf])")
+_PDF_XREF_ROW = re.compile(rb"(\d{10}) (\d{5}) ([nf])")
 _PDF_XREF_TRAILER = re.compile(rb"\s*trailer\b")
-_PDF_XREF_STREAM = re.compile(rb"\s*\d{1,10}\s+\d{1,5}\s+obj\b")
 _PDF_XREF_WIDTHS = re.compile(rb"/W\s*\[\s*(\d)\s+(\d)\s+(\d)\s*\]")
 
 
-def _pdf_syntax(data: bytes, pos: int = 0) -> tuple[bytes, int, bool]:
-    """PDF syntax from ``pos`` to the next ``stream``/``endobj``/``startxref``, minus
-    comments and string literals; also where it stopped and whether a stream starts there."""
+def _pdf_syntax(data: bytes, pos: int = 0, end: int | None = None) -> tuple[bytes, int, bool]:
+    """PDF syntax from ``pos`` to the next ``stream``/``endobj``/``startxref`` (or ``end``),
+    minus comments and string literals; also where it stopped and whether a stream
+    starts there."""
+    end = len(data) if end is None else min(end, len(data))
     parts = []
-    while match := _PDF_SYNTAX_STOP.search(data, pos):
+    while match := _PDF_SYNTAX_STOP.search(data, pos, end):
         parts.append(data[pos : match.start()])
         pos = match.end()
         if match.group() == b"(":
             depth = 0  # a string literal may nest balanced parentheses
-            pos = len(data)
-            for token in _PDF_STRING_TOKEN.finditer(data, match.start()):
+            pos = end
+            for token in _PDF_STRING_TOKEN.finditer(data, match.start(), end):
                 depth += {b"(": 1, b")": -1}.get(token.group(), 0)
                 if not depth:
                     pos = token.end()
                     break
         elif not match.group().startswith(b"%"):
             return b"".join(parts), pos, match.group().startswith(b"stream")
-    return b"".join(parts) + data[pos:], len(data), False
+    return b"".join(parts) + data[pos:end], end, False
 
 
-def _pdf_own_keys(syntax: bytes) -> bytes:
+def _pdf_own_keys(syntax: bytes, nested: list[bytes] | None = None) -> bytes:
     """The top level of the dictionary ``syntax`` opens with, each nested dict, array
-    and hex string cut to ``_``: a key read from it is that dictionary's own. An array
-    of plain integers holds no key, so it stays (an xref stream's ``/W`` and ``/Index``)."""
+    and hex string cut to ``_<i>``: a key read from it is that dictionary's own. An
+    array of plain integers holds no key, so it stays (an xref stream's ``/W`` and
+    ``/Index``). ``nested`` collects what was cut, ``_<i>`` being entry i."""
     body = syntax.lstrip(b"\0\t\n\x0c\r ")
     if not body.startswith(b"<<"):
         return b""
+    cut: list[bytes] = [] if nested is None else nested
     parts: list[bytes] = []
-    depth = pos = 0
+    depth = pos = opened = 0
     for token in _PDF_NESTING.finditer(body):
+        step = {b"<<": 1, b"[": 1, b">>": -1, b"]": -1}.get(token.group(), 0)
         if depth == 1:
-            parts += [body[pos : token.start()], token.group(1) or b" _ "]
-        depth += {b"<<": 1, b"[": 1, b">>": -1, b"]": -1}.get(token.group(), 0)
+            parts.append(body[pos : token.start()])
+            if step < 0:
+                break  # the dictionary's own end
+            if token.group(1):
+                parts.append(token.group(1))
+            else:
+                parts.append(b" _%d " % len(cut))
+                opened = token.start()
+                if not step:
+                    cut.append(token.group())  # a hex string
+        depth += step
+        if step < 0 and depth == 1:
+            cut.append(body[opened : token.end()])
         if not depth:
             break
         pos = token.end()
     return b"".join(parts)
 
 
-def _pdf_xref(doc: bytes, end: int, budget: int) -> tuple[dict[int, int], int] | None:
-    """Offset of each uncompressed object, from the cross-reference sections the last
-    ``startxref`` before ``end`` chains to (a table's ``/XRefStm``, then ``/Prev``);
-    the newest entry wins. Read the way a PDF reader reads it, never by searching the
-    file for an object's text, which page content can fake. Returns what is left of
-    ``budget`` too, or None once a budget runs out: the whole traversal shares one
-    budget of rows read and one of bytes scanned or inflated, repeats included, so
-    no chain of sections can multiply the work."""
-    offsets: dict[int, int] = {}
-    rows = _PDF_MAX_OBJECTS  # one per row read, plus one per section and subsection
-    last = doc.rfind(b"startxref", 0, end)
-    start = _PDF_STARTXREF.match(doc, last) if last >= 0 else None
-    todo = [int(start.group(1))] if start else []
-    seen: set[int] = set()
-    while todo:
-        at = todo.pop(0)
-        if at in seen:
-            continue
-        seen.add(at)
-        rows -= 1
-        if len(seen) > _PDF_MAX_XREF_SECTIONS or rows < 0:
-            return None
-        if table := _PDF_XREF_TABLE.match(doc, at):
-            pos = table.end()
-            while sub := _PDF_XREF_SUBSECTION.match(doc, pos):
-                rows -= int(sub.group(2)) + 1  # also caps the distinct counts compiled below
-                if rows < 0:
-                    return None
-                table_rows = re.compile(rb"(?:\d{10} \d{5} [nf]\s{1,2}){%s}" % sub.group(2))
-                if not (block := table_rows.match(doc, sub.end())):
-                    break
-                for number, (offset, kind) in enumerate(
-                    _PDF_XREF_ROW.findall(block.group()), int(sub.group(1))
-                ):
-                    if kind == b"n":
-                        offsets.setdefault(number, int(offset))
-                pos = block.end()
-            trailer = _PDF_XREF_TRAILER.match(doc, pos)
-            syntax, stop, _ = _pdf_syntax(doc, trailer.end()) if trailer else (b"", pos, False)
-            budget -= stop - pos
-        elif header := _PDF_XREF_STREAM.match(doc, at):
-            syntax, pos, is_stream = _pdf_syntax(doc, header.end())
-            budget -= pos - header.end()
-        else:
-            continue
-        if budget < 0:
-            return None
-        keys = _pdf_own_keys(syntax)
-        if not table:
-            length = _PDF_STREAM_LENGTH.search(keys)
-            widths = _PDF_XREF_WIDTHS.search(keys)
-            kind, field, gen = map(int, widths.groups()) if widths else (0, 0, 0)
-            row = kind + field + gen
-            size = re.search(rb"/Size\s+(\d{1,10})", keys)
-            # shortcut: a section with a predictor (/DecodeParms) or a filter other than
-            # Flate stays unread, so a /Length only it locates gets the size estimate;
-            # decode the PNG predictor if such files turn up.
-            if not (
-                is_stream
-                and length
-                and row
-                and size
-                and re.search(rb"/Type\s*/XRef\b", keys)
-                and _PDF_STREAM_END.match(doc, pos + int(length.group(1)))
-                and not re.search(rb"/DecodeParms|/Filter(?!\s*/FlateDecode\b)", keys)
-            ):
+def _pdf_png_rows(data: bytes, columns: int) -> bytes:
+    """``data`` decoded from PNG predictor rows: each a filter byte, then ``columns``
+    bytes, one per sample (an xref stream's /Colors 1 /BitsPerComponent 8)."""
+    out, prior = bytearray(), bytes(columns)
+    for at in range(0, len(data), columns + 1):
+        kind, row = data[at], bytearray(data[at + 1 : at + 1 + columns])
+        if kind == 2:
+            row = bytearray((a + b) & 255 for a, b in zip(row, prior))
+        elif kind:
+            for i in range(len(row)):
+                left, up, corner = row[i - 1] if i else 0, prior[i], prior[i - 1] if i else 0
+                if kind == 1:
+                    row[i] = (row[i] + left) & 255
+                elif kind == 3:
+                    row[i] = (row[i] + (left + up) // 2) & 255
+                elif kind == 4:
+                    guess = left + up - corner  # Paeth: the neighbour nearest the guess
+                    pa, pb, pc = abs(guess - left), abs(guess - up), abs(guess - corner)
+                    row[i] = (
+                        row[i] + (left if pa <= pb and pa <= pc else up if pb <= pc else corner)
+                    ) & 255
+                else:
+                    raise _PdfUnreadable
+        out += row
+        prior = bytes(row)
+    return bytes(out)
+
+
+class _PdfUnreadable(Exception):
+    """The PDF fails verification or a budget runs out: its size estimate stands in."""
+
+
+class _PdfReader:
+    """Reads objects at the locations the PDF's cross-reference data gives for them."""
+
+    def __init__(self, doc: bytes) -> None:
+        self.doc = doc
+        self.budget = _PDF_OBJECT_STREAM_MAX_BYTES
+        self.rows = _PDF_MAX_OBJECTS
+        self.entries: dict[int, tuple[int, int, int]] = {}  # number: (type, field 2, field 3)
+        self.packed: dict[int, tuple[list[bytes], int, bytes]] = {}  # header, /First, data
+        self.root: re.Match[bytes] | None = None
+        eof = doc.rfind(b"%%EOF")  # bytes after the last revision hold no objects
+        last = doc.rfind(b"startxref", 0, len(doc) if eof < 0 else eof)
+        start = _PDF_STARTXREF.match(doc, last) if last >= 0 else None
+        todo = [int(start.group(1))] if start else []
+        seen: set[int] = set()
+        while todo:
+            at = todo.pop(0)
+            if at in seen:
                 continue
-            data = doc[pos : pos + int(length.group(1))]
-            if b"/Filter" in keys:
-                if budget <= 0:  # max_length 0 would mean no limit
-                    return None
-                inflate = zlib.decompressobj()
-                try:
-                    data = inflate.decompress(data, budget)
-                except zlib.error:
-                    continue
-                if inflate.unconsumed_tail:
-                    return None
-                budget -= len(data)
-            index = re.search(rb"/Index\s*\[([\d\s]*)\]", keys)
-            bounds = [int(n) for n in (index.group(1) if index else b"0 " + size.group(1)).split()]
-            rows -= min(sum(bounds[1::2]), len(data) // row)
-            if rows < 0:
-                return None
-            numbers = (
-                n for a, count in zip(bounds[::2], bounds[1::2]) for n in range(a, a + count)
-            )
-            for number, at_row in zip(numbers, range(0, len(data) - row + 1, row)):
-                entry = data[at_row : at_row + row]
-                if int.from_bytes(entry[:kind] or b"\x01", "big") == 1:  # type 1: at an offset
-                    offsets.setdefault(number, int.from_bytes(entry[kind : kind + field], "big"))
-        for key in (rb"/XRefStm", rb"/Prev"):
-            if found := re.search(key + rb"\s+(\d{1,10})(?!\d)", keys):
-                todo.append(int(found.group(1)))
-    return offsets, budget
+            seen.add(at)
+            if len(seen) > _PDF_MAX_XREF_SECTIONS:
+                raise _PdfUnreadable
+            self.spend(rows=1)
+            table = _PDF_XREF_TABLE.match(doc, at)
+            keys = self.read_table(table.end()) if table else self.read_xref_stream(at)
+            self.root = self.root or _PDF_ROOT.search(keys)  # the newest trailer's
+            for key in (rb"/XRefStm", rb"/Prev"):  # a table's stream entries, then older sections
+                if found := re.search(key + rb"\s+(\d{1,10})(?!\d)", keys):
+                    todo.append(int(found.group(1)))
+        if not self.root:
+            raise _PdfUnreadable
+
+    def spend(self, scanned: int = 0, rows: int = 0) -> None:
+        self.budget -= scanned
+        self.rows -= rows
+        if self.budget < 0 or self.rows < 0:
+            raise _PdfUnreadable
+
+    def keys_at(self, pos: int, nested: list[bytes] | None = None) -> tuple[bytes, int, bool]:
+        """Own keys of the dictionary at ``pos``, where its syntax stops, and whether a
+        stream starts there; the scan is charged to the budget."""
+        syntax, stop, is_stream = _pdf_syntax(self.doc, pos, pos + self.budget + 1)
+        self.spend(stop - pos)  # a scan past the budget stops one byte beyond it
+        return _pdf_own_keys(syntax, nested), stop, is_stream
+
+    def read_table(self, pos: int) -> bytes:
+        while sub := _PDF_XREF_SUBSECTION.match(self.doc, pos):
+            self.spend(rows=int(sub.group(2)) + 1)  # also caps the distinct counts compiled
+            rows = re.compile(rb"(?:\d{10} \d{5} [nf]\s{1,2}){%s}" % sub.group(2))
+            if not (block := rows.match(self.doc, sub.end())):
+                raise _PdfUnreadable
+            for number, (offset, gen, kind) in enumerate(
+                _PDF_XREF_ROW.findall(block.group()), int(sub.group(1))
+            ):
+                if kind == b"n":  # the newest section is read first, so its entry wins
+                    self.entries.setdefault(number, (1, int(offset), int(gen)))
+            pos = block.end()
+        if not (trailer := _PDF_XREF_TRAILER.match(self.doc, pos)):
+            raise _PdfUnreadable
+        return self.keys_at(trailer.end())[0]
+
+    def read_xref_stream(self, at: int) -> bytes:
+        header = _PDF_OBJECT_HEADER.match(self.doc, at)
+        nested: list[bytes] = []
+        keys, data = self.stream(header.end(), nested) if header else (b"", b"")
+        widths = _PDF_XREF_WIDTHS.search(keys)
+        size = re.search(rb"/Size\s+(\d{1,10})", keys)
+        if not (widths and size and re.search(rb"/Type\s*/XRef\b", keys)):
+            raise _PdfUnreadable
+        kind, field, gen = map(int, widths.groups())
+        width = kind + field + gen
+        predicted = 0
+        if parms := re.search(rb"/DecodeParms\s+_(\d{1,4})(?!\d)", keys):
+            raw = nested[int(parms.group(1))] if int(parms.group(1)) < len(nested) else b""
+            if not raw.startswith(b"<<"):
+                raise _PdfUnreadable  # an array, or "_<i>" typed into the dict itself
+            values = _pdf_own_keys(raw)
+            predictor = re.search(rb"/Predictor\s+(\d{1,2})(?!\d)", values)
+            columns = re.search(rb"/Columns\s+(\d{1,2})(?!\d)", values)
+            if re.search(rb"/Colors\s+(?!1(?!\d))|/BitsPerComponent\s+(?!8(?!\d))", values):
+                raise _PdfUnreadable
+            if predictor and int(predictor.group(1)) >= 10:
+                predicted = 1
+                if int(columns.group(1) if columns else 1) != width:
+                    raise _PdfUnreadable
+            elif predictor and int(predictor.group(1)) != 1:
+                raise _PdfUnreadable  # TIFF prediction: not written for xref streams
+        if not width:
+            raise _PdfUnreadable
+        index = re.search(rb"/Index\s*\[([\d\s]*)\]", keys)
+        bounds = (index.group(1) if index else b"0 " + size.group(1)).split()
+        if any(len(n) > 10 for n in bounds):
+            raise _PdfUnreadable
+        starts, lengths = [int(n) for n in bounds[::2]], [int(n) for n in bounds[1::2]]
+        count = min(sum(lengths), len(data) // (width + predicted))
+        self.spend(rows=count)
+        data = data[: count * (width + predicted)]
+        if predicted:
+            data = _pdf_png_rows(data, width)
+        numbers = (n for a, length in zip(starts, lengths) for n in range(a, a + length))
+        for number, at_row in zip(numbers, range(0, count * width, width)):
+            entry = data[at_row : at_row + width]
+            entry_type = int.from_bytes(entry[:kind] or b"\x01", "big")
+            if entry_type in (1, 2):
+                second = int.from_bytes(entry[kind : kind + field], "big")
+                self.entries.setdefault(
+                    number, (entry_type, second, int.from_bytes(entry[kind + field :], "big"))
+                )
+        return keys
+
+    def stream(self, pos: int, nested: list[bytes]) -> tuple[bytes, bytes]:
+        """Own keys and inflated data of the stream object whose dict starts at ``pos``.
+        Its end must be verified: ``endstream`` right after ``/Length`` bytes."""
+        keys, start, is_stream = self.keys_at(pos, nested)
+        length = _PDF_STREAM_LENGTH.search(keys)
+        size = int(length.group(1)) if length else self.integer(_PDF_LENGTH_REF.search(keys))
+        if not (is_stream and _PDF_STREAM_END.match(self.doc, start + size)):
+            raise _PdfUnreadable
+        data = self.doc[start : start + size]
+        if b"/Filter" not in keys:
+            if b"/DecodeParms" in keys:
+                raise _PdfUnreadable
+            return keys, data
+        if not re.search(rb"/Filter\s*/FlateDecode\b", keys) or self.budget <= 0:
+            raise _PdfUnreadable  # (max_length 0 would mean no limit)
+        inflate = zlib.decompressobj()
+        try:
+            data = inflate.decompress(data, self.budget)
+        except zlib.error:
+            raise _PdfUnreadable from None
+        if inflate.unconsumed_tail:
+            raise _PdfUnreadable
+        self.spend(len(data))
+        return keys, data
+
+    def integer(self, ref: re.Match[bytes] | None) -> int:
+        """The integer an indirect ``/Length`` names, at its xref offset."""
+        entry = self.entries.get(int(ref.group(1))) if ref else None
+        value = _PDF_LENGTH_OBJECT.match(self.doc, entry[1]) if entry and entry[0] == 1 else None
+        if not (ref and entry and value and value.group(1, 2) == ref.group(1, 2)):
+            raise _PdfUnreadable
+        if int(ref.group(2)) != entry[2]:  # the generation the xref holds
+            raise _PdfUnreadable
+        return int(value.group(3))
+
+    def get(self, ref: re.Match[bytes] | None) -> bytes:
+        """Own keys of the object ``ref`` names, read where the xref says it lives."""
+        number, gen = (int(ref.group(1)), int(ref.group(2))) if ref else (-1, -1)
+        kind, where, extra = self.entries.get(number, (0, 0, 0))
+        if kind == 1 and extra == gen:
+            header = _PDF_OBJECT_HEADER.match(self.doc, where)
+            if header and (int(header.group(1)), int(header.group(2))) == (number, gen):
+                return self.keys_at(header.end())[0]
+        elif kind == 2 and gen == 0:
+            head, first, data = self.packed.get(where) or self.unpack(where)
+            i = 2 * extra  # entry i of the stream's header of (number, offset) pairs
+            if i + 1 < len(head) and int(head[i]) == number:
+                stop = first + int(head[i + 3]) if i + 3 < len(head) else len(data)
+                return _pdf_own_keys(_pdf_syntax(data[first + int(head[i + 1]) : stop])[0])
+        raise _PdfUnreadable
+
+    def unpack(self, number: int) -> tuple[list[bytes], int, bytes]:
+        """An object stream's header numbers, its /First and its inflated data."""
+        kind, where, gen = self.entries.get(number, (0, 0, 0))
+        header = _PDF_OBJECT_HEADER.match(self.doc, where) if kind == 1 else None
+        if not (header and (int(header.group(1)), int(header.group(2))) == (number, gen)):
+            raise _PdfUnreadable
+        keys, data = self.stream(header.end(), [])
+        first = _PDF_FIRST.search(keys)
+        if not (first and re.search(rb"/Type\s*/ObjStm\b", keys)) or b"/DecodeParms" in keys:
+            raise _PdfUnreadable
+        head = re.findall(rb"\d{1,10}", data[: int(first.group(1))])
+        self.packed[number] = head, int(first.group(1)), data
+        return self.packed[number]
 
 
 def _pdf_page_count(doc: bytes) -> int:
-    """Pages in the PDF's active page tree, else its page objects, else 0."""
-    objects: dict[int, bytes] = {}
-    trailers: list[bytes] = []
-    budget = _PDF_OBJECT_STREAM_MAX_BYTES
-    xref: dict[int, int] | None = None  # read once, when a stream's /Length is indirect
-    pos = 0
-    eof = doc.rfind(b"%%EOF")  # bytes after the last revision hold no objects
-    while len(objects) <= _PDF_MAX_OBJECTS and (
-        match := _PDF_TOP_LEVEL.search(doc, pos, len(doc) if eof < 0 else eof)
-    ):
-        pos = match.end()
-        if match.group().startswith(b"%"):
-            continue
-        syntax, pos, is_stream = _pdf_syntax(doc, pos)
-        if match.group(1) is None:
-            trailers.append(_pdf_own_keys(syntax))
-            continue
-        objects[int(match.group(1))] = syntax  # a later definition replaces an earlier one
-        if not is_stream:
-            continue
-        keys = _pdf_own_keys(syntax)
-        length = _PDF_STREAM_LENGTH.search(keys)
-        size = int(length.group(1)) if length else -1
-        if not length and (ref := _PDF_LENGTH_REF.search(keys)):
-            if xref is None:
-                found = _pdf_xref(doc, len(doc) if eof < 0 else eof, budget)
-                if not found:
-                    return 0  # reading the xref ran out of budget: the size estimate
-                xref, budget = found
-            value = _PDF_LENGTH_OBJECT.match(doc, xref.get(int(ref.group(1)), len(doc)))
-            if value and value.group(1, 2) == ref.group(1, 2):
-                size = int(value.group(3))
-        if size < 0 or not _PDF_STREAM_END.match(doc, pos + size):
-            return 0  # an unverified stream end: its data could pass for objects
-        start, pos = pos, pos + size
-        if re.search(rb"/Type\s*/XRef\b", keys):
-            trailers.append(keys)  # a cross-reference stream's dict is its trailer
-        first = _PDF_FIRST.search(keys)
-        if first and budget > 0 and re.search(rb"/Type\s*/ObjStm\b", keys):
-            # One inflate budget for the whole file, not per stream: a PDF with
-            # many object streams must not multiply the request path's memory.
-            with contextlib.suppress(zlib.error):
-                inflated = zlib.decompressobj().decompress(memoryview(doc)[start:pos], budget)
-                budget -= len(inflated)
-                head = re.findall(rb"\d{1,10}", inflated[: int(first.group(1))])
-                offsets = [int(first.group(1)) + int(offset) for offset in head[1::2]]
-                for number, at, stop in zip(head[::2], offsets, [*offsets[1:], len(inflated)]):
-                    objects[int(number)] = inflated[at:stop]
-
-    if len(objects) > _PDF_MAX_OBJECTS:
-        return 0  # too many objects to walk: the size estimate stands in
-
-    def keys_of(number: int) -> bytes:
-        return _pdf_own_keys(_pdf_syntax(objects.get(number, b""))[0])
-
-    root = next((m for t in reversed(trailers) if (m := _PDF_ROOT.search(t))), None)
-    tree = _PDF_PAGES.search(keys_of(int(root.group(1)))) if root else None
-    count = _PDF_COUNT.search(keys_of(int(tree.group(1)))) if tree else None
-    if count and 0 < int(count.group(1)) <= _PDF_MAX_PAGES:
-        return int(count.group(1))
-    return sum(1 for number in objects if _PDF_PAGE_OBJECT.search(keys_of(number)))
+    """Pages in the PDF's active page tree, else 0."""
+    try:
+        reader = _PdfReader(doc)
+        count = _PDF_COUNT.search(reader.get(_PDF_PAGES.search(reader.get(reader.root))))
+    except _PdfUnreadable:
+        return 0
+    return int(count.group(1)) if count and 0 < int(count.group(1)) <= _PDF_MAX_PAGES else 0
 
 
 class TokenCountCache:
