@@ -46,7 +46,7 @@ from headroom.providers.claude import (
 )
 
 from .main import get_version, main
-from .port_discovery import find_live_proxy_elsewhere, is_headroom_livez
+from .port_discovery import find_live_proxy_elsewhere, is_headroom_livez, loopback_port
 from .wrap import _read_wrap_marker, _wrap_marker_is_stale
 
 PASS = "pass"
@@ -59,6 +59,7 @@ DEFAULT_PROXY_PORT = 8787
 _LOOPBACK_URL_RE = re.compile(r"https?://(?:127\.0\.0\.1|localhost):(\d+)")
 _CODEX_BASE_URL_RE = re.compile(r'(?m)^[ \t]*base_url\s*=\s*"([^"\r\n]+)"')
 _CODEX_MODEL_PROVIDER_RE = re.compile(r'(?m)^[ \t]*model_provider\s*=\s*"([^"\r\n]+)"')
+_CODEX_OPENAI_BASE_URL_RE = re.compile(r'(?m)^[ \t]*openai_base_url\s*=\s*"([^"\r\n]+)"')
 
 # Ollama's fixed default port. `ollama launch claude` writes
 # ``ANTHROPIC_BASE_URL=http://127.0.0.1:11434`` into the launched Claude Code
@@ -575,7 +576,13 @@ def codex_active_base_url(text: str) -> tuple[str, str | None]:
     """Return ``(provider_id, base_url)`` for the active Codex provider in ``text``."""
     active_match = _CODEX_MODEL_PROVIDER_RE.search(text)
     provider_id = active_match.group(1) if active_match else "headroom"
-    return provider_id, _codex_provider_base_url(text, provider_id)
+    base_url = _codex_provider_base_url(text, provider_id)
+    if base_url is None and (active_match is None or provider_id == "openai"):
+        # A root `openai_base_url` re-points Codex's built-in `openai` provider
+        # (the default when `model_provider` is unset). Headroom Desktop routes
+        # this way because the ChatGPT app hides features for any other provider.
+        base_url = _codex_root_openai_base_url(text)
+    return provider_id, base_url
 
 
 def check_codex_routing(
@@ -659,6 +666,28 @@ def _codex_provider_base_url(text: str, provider_id: str) -> str | None:
         section = section[: next_section.start()]
     base_url_match = _CODEX_BASE_URL_RE.search(section)
     return base_url_match.group(1) if base_url_match else None
+
+
+def _codex_root_openai_base_url(text: str) -> str | None:
+    first_table = re.search(r"(?m)^[ \t]*\[", text)
+    root = text[: first_table.start()] if first_table is not None else text
+    match = _CODEX_OPENAI_BASE_URL_RE.search(root)
+    return match.group(1) if match else None
+
+
+def _configured_client_ports() -> list[int]:
+    """Loopback ports the user's Claude Code and Codex configs send traffic to.
+
+    Headroom Desktop (port 6767) and ``wrap --port N`` leave no deployment
+    manifest, so without these a bare ``doctor`` only ever finds 8787.
+    """
+    urls = [_claude_base_url_in(claude_settings_path())[0]]
+    try:
+        codex_text = codex_config_path().read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        codex_text = ""
+    urls.append(codex_active_base_url(codex_text)[1] or "")
+    return [port for port in map(loopback_port, urls) if port is not None]
 
 
 def _codex_block_missing_openai_auth(
@@ -1214,10 +1243,12 @@ def doctor(
     live_elsewhere = None
     if livez is None:
         # Cheap, bounded: only ports Headroom recorded (HEADROOM_PORT, 8787,
-        # deployment manifests, the project's wrap marker), probed in parallel.
+        # deployment manifests, the project's wrap marker) and the ports the
+        # agents are configured for, probed in parallel.
         live_elsewhere = find_live_proxy_elsewhere(
             port,
             manifests=manifests,
+            extra=_configured_client_ports(),
             probe=lambda p: is_headroom_livez(
                 probe_json(f"http://127.0.0.1:{p}/livez", timeout=0.5)
             ),
