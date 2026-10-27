@@ -511,4 +511,39 @@ mod tests {
             assert!((0.0..=1.0).contains(&sc.score));
         }
     }
+
+    #[cfg(feature = "ml")]
+    #[test]
+    fn fastembed_batches_past_the_cap_keep_each_score_with_its_item() {
+        if !fastembed_enabled() {
+            return;
+        }
+        // Three EMBED_BATCH_SIZE batches of mixed lengths, the one related item
+        // in the last: a misaligned batch boundary would hand its score away.
+        let s = EmbeddingScorer::try_new().expect("model loads");
+        let mut items: Vec<String> = (0..40)
+            .map(|i| {
+                format!(
+                    "inventory row {i}: {}",
+                    "pallets of garden furniture ".repeat(i % 5 + 1)
+                )
+            })
+            .collect();
+        items[37] = "authentication failed for user admin: invalid password".to_string();
+        let refs: Vec<&str> = items.iter().map(String::as_str).collect();
+        let batch = s.score_batch(&refs, "login error");
+        assert_eq!(batch.len(), 40);
+        let top = (0..40)
+            .max_by(|&a, &b| batch[a].score.total_cmp(&batch[b].score))
+            .unwrap();
+        assert_eq!(top, 37);
+        for (item, sc) in refs.iter().zip(&batch) {
+            let single = s.score(item, "login error").score;
+            assert!(
+                (sc.score - single).abs() < 1e-3,
+                "{item}: batched {} vs single {single}",
+                sc.score
+            );
+        }
+    }
 }
