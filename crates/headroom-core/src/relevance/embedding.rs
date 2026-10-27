@@ -34,6 +34,11 @@ use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 
 use super::base::{RelevanceScore, RelevanceScorer};
 
+/// Texts per ONNX Runtime run, matching Python's `EMBED_BATCH_SIZE`: fastembed's
+/// default of 256 grows ORT's never-shrinking CPU arena to the biggest batch scored.
+#[cfg(feature = "ml")]
+const EMBED_BATCH_SIZE: usize = 16;
+
 /// fastembed-backed semantic relevance scorer.
 ///
 /// Construct via `EmbeddingScorer::try_new()` to handle the model-load
@@ -196,7 +201,7 @@ impl RelevanceScorer for EmbeddingScorer {
         // overhead. Mirrors Python fastembed batch encoding.
         let mut all_texts: Vec<String> = items.iter().map(|s| s.to_string()).collect();
         all_texts.push(context.to_string());
-        let embeddings = match guard.embed(all_texts, None) {
+        let embeddings = match guard.embed(all_texts, Some(EMBED_BATCH_SIZE)) {
             Ok(e) => e,
             Err(e) => {
                 return items
