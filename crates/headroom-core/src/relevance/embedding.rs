@@ -30,7 +30,7 @@
 use std::sync::Mutex;
 
 #[cfg(feature = "ml")]
-use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use fastembed::{EmbeddingModel, InitOptions, QuantizationMode, TextEmbedding};
 
 use super::base::{RelevanceScore, RelevanceScorer};
 
@@ -38,6 +38,14 @@ use super::base::{RelevanceScore, RelevanceScorer};
 /// default of 256 grows ORT's never-shrinking CPU arena to the biggest batch scored.
 #[cfg(feature = "ml")]
 const EMBED_BATCH_SIZE: usize = 16;
+
+/// fastembed refuses to split a dynamic-quantized model's input across runs (each
+/// run calibrates its own int8 range, so the embeddings would not compare): one batch.
+#[cfg(feature = "ml")]
+fn embed_batch_size(model_kind: &EmbeddingModel) -> Option<usize> {
+    (TextEmbedding::get_quantization_mode(model_kind) != QuantizationMode::Dynamic)
+        .then_some(EMBED_BATCH_SIZE)
+}
 
 /// fastembed-backed semantic relevance scorer.
 ///
@@ -61,6 +69,8 @@ pub struct EmbeddingScorer {
     /// dominant cost so contention is bounded by inference latency,
     /// not lock latency.
     model: Option<Mutex<TextEmbedding>>,
+    /// `embed` batch size for this model, from `embed_batch_size`.
+    batch_size: Option<usize>,
 }
 
 #[cfg(feature = "ml")]
@@ -80,6 +90,7 @@ impl Default for EmbeddingScorer {
         EmbeddingScorer {
             model_name: "BAAI/bge-small-en-v1.5".to_string(),
             model: None,
+            batch_size: Some(EMBED_BATCH_SIZE),
         }
     }
 }
@@ -134,11 +145,13 @@ impl EmbeddingScorer {
         // `dynamic_ort_loader_ready`).
         crate::transforms::magika_detector::dynamic_ort_loader_ready()
             .map_err(|e| format!("EmbeddingScorer: ONNX Runtime unavailable: {e}"))?;
+        let batch_size = embed_batch_size(&model_kind);
         let model = TextEmbedding::try_new(InitOptions::new(model_kind))
             .map_err(|e| format!("EmbeddingScorer model load failed: {}", e))?;
         Ok(EmbeddingScorer {
             model_name: name,
             model: Some(Mutex::new(model)),
+            batch_size,
         })
     }
 }
@@ -197,11 +210,11 @@ impl RelevanceScorer for EmbeddingScorer {
             }
         };
 
-        // Encode items + context in one batch — saves model dispatch
-        // overhead. Mirrors Python fastembed batch encoding.
+        // Encode items + context in one `embed` call, which runs them in
+        // `self.batch_size` chunks. Mirrors Python fastembed batch encoding.
         let mut all_texts: Vec<String> = items.iter().map(|s| s.to_string()).collect();
         all_texts.push(context.to_string());
-        let embeddings = match guard.embed(all_texts, Some(EMBED_BATCH_SIZE)) {
+        let embeddings = match guard.embed(all_texts, self.batch_size) {
             Ok(e) => e,
             Err(e) => {
                 return items
@@ -357,6 +370,7 @@ mod tests {
         EmbeddingScorer {
             model_name: "test".to_string(),
             model: None,
+            batch_size: Some(EMBED_BATCH_SIZE),
         }
     }
 
@@ -467,6 +481,15 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "ml")]
+    #[test]
+    fn dynamic_quantized_models_embed_in_one_batch() {
+        let capped = Some(EMBED_BATCH_SIZE);
+        assert_eq!(embed_batch_size(&EmbeddingModel::BGESmallENV15), capped);
+        assert_eq!(embed_batch_size(&EmbeddingModel::BGESmallENV15Q), capped);
+        assert_eq!(embed_batch_size(&EmbeddingModel::AllMiniLML6V2Q), None);
+    }
+
     // ---------- model-backed tests (gated on RUN_FASTEMBED_TESTS) ----------
 
     #[cfg(feature = "ml")]
@@ -544,6 +567,38 @@ mod tests {
                 "{item}: batched {} vs single {single}",
                 sc.score
             );
+        }
+    }
+
+    #[cfg(feature = "ml")]
+    #[test]
+    fn fastembed_dynamic_quantized_model_scores_on_both_sides_of_the_cap() {
+        if !fastembed_enabled() {
+            return;
+        }
+        // 15 items plus the context fill exactly one EMBED_BATCH_SIZE run; 16
+        // and 40 go past it, where fastembed refuses to split this model.
+        let s = EmbeddingScorer::try_new_with_model(EmbeddingModel::AllMiniLML6V2Q)
+            .expect("model loads");
+        for n in [15, 16, 40] {
+            let mut items: Vec<String> = (0..n)
+                .map(|i| format!("inventory row {i}: pallets of garden furniture"))
+                .collect();
+            items[n - 3] = "authentication failed for user admin: invalid password".to_string();
+            let refs: Vec<&str> = items.iter().map(String::as_str).collect();
+            let batch = s.score_batch(&refs, "login error");
+            assert_eq!(batch.len(), n);
+            for sc in &batch {
+                assert!(
+                    !sc.reason.contains("inference failed"),
+                    "{n} items: {}",
+                    sc.reason
+                );
+            }
+            let top = (0..n)
+                .max_by(|&a, &b| batch[a].score.total_cmp(&batch[b].score))
+                .unwrap();
+            assert_eq!(top, n - 3, "{n} items");
         }
     }
 }
