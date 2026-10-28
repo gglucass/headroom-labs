@@ -616,6 +616,28 @@ class TestCodexRouting:
         )
         assert check_codex_routing(path, 8787).status == WARN
 
+    def test_root_openai_base_url_beats_an_inactive_headroom_table(self, tmp_path):
+        """No root `model_provider`: Codex uses its built-in `openai`, not the table."""
+        path = tmp_path / "config.toml"
+        path.write_text(
+            'openai_base_url = "http://127.0.0.1:6767/v1"\n'
+            "[model_providers.headroom]\n"
+            'base_url = "http://127.0.0.1:8787/v1"\n',
+            encoding="utf-8",
+        )
+        assert check_codex_routing(path, 6767).status == PASS
+        assert check_codex_routing(path, 8787).status == WARN
+
+    def test_profile_model_provider_does_not_hide_the_default_route(self, tmp_path):
+        path = tmp_path / "config.toml"
+        path.write_text(
+            'openai_base_url = "http://127.0.0.1:6767/v1"\n'
+            "[profiles.work]\n"
+            'model_provider = "azure"\n',
+            encoding="utf-8",
+        )
+        assert check_codex_routing(path, 6767).status == PASS
+
     def test_no_marker_warns(self, tmp_path):
         path = tmp_path / "config.toml"
         path.write_text('model = "gpt-5"\n', encoding="utf-8")
@@ -1022,6 +1044,33 @@ class TestDoctorCommand:
             json.dumps({"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:6767"}}),
             encoding="utf-8",
         )
+
+        def desktop_probe(url, timeout=2.0):
+            return LIVEZ_OK if url == "http://127.0.0.1:6767/livez" else None
+
+        monkeypatch.setattr(doctor_mod, "probe_json", desktop_probe)
+        result = runner.invoke(main, ["doctor", "--json"])
+        proxy = next(c for c in json.loads(result.output)["checks"] if c["name"] == "proxy")
+        assert "a Headroom proxy IS running on port 6767" in proxy["summary"]
+
+    @pytest.mark.parametrize(
+        ("relative", "content"),
+        [
+            ("project-codex.toml", 'openai_base_url = "http://127.0.0.1:6767/v1"\n'),
+            (
+                ".claude/settings.local.json",
+                json.dumps({"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:6767"}}),
+            ),
+        ],
+    )
+    def test_names_the_live_port_only_a_project_config_routes_to(
+        self, runner, isolated, monkeypatch, relative, content
+    ):
+        monkeypatch.setenv("HEADROOM_PORT_DISCOVERY", "1")
+        monkeypatch.chdir(isolated)
+        path = isolated / relative
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(content, encoding="utf-8")
 
         def desktop_probe(url, timeout=2.0):
             return LIVEZ_OK if url == "http://127.0.0.1:6767/livez" else None
