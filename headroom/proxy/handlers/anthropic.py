@@ -2623,9 +2623,14 @@ class AnthropicHandlerMixin:
                             prefix_tracker.restored_maturation_state = None
                             maturation_mgr.restore_state(state)
                     _maturation_mgr = maturation_mgr
+                    # Never below the floor finalize_turn just replayed: the
+                    # pipeline's freeze is clamped to what the local compression
+                    # cache can byte-replay, which stops at the first tool_result
+                    # it never stored, so on its own it lets a cached Read mature
+                    # and re-write the provider cache from that Read onward.
                     maturation = maturation_mgr.apply(
                         optimized_messages,
-                        frozen_message_count=frozen_message_count,
+                        frozen_message_count=max(frozen_message_count, _confirmed_frozen),
                     )
                     if maturation.replacements_applied or maturation.holding_msg_indices:
                         optimized_messages = maturation.messages
