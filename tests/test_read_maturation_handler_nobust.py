@@ -366,10 +366,12 @@ DEFERRED_TOOL = {
 
 
 def _tool_search_convo(nquiet: int) -> list[dict]:
-    """``_busy_convo`` after a ToolSearch whose result holds only tool_reference
-    blocks, as Claude Code loads deferred tools. The compression cache reads no
-    text from that result, so its count never passes it, however much of the
-    later tool output compresses."""
+    """``_busy_convo`` after a ToolSearch that Claude Code ran beside a Bash call
+    to load a deferred tool. The compression cache keys a message by its first
+    tool_result, here the tool_reference-only ToolSearch result, so it never
+    stores the Bash text beside it and its count never passes that message,
+    however much of the later tool output compresses. (A ToolSearch result
+    alone no longer stops the count: it carries no text to replay.)"""
     msgs = _busy_convo(nquiet)
     search = [
         {
@@ -380,7 +382,13 @@ def _tool_search_convo(nquiet: int) -> list[dict]:
                     "id": "toolu_ts",
                     "name": "ToolSearch",
                     "input": {"query": "notes"},
-                }
+                },
+                {
+                    "type": "tool_use",
+                    "id": "toolu_pwd",
+                    "name": "Bash",
+                    "input": {"command": "pwd"},
+                },
             ],
         },
         {
@@ -390,7 +398,8 @@ def _tool_search_convo(nquiet: int) -> list[dict]:
                     "type": "tool_result",
                     "tool_use_id": "toolu_ts",
                     "content": [{"type": "tool_reference", "tool_name": DEFERRED_TOOL["name"]}],
-                }
+                },
+                {"type": "tool_result", "tool_use_id": "toolu_pwd", "content": "/x"},
             ],
         },
     ]
@@ -436,7 +445,7 @@ def _record_pipeline_freeze(monkeypatch) -> list[int]:
     [
         # Nothing compresses, so the compression cache never stores the Read.
         (_convo, [READ_TOOL], 2),
-        # Tool output compresses, but the count stops at the ToolSearch result.
+        # Tool output compresses, but the count stops at the ToolSearch message.
         (_tool_search_convo, [READ_TOOL, DEFERRED_TOOL], 2),
     ],
     ids=["quiet", "tool-reference"],
